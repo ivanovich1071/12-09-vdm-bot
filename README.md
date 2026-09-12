@@ -143,8 +143,13 @@ agent · catalog · norms · orders · privacy · media
 
 **Ветки:**
 
-- `main` — baseline `26-08-vdm-bot` @ `6502846`;
-- `epic-0/audit` → `epic-0.5/r1-widget-session` → `epic-1/catalog-domain`.
+- `main` — принятое состояние: снимок baseline `26-08-vdm-bot` @ `6502846` без
+  истории (коммит `2fbbefc`), EPIC 0, EPIC 0.5 и документы v2;
+- `epic-0/audit`, `epic-0.5/r1-widget-session` — точки завершения EPIC;
+- `epic-1/catalog-domain` — текущая работа.
+
+Перед пушем история проверяется gitleaks; разобранные ложные срабатывания
+лежат в `.gitleaksignore`.
 
 **Ждём от заказчика:** доступ к CRM, токен MAX, ключ Cloud.ru на его аккаунт,
 образцы заказов, реестр «пункт 838 → код 1С».

@@ -104,7 +104,7 @@ cp .env.example .env
 
 ```env
 # Токен от @BotFather. Без него Telegram-бот не запустится.
-TELEGRAM_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TELEGRAM_TOKEN=<токен от @BotFather>
 
 # Ключ сервисного аккаунта Cloud.ru. Пусто — бот отвечает поиском.
 CLOUDRU_API_KEY=
