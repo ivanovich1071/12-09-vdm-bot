@@ -149,7 +149,10 @@ agent · catalog · norms · orders · privacy · media
     полей (docs/DECISIONS.md, D8);
   - EPIC 2 (импорт 1С) — `run.py import-1c`: загрузка на проверку, разбор,
     проверка строк, предпросмотр; каталог бота не меняется (D9).
-- **Тесты:** 429 passed, ruff чистый.
+- **EPIC 3 (сопоставление) принят:** `catalog/matcher.py` — код 1С, название,
+  артикул поставщика, похожее название; импорт 1С проверяет существующие коды
+  и ищет перекодировку только среди исчезнувших (D10).
+- **Тесты:** 519 passed, ruff чистый.
 
 **Ветки:**
 
@@ -157,7 +160,8 @@ agent · catalog · norms · orders · privacy · media
   истории (коммит `2fbbefc`), EPIC 0, EPIC 0.5 и документы v2;
 - `epic-0/audit`, `epic-0.5/r1-widget-session` — точки завершения EPIC;
 - `epic-1/catalog-domain` — EPIC 1;
-- `epic-2/catalog-import` — текущая работа, от EPIC 1.
+- `epic-2/catalog-import` — EPIC 2, от EPIC 1;
+- `epic-3/matching` — EPIC 3, от EPIC 2.
 
 Перед пушем история проверяется gitleaks; разобранные ложные срабатывания
 лежат в `.gitleaksignore`.
