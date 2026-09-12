@@ -29,20 +29,28 @@ log = logging.getLogger(__name__)
 STATIC = Path(__file__).parent / "static"
 CHANNEL = "web"
 
+# Идентификатор посетителя выдаёт сервер — `uuid4().hex`, — и формат сверяется на
+# каждом запросе, а не только при открытии сессии. Корзина, согласие и удаление
+# данных привязаны к идентификатору без канала: пока `/widget/message` и
+# `/widget/action` принимали любую строку от восьми символов, числовым ID
+# пользователя Telegram можно было очистить его корзину, дать за него согласие
+# или стереть его данные.
+SESSION_ID = r"^[0-9a-f]{32}$"
+
 
 class SessionIn(BaseModel):
     # Посетитель, вернувшийся на сайт, присылает свой прежний идентификатор,
     # чтобы не потерять корзину. Проверяем только формат: он анонимный.
-    session_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    session_id: str | None = Field(default=None, pattern=SESSION_ID)
 
 
 class MessageIn(BaseModel):
-    session_id: str = Field(min_length=8, max_length=64)
+    session_id: str = Field(pattern=SESSION_ID)
     text: str = Field(default="", max_length=2000)
 
 
 class ActionIn(BaseModel):
-    session_id: str = Field(min_length=8, max_length=64)
+    session_id: str = Field(pattern=SESSION_ID)
     action: str = Field(min_length=1, max_length=128)
 
 
