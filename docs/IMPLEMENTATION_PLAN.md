@@ -1,6 +1,8 @@
 # План внедрения v2 — 12-09-vdm-bot
 
-**Статус: черновик на согласование.** Код не менялся. Основание:
+**Статус:** решения по Р1–Р3 и вопросам Q1–Q3 приняты 12.09.2026 — см.
+[DECISIONS.md](DECISIONS.md), при расхождении действует он. EPIC 0.5 выполнен.
+Основание:
 [AUDIT.md](AUDIT.md), [ARCHITECTURE_CURRENT.md](ARCHITECTURE_CURRENT.md),
 [BASELINE.md](BASELINE.md).
 

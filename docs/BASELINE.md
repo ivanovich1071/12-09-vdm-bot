@@ -225,8 +225,11 @@ tests/  21 файл test_*.py (fixtures/ — в .gitignore)
 
 Полные выводы: `docs/baseline/pytest-source.txt`, `docs/baseline/pytest-clone.txt`.
 
-Если клонировать с GitHub без `tests/fixtures/`, по коду получится **316 passed,
-1 skipped**: `test_real_card_yields_full_size_photos` помечен `skipif`.
+Тесты не полностью изолированы от рабочих данных: `tests/test_web.py` при
+импорте `web.app` загружает настоящий `data/kb/products.jsonl` и создаёт
+`data/vdm.sqlite3` (AUDIT, R5). В клоне этот файл появился во время прогона.
+Без `tests/fixtures/` тест `test_real_card_yields_full_size_photos`
+пропускается (`skipif`); без `data/kb` сбор `test_web.py`, по коду, упадёт.
 
 Количество тестов по файлам — в AUDIT.md, §6.
 
