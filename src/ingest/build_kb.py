@@ -48,7 +48,9 @@ class Product:
     short_url: str | None
     price: int | None
     currency: str
-    in_stock: int
+    # Пустая или нечитаемая ячейка — `None`, а не 0: «нет данных» и «нет в
+    # наличии» — разные ответы покупателю (D8, решение E).
+    in_stock: int | None
     # Один товар размещён сразу в нескольких разделах: например, мяч лежит и в спортивном
     # инвентаре детского сада, и в пункте приказа 838 по спортивному комплексу. Все
     # размещения нужны: по ним работают и навигация, и нормативная привязка.
@@ -73,6 +75,7 @@ class Report:
     cross_listed: int = 0
     with_price: int = 0
     with_stock: int = 0
+    stock_unknown: int = 0
     with_description: int = 0
     with_kit_contents: int = 0
     with_bitrix_id: int = 0
@@ -159,7 +162,7 @@ def _read_products(
             short_url=row.get("F", "").strip() or None,
             price=_to_int(row.get("D")),
             currency="RUB",
-            in_stock=_to_int(row.get("E")) or 0,
+            in_stock=_to_int(row.get("E")),
             category_paths=[path.titles] if path.titles else [],
             description=description,
             kit_contents=kit,
@@ -243,7 +246,8 @@ def _fill_report(report: Report, products: list[Product]) -> None:
         report.products += 1
         report.cross_listed += len(product.category_paths) > 1
         report.with_price += product.price is not None
-        report.with_stock += product.in_stock > 0
+        report.with_stock += (product.in_stock or 0) > 0
+        report.stock_unknown += product.in_stock is None
         report.with_description += bool(product.description)
         report.with_kit_contents += bool(product.kit_contents)
         report.with_bitrix_id += product.bitrix_id is not None

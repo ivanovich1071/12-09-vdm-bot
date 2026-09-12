@@ -1,15 +1,77 @@
-"""Загрузка каталога из собранной базы знаний."""
+"""Доступ к каталогу.
+
+`CatalogRepository` — то, на что опирается `CatalogService`. Реализация пока одна:
+каталог в памяти поверх `CatalogIndex`, собранного из базы знаний. Хранилище за
+ней заменяется (SQLite, PostgreSQL), не трогая сервис и его потребителей (D4).
+
+`load_products` и `load_index` остаются: ими пользуется сборка приложения.
+"""
 
 from __future__ import annotations
 
 import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Protocol
 
 from catalog.models import Product
-from catalog.search import CatalogIndex
+from catalog.search import CatalogIndex, SearchHit, SearchQuery
 
 DEFAULT_KB = Path("data/kb/products.jsonl")
+
+
+class CatalogRepository(Protocol):
+    def get_product(self, product_id: str) -> Product | None: ...
+
+    def get_by_article(self, article: str) -> Product | None: ...
+
+    def list_active(self) -> list[Product]: ...
+
+    def search_text(
+        self,
+        text: str,
+        *,
+        limit: int,
+        audience: str | None = None,
+        norm_point: str | None = None,
+    ) -> list[SearchHit]:
+        """Кандидаты по словам и номеру пункта, в порядке релевантности."""
+        ...
+
+
+class InMemoryCatalogRepository:
+    """Репозиторий поверх существующего индекса. Алгоритм поиска не меняется."""
+
+    def __init__(self, index: CatalogIndex) -> None:
+        self.index = index
+
+    @classmethod
+    def from_path(cls, path: str | Path = DEFAULT_KB) -> InMemoryCatalogRepository:
+        return cls(load_index(path))
+
+    def get_product(self, product_id: str) -> Product | None:
+        return self.index.get(product_id)
+
+    def get_by_article(self, article: str) -> Product | None:
+        # Артикул — код 1С, то есть тот же ключ, что и id (D8, решение A).
+        # Артикул поставщика не ищем: он не уникален («065», «221»).
+        article = (article or "").strip()
+        return self.index.get(article) if article else None
+
+    def list_active(self) -> list[Product]:
+        return [product for product in self.index.products if product.is_active]
+
+    def search_text(
+        self,
+        text: str,
+        *,
+        limit: int,
+        audience: str | None = None,
+        norm_point: str | None = None,
+    ) -> list[SearchHit]:
+        return self.index.search(
+            SearchQuery(text=text, limit=limit, audience=audience, norm_code=norm_point)
+        )
 
 
 def load_products(path: str | Path = DEFAULT_KB) -> list[Product]:

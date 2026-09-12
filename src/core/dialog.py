@@ -11,9 +11,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from catalog.models import Product
+from catalog.repository import InMemoryCatalogRepository
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
+from catalog.service import CatalogService
 from core import intent
 from core.config import Settings
 from core.models import CartItem, Customer
@@ -205,6 +208,15 @@ class DialogEngine:
         # Пункты приказов с формулировками и поиском по словам. Файла может не
         # быть — тогда бот называет номер пункта без текста, как и раньше.
         self.norm_texts = norm_items.ItemIndex(norm_items.load())
+
+    @cached_property
+    def catalog(self) -> CatalogService:
+        """Каталог через доменный слой (EPIC 1) — поверх того же индекса, что `index`.
+
+        Прежние вызовы `self.index` пока не переведены: бот и агент переходят на
+        сервис в следующих EPIC, поведение диалога здесь не меняется.
+        """
+        return CatalogService(InMemoryCatalogRepository(self.index))
 
     def session(self, user_id: str, channel: str) -> Session:
         key = f"{channel}:{user_id}"
