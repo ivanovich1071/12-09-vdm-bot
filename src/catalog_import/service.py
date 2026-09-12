@@ -1,8 +1,8 @@
 """Импорт выгрузки 1С: загрузка → контрольная сумма → разбор → проверка → предпросмотр.
 
 Загрузка каталог бота не меняет (D5): товары импорта лежат в своих таблицах,
-`products.jsonl` не трогается. Сопоставление по названию — EPIC 3, изменения по
-позициям, утверждение и применение — EPIC 4.
+`products.jsonl` не трогается. Сопоставление с каталогом — `matching.py` (EPIC 3),
+изменения по позициям, утверждение и применение — EPIC 4.
 """
 
 from __future__ import annotations
@@ -12,14 +12,16 @@ import uuid
 import zipfile
 import zlib
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from xml.etree import ElementTree as ET
 
+from catalog.matcher import CatalogMatcher, MatchSettings
 from catalog_import.files import MB, MIME_TYPES, FileStore, check_upload, checksum, megabytes
+from catalog_import.matching import MATCH_STATUS_SHORT_LABELS, compare_with_catalog
 from catalog_import.models import (
     CatalogComparison,
     CatalogImport,
@@ -36,6 +38,7 @@ from catalog_import.validator import ISSUE_LABELS, file_issues, row_issues
 from ingest.xlsx_reader import XlsxFile
 
 if TYPE_CHECKING:
+    from catalog.repository import CatalogRepository
     from core.config import Settings
 
 log = logging.getLogger(__name__)
@@ -66,14 +69,16 @@ class CatalogImportService:
         files: FileStore,
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
-        current_codes: Callable[[], Iterable[str]] | None = None,
+        catalog: Callable[[], CatalogRepository] | None = None,
+        match_settings: MatchSettings | None = None,
         clock: Callable[[], str] | None = None,
     ) -> None:
         self.repository = repository
         self.files = files
         self.max_bytes = max_bytes
-        # Коды 1С каталога, с которым сейчас работает бот. `None` — сравнивать не с чем.
-        self.current_codes = current_codes
+        # Каталог, с которым сейчас работает бот. `None` — сравнивать не с чем.
+        self.catalog = catalog
+        self.match_settings = match_settings
         self._now = clock or _now
 
     def upload(self, source: str | Path, uploaded_by: str) -> CatalogImport:
@@ -111,7 +116,7 @@ class CatalogImportService:
 
         summary = inspection.summary
         if inspection.status is ImportStatus.PARSED:
-            summary = replace(summary, comparison=self._compare(inspection.codes))
+            summary = replace(summary, comparison=self._compare(inspection))
         log.info(
             "Импорт %s: %s, товаров %s, принято %s, ошибок %s, предупреждений %s",
             record.id,
@@ -139,15 +144,13 @@ class CatalogImportService:
     ) -> list[Issue]:
         return self.repository.issues(import_id, severity, limit)
 
-    def _compare(self, codes: frozenset[str]) -> CatalogComparison | None:
-        if self.current_codes is None:
+    def _compare(self, inspection: Inspection) -> CatalogComparison | None:
+        if self.catalog is None:
             return None
-        current = set(self.current_codes())
-        return CatalogComparison(
-            in_catalog=len(codes & current),
-            new=len(codes - current),
-            missing_from_file=len(current - codes),
-        )
+        catalog = self.catalog()
+        matcher = CatalogMatcher(catalog, self.match_settings)
+        matching = compare_with_catalog(inspection.items, inspection.codes, catalog, matcher)
+        return matching.comparison
 
 
 def inspect(path: Path, *, source_name: str, now: str) -> Inspection:
@@ -208,18 +211,19 @@ def inspect(path: Path, *, source_name: str, now: str) -> Inspection:
 
 def build_service(settings: Settings) -> CatalogImportService:
     """Сервис по настройкам приложения — для командной строки, а позже для админки."""
-    from catalog.repository import load_products
+    from catalog.repository import InMemoryCatalogRepository
 
     kb_path = Path(settings.kb_path)
 
-    def current_codes() -> set[str]:
-        return {product.sku_1c for product in load_products(kb_path) if product.is_active}
+    def catalog() -> CatalogRepository:
+        return InMemoryCatalogRepository.from_path(kb_path)
 
     return CatalogImportService(
         SqliteImportRepository(settings.catalog_db_path),
         FileStore(settings.uploads_dir),
         max_bytes=settings.import_max_mb * MB,
-        current_codes=current_codes if kb_path.exists() else None,
+        catalog=catalog if kb_path.exists() else None,
+        match_settings=MatchSettings.from_settings(settings),
     )
 
 
@@ -268,6 +272,7 @@ def format_preview(record: CatalogImport, issues: list[Issue]) -> str:
                 f"{_n(comparison.in_catalog)}, новых {_n(comparison.new)}, "
                 f"нет в файле {_n(comparison.missing_from_file)}"
             )
+            lines += _matching_lines(comparison)
         if issues:
             total = summary.errors + summary.warnings
             shown = f" (показано {len(issues)} из {_n(total)})" if total > len(issues) else ""
@@ -286,6 +291,36 @@ def format_imports(records: list[CatalogImport]) -> str:
         f"товаров {_n(record.summary.products)}, ошибок {_n(record.summary.errors)}, "
         f"предупреждений {_n(record.summary.warnings)}  {record.created_at}"
         for record in records
+    )
+
+
+def _matching_lines(comparison: CatalogComparison) -> list[str]:
+    """Итог сопоставления: проверка кодов из каталога и поиск перекодировок."""
+    if not comparison.matching:
+        return ["Сопоставление с каталогом не выполнялось: импорт загружен до его появления."]
+    lines = []
+    if comparison.existing_by_status:
+        lines.append(f"Товары с кодом 1С из каталога: {_statuses(comparison.existing_by_status)}")
+    if comparison.recoding_checked:
+        lines.append(
+            "Возможные перекодировки (новые коды сравнены только с исчезнувшими): "
+            f"проверено {_n(comparison.recoding_checked)}, "
+            f"с кандидатом {_n(comparison.recoding_candidates)} — "
+            f"{_statuses(comparison.recoding_by_status)}"
+        )
+    else:
+        reason = (
+            "нет исчезнувших кодов"
+            if not comparison.missing_from_file
+            else "нет новых товаров, принятых в импорт"
+        )
+        lines.append(f"Возможные перекодировки: 0 — {reason}.")
+    return lines
+
+
+def _statuses(counts: dict[str, int]) -> str:
+    return ", ".join(
+        f"{MATCH_STATUS_SHORT_LABELS.get(code, code)} {_n(count)}" for code, count in counts.items()
     )
 
 

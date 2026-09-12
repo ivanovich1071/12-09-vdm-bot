@@ -36,6 +36,13 @@ class Settings:
     catalog_db_path: str = "data/catalog.sqlite3"
     uploads_dir: str = "data/uploads"
     import_max_mb: int = 50
+    # Сопоставление позиции с каталогом (EPIC 3, `catalog/matcher.py`). Пороги —
+    # доли общих триграмм названия. Автовыбор по похожему названию выключен:
+    # в каталоге много почти одинаковых товаров, опечатку от соседа не отличить.
+    match_auto_enabled: bool = False
+    match_auto_threshold: float = 0.85
+    match_review_threshold: float = 0.60
+    match_ambiguity_margin: float = 0.05
 
     # Модель. Провайдеров два: Cloud.ru — то, где всё будет работать у заказчика,
     # OpenRouter — то, где диалог можно проверить с машины разработки, когда
@@ -107,6 +114,17 @@ class Settings:
             catalog_db_path=env.get("CATALOG_DB_PATH", cls.catalog_db_path),
             uploads_dir=env.get("UPLOADS_DIR", cls.uploads_dir),
             import_max_mb=int(env.get("IMPORT_MAX_MB", cls.import_max_mb)),
+            # Включается только явным «1/true/yes»: опечатка в значении не должна
+            # включать автовыбор, как было бы при проверке «не 0».
+            match_auto_enabled=env.get("MATCH_AUTO_ENABLED", "0").strip().lower()
+            in {"1", "true", "yes"},
+            match_auto_threshold=float(env.get("MATCH_AUTO_THRESHOLD", cls.match_auto_threshold)),
+            match_review_threshold=float(
+                env.get("MATCH_REVIEW_THRESHOLD", cls.match_review_threshold)
+            ),
+            match_ambiguity_margin=float(
+                env.get("MATCH_AMBIGUITY_MARGIN", cls.match_ambiguity_margin)
+            ),
             llm_provider=env.get("LLM_PROVIDER", cls.llm_provider).strip().lower(),
             cloudru_api_key=env.get("CLOUDRU_API_KEY", ""),
             cloudru_base_url=env.get("CLOUDRU_BASE_URL", cls.cloudru_base_url),

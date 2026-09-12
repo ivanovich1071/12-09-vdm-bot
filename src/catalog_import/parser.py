@@ -8,12 +8,12 @@
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from catalog.text import normalize_name
 from ingest.catalog_tree import CatalogPath
 from ingest.html_text import html_to_text, split_kit_contents
 from norms import documents as norm_docs
@@ -33,8 +33,6 @@ EXPECTED_HEADERS = {
     "F": "Короткая ссылка",
     "G": "Описание",
 }
-
-_SPACES = re.compile(r"\s+")
 
 
 @dataclass
@@ -253,10 +251,6 @@ def link_to_dict(link: NormLink) -> dict[str, Any]:
         "source": link.source,
         "confidence": link.confidence,
     }
-
-
-def normalize_name(name: str) -> str:
-    return _SPACES.sub(" ", name.replace("\xa0", " ")).strip().casefold()
 
 
 def to_int(raw: str | None) -> int | None:

@@ -17,7 +17,8 @@ from xml.sax.saxutils import escape
 import pytest
 
 from catalog.models import Product
-from catalog.repository import load_products
+from catalog.repository import InMemoryCatalogRepository, load_products
+from catalog.search import CatalogIndex
 from catalog_import import service as import_service
 from catalog_import.files import FileStore, UploadRejected
 from catalog_import.models import CatalogComparison, ImportStatus, Severity
@@ -270,12 +271,25 @@ def test_upload_does_not_touch_bot_catalog(repository, tmp_path, valid_file):
     )
     before = (kb.read_bytes(), kb.stat().st_mtime_ns)
     service = make_service(
-        repository, tmp_path, current_codes=lambda: {p.sku_1c for p in load_products(kb)}
+        repository,
+        tmp_path,
+        catalog=lambda: InMemoryCatalogRepository(CatalogIndex(load_products(kb))),
     )
 
     record = service.upload(valid_file, uploaded_by="manager")
 
-    assert record.summary.comparison == CatalogComparison(in_catalog=1, new=2, missing_from_file=1)
+    # Названия в этой базе знаний — коды, поэтому у S1 название не подтверждает код,
+    # а новые S2 и S3 не похожи на исчезнувший OLD.
+    assert record.summary.comparison == CatalogComparison(
+        in_catalog=1,
+        new=2,
+        missing_from_file=1,
+        matching=True,
+        existing_by_status={"MATCHED_REVIEW": 1},
+        recoding_checked=2,
+        recoding_candidates=0,
+        recoding_by_status={"NOT_FOUND": 2},
+    )
     assert (kb.read_bytes(), kb.stat().st_mtime_ns) == before
     assert sorted(path.name for path in kb.parent.iterdir()) == ["products.jsonl"]
     assert "есть в каталоге 1, новых 2, нет в файле 1" in format_preview(record, [])

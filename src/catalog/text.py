@@ -10,7 +10,18 @@ from __future__ import annotations
 import re
 
 _TOKEN = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
+_SPACES = re.compile(r"\s+")
 _MIN_STEM = 3
+
+
+def normalize_name(name: str) -> str:
+    """Название без различий в пробелах и регистре — ключ точного совпадения.
+
+    Живёт здесь, а не в разборе выгрузки: им пользуются и импорт, и
+    сопоставление с каталогом, а каталог от импорта не зависит.
+    """
+    return _SPACES.sub(" ", name.replace("\xa0", " ")).strip().casefold()
+
 
 # Порядок важен: длинные окончания проверяются раньше коротких.
 _SUFFIXES = (
