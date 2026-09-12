@@ -152,6 +152,8 @@ agent · catalog · norms · orders · privacy · media
 - **EPIC 3 (сопоставление) принят:** `catalog/matcher.py` — код 1С, название,
   артикул поставщика, похожее название; импорт 1С проверяет существующие коды
   и ищет перекодировку только среди исчезнувших (D10).
+- **EPIC 4 (diff, версии, откат):** решения приняты, конструкция —
+  docs/IMPLEMENTATION_PLAN.md, §6 (D11); реализация не начата.
 - **Тесты:** 519 passed, ruff чистый.
 
 **Ветки:**
@@ -161,7 +163,8 @@ agent · catalog · norms · orders · privacy · media
 - `epic-0/audit`, `epic-0.5/r1-widget-session` — точки завершения EPIC;
 - `epic-1/catalog-domain` — EPIC 1;
 - `epic-2/catalog-import` — EPIC 2, от EPIC 1;
-- `epic-3/matching` — EPIC 3, от EPIC 2.
+- `epic-3/matching` — EPIC 3, от EPIC 2;
+- `epic-4/catalog-versions` — EPIC 4, от EPIC 3 (пока только решения).
 
 Перед пушем история проверяется gitleaks; разобранные ложные срабатывания
 лежат в `.gitleaksignore`.
