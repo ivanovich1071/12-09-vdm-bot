@@ -1,7 +1,8 @@
 """Точка запуска без установки пакета.
 
     python run.py ingest --source data/raw/Pricelist20260826.xlsx
-    python run.py llm                       # проверить провайдеров модели
+    python run.py import-1c --file data/raw/Pricelist20260826.xlsx  # на проверку, бот не меняется
+    python run.py llm                      # проверить провайдеров модели
     python run.py media                     # фотографии с сайта → в базу знаний
     python run.py widget
     python run.py telegram
@@ -40,6 +41,17 @@ def main() -> None:
     ingest = sub.add_parser("ingest", help="собрать базу знаний из выгрузки 1С")
     ingest.add_argument("--source", default="data/raw/Pricelist20260826.xlsx")
     ingest.add_argument("--out", default="data/kb")
+
+    import_1c = sub.add_parser(
+        "import-1c",
+        help="загрузить выгрузку 1С на проверку: разбор и предпросмотр, каталог бота не меняется",
+    )
+    what = import_1c.add_mutually_exclusive_group(required=True)
+    what.add_argument("--file", help="выгрузка .xlsx")
+    what.add_argument("--list", action="store_true", help="последние импорты")
+    what.add_argument("--show", metavar="ID", help="предпросмотр импорта по номеру")
+    import_1c.add_argument("--issues", type=int, default=10,
+                           help="сколько проблем строк показать")
 
     norms = sub.add_parser("norms", help="разобрать реестр «пункт приказа 1057 → код 1С»")
     norms.add_argument("--source", default="Baza-Ivan-25-11-25.pdf")
@@ -88,6 +100,9 @@ def main() -> None:
 
         report = build(Path(args.source), Path(args.out))
         print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+
+    elif args.command == "import-1c":
+        _import_1c(args)
 
     elif args.command == "norms":
         from catalog.repository import load_products
@@ -171,6 +186,34 @@ def main() -> None:
             print(f"    {price_text(product.price)} · {stock_text(product)}")
             if hit.citation():
                 print(f"    {hit.citation()}")
+
+
+def _import_1c(args) -> None:  # noqa: ANN001 — argparse.Namespace
+    """Импорт выгрузки на проверку (EPIC 2). Базу знаний бота не трогает."""
+    import getpass
+
+    from catalog_import.files import UploadRejected
+    from catalog_import.service import build_service, format_imports, format_preview
+    from core.config import Settings
+
+    service = build_service(Settings.from_env())
+    if args.list:
+        print(format_imports(service.list_imports()))
+        return
+    if args.show:
+        record = service.get(args.show)
+        if record is None:
+            sys.exit(f"Импорта {args.show} нет.")
+    else:
+        try:
+            user = getpass.getuser()
+        except OSError:
+            user = "cli"
+        try:
+            record = service.upload(Path(args.file), uploaded_by=user)
+        except UploadRejected as exc:
+            sys.exit(f"Файл не принят: {exc}")
+    print(format_preview(record, service.issues(record.id, limit=args.issues)))
 
 
 def _parse_acts(args) -> None:  # noqa: ANN001 — argparse.Namespace

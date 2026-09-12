@@ -91,12 +91,25 @@ class XlsxFile:
 
     def rows(self, sheet: str | int = 0) -> Iterator[Row]:
         """Строки листа как {'A': значение, ...}. Пустые ячейки отсутствуют в словаре."""
+        for _number, row in self.numbered_rows(sheet):
+            yield row
+
+    def numbered_rows(self, sheet: str | int = 0) -> Iterator[tuple[int, Row]]:
+        """То же с номером строки, как его показывает Excel.
+
+        Пустые строки в файл не записываются вовсе, поэтому номер берётся из
+        атрибута `r`, а не считается по порядку — иначе «ошибка в строке 120»
+        указывала бы не на ту строку.
+        """
         name = self.sheet_names[sheet] if isinstance(sheet, int) else sheet
         strings = self.shared_strings
+        number = 0
         with self._zip.open(self._sheets[name]) as fh:
             for _, elem in ET.iterparse(fh, events=("end",)):
                 if elem.tag != f"{NS}row":
                     continue
+                ref = elem.attrib.get("r", "")
+                number = int(ref) if ref.isdigit() else number + 1
                 row: Row = {}
                 for pos, cell in enumerate(elem.iter(f"{NS}c")):
                     ref = cell.attrib.get("r")
@@ -105,7 +118,7 @@ class XlsxFile:
                     if value:
                         row[col] = value
                 elem.clear()
-                yield row
+                yield number, row
 
 
 def _cell_value(cell: ET.Element, strings: list[str]) -> str:

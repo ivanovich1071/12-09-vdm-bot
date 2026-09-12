@@ -30,6 +30,12 @@ class Settings:
     # Каталог
     kb_path: str = "data/kb/products.jsonl"
     storage_path: str = "data/vdm.sqlite3"
+    # Импорт выгрузки 1С на проверку (EPIC 2). База отдельная от `storage_path`:
+    # запись тысяч товаров не блокирует запись диалогов работающего бота, а
+    # коммерческие данные не лежат рядом с персональными (D9).
+    catalog_db_path: str = "data/catalog.sqlite3"
+    uploads_dir: str = "data/uploads"
+    import_max_mb: int = 50
 
     # Модель. Провайдеров два: Cloud.ru — то, где всё будет работать у заказчика,
     # OpenRouter — то, где диалог можно проверить с машины разработки, когда
@@ -98,6 +104,9 @@ class Settings:
         return cls(
             kb_path=env.get("KB_PATH", cls.kb_path),
             storage_path=env.get("STORAGE_PATH", cls.storage_path),
+            catalog_db_path=env.get("CATALOG_DB_PATH", cls.catalog_db_path),
+            uploads_dir=env.get("UPLOADS_DIR", cls.uploads_dir),
+            import_max_mb=int(env.get("IMPORT_MAX_MB", cls.import_max_mb)),
             llm_provider=env.get("LLM_PROVIDER", cls.llm_provider).strip().lower(),
             cloudru_api_key=env.get("CLOUDRU_API_KEY", ""),
             cloudru_base_url=env.get("CLOUDRU_BASE_URL", cls.cloudru_base_url),

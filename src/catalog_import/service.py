@@ -1,0 +1,337 @@
+"""Импорт выгрузки 1С: загрузка → контрольная сумма → разбор → проверка → предпросмотр.
+
+Загрузка каталог бота не меняет (D5): товары импорта лежат в своих таблицах,
+`products.jsonl` не трогается. Сопоставление по названию — EPIC 3, изменения по
+позициям, утверждение и применение — EPIC 4.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+import zipfile
+import zlib
+from collections import Counter
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+from xml.etree import ElementTree as ET
+
+from catalog_import.files import MB, MIME_TYPES, FileStore, check_upload, checksum, megabytes
+from catalog_import.models import (
+    CatalogComparison,
+    CatalogImport,
+    ImportItem,
+    ImportStatus,
+    ImportSummary,
+    Issue,
+    Severity,
+    StoredFile,
+)
+from catalog_import.parser import ParsedSheet, parse_products, read_bitrix_ids
+from catalog_import.repository import ImportRepository, SqliteImportRepository
+from catalog_import.validator import ISSUE_LABELS, file_issues, row_issues
+from ingest.xlsx_reader import XlsxFile
+
+if TYPE_CHECKING:
+    from core.config import Settings
+
+log = logging.getLogger(__name__)
+
+DEFAULT_MAX_BYTES = 50 * MB
+
+# Ошибки, с которыми файл не читается как книга Excel вообще: не zip, битый
+# архив, нет обязательных частей книги, испорченный XML.
+_UNREADABLE = (zipfile.BadZipFile, zlib.error, EOFError, KeyError, ET.ParseError, UnicodeDecodeError)
+
+
+@dataclass(frozen=True)
+class Inspection:
+    """Результат разбора и проверки одного файла. Ничего не записано."""
+
+    status: ImportStatus
+    summary: ImportSummary
+    items: list[ImportItem] = field(default_factory=list)
+    issues: list[Issue] = field(default_factory=list)
+    # Все коды 1С файла, включая исключённые, — для сравнения с каталогом.
+    codes: frozenset[str] = frozenset()
+
+
+class CatalogImportService:
+    def __init__(
+        self,
+        repository: ImportRepository,
+        files: FileStore,
+        *,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        current_codes: Callable[[], Iterable[str]] | None = None,
+        clock: Callable[[], str] | None = None,
+    ) -> None:
+        self.repository = repository
+        self.files = files
+        self.max_bytes = max_bytes
+        # Коды 1С каталога, с которым сейчас работает бот. `None` — сравнивать не с чем.
+        self.current_codes = current_codes
+        self._now = clock or _now
+
+    def upload(self, source: str | Path, uploaded_by: str) -> CatalogImport:
+        """Загрузка на проверку. Тот же файл второй раз возвращает прежний импорт."""
+        source = Path(source)
+        check_upload(source, self.max_bytes)
+        digest = checksum(source)
+
+        existing = self.repository.find_by_checksum(digest)
+        if existing is not None and existing.status is not ImportStatus.UPLOADED:
+            log.info("Импорт %s: файл %s уже загружали", existing.id, source.name)
+            return replace(existing, duplicate=True)
+
+        stored = self.files.store(source, digest)
+        now = self._now()
+        record = existing or self.repository.create(
+            StoredFile(
+                id=uuid.uuid4().hex,
+                filename=source.name,
+                mime_type=MIME_TYPES[source.suffix.lower()],
+                size=source.stat().st_size,
+                checksum=digest,
+                storage_path=str(stored),
+                uploaded_by=uploaded_by,
+                uploaded_at=now,
+            )
+        )
+
+        try:
+            inspection = inspect(stored, source_name=record.file.filename, now=now)
+        except Exception as exc:
+            # Импорт остаётся UPLOADED с причиной: повторная загрузка разберёт заново.
+            self.repository.fail(record.id, f"{type(exc).__name__}: {exc}")
+            raise
+
+        summary = inspection.summary
+        if inspection.status is ImportStatus.PARSED:
+            summary = replace(summary, comparison=self._compare(inspection.codes))
+        log.info(
+            "Импорт %s: %s, товаров %s, принято %s, ошибок %s, предупреждений %s",
+            record.id,
+            inspection.status,
+            summary.products,
+            summary.accepted,
+            summary.errors,
+            summary.warnings,
+        )
+        return self.repository.finish(
+            record.id, inspection.status, summary, inspection.items, inspection.issues, now
+        )
+
+    def get(self, import_id: str) -> CatalogImport | None:
+        return self.repository.get(import_id)
+
+    def list_imports(self, limit: int = 20) -> list[CatalogImport]:
+        return self.repository.list_imports(limit)
+
+    def items(self, import_id: str) -> list[ImportItem]:
+        return self.repository.items(import_id)
+
+    def issues(
+        self, import_id: str, severity: Severity | None = None, limit: int | None = None
+    ) -> list[Issue]:
+        return self.repository.issues(import_id, severity, limit)
+
+    def _compare(self, codes: frozenset[str]) -> CatalogComparison | None:
+        if self.current_codes is None:
+            return None
+        current = set(self.current_codes())
+        return CatalogComparison(
+            in_catalog=len(codes & current),
+            new=len(codes - current),
+            missing_from_file=len(current - codes),
+        )
+
+
+def inspect(path: Path, *, source_name: str, now: str) -> Inspection:
+    """Разбор и проверка файла выгрузки."""
+    try:
+        with XlsxFile(path) as book:
+            names = book.sheet_names
+            # Строки читаются целиком здесь, чтобы битый архив дал INVALID, а не
+            # исключение посреди разбора. Лист товаров — около 10 МБ текста.
+            products_rows = list(book.numbered_rows(0)) if names else []
+            bitrix_rows = list(book.numbered_rows(1)) if len(names) > 1 else []
+    except _UNREADABLE as exc:
+        return _invalid(
+            Issue(
+                Severity.ERROR,
+                "unreadable_file",
+                f"Файл не читается как книга Excel ({type(exc).__name__}).",
+            )
+        )
+    if not names:
+        return _invalid(Issue(Severity.ERROR, "no_sheets", "В книге нет ни одного листа."))
+
+    bitrix = read_bitrix_ids(bitrix_rows)
+    sheet = parse_products(
+        products_rows, bitrix_ids=bitrix.by_name, now=now, source_name=source_name
+    )
+    problems = file_issues(sheet)
+    if problems:
+        return Inspection(ImportStatus.INVALID, _summary(sheet, problems), issues=problems)
+
+    issues = row_issues(sheet, bitrix)
+    rejected = {
+        issue.sku_1c for issue in issues if issue.severity is Severity.ERROR and issue.sku_1c
+    }
+    coded = [product for product in sheet.products if product.sku_1c]
+    items = [
+        ImportItem(
+            sku_1c=product.sku_1c,
+            name=product.name,
+            price=product.price,
+            stock=product.in_stock,
+            rows=list(sheet.rows_by_key[product.sku_1c]),
+            payload=asdict(product),
+        )
+        for product in coded
+        if product.sku_1c not in rejected
+    ]
+    summary = _summary(
+        sheet,
+        issues,
+        accepted=len(items),
+        rejected=sum(product.sku_1c in rejected for product in coded),
+    )
+    return Inspection(
+        ImportStatus.PARSED, summary, items, issues, frozenset(p.sku_1c for p in coded)
+    )
+
+
+def build_service(settings: Settings) -> CatalogImportService:
+    """Сервис по настройкам приложения — для командной строки, а позже для админки."""
+    from catalog.repository import load_products
+
+    kb_path = Path(settings.kb_path)
+
+    def current_codes() -> set[str]:
+        return {product.sku_1c for product in load_products(kb_path) if product.is_active}
+
+    return CatalogImportService(
+        SqliteImportRepository(settings.catalog_db_path),
+        FileStore(settings.uploads_dir),
+        max_bytes=settings.import_max_mb * MB,
+        current_codes=current_codes if kb_path.exists() else None,
+    )
+
+
+# --- Предпросмотр --------------------------------------------------------------
+
+
+def format_preview(record: CatalogImport, issues: list[Issue]) -> str:
+    """Текст предпросмотра: только реальные числа импорта."""
+    summary = record.summary
+    lines = [
+        f"Импорт {record.id} — {record.status}",
+        f"Файл: {record.file.filename}, {megabytes(record.file.size)} МБ, "
+        f"sha256 {record.file.checksum[:16]}…, загрузил {record.uploaded_by}, {record.created_at}",
+    ]
+    if record.duplicate:
+        lines.append("Этот файл уже загружали: показан прежний импорт, новых записей нет.")
+
+    if record.status is ImportStatus.UPLOADED:
+        lines.append(
+            f"Разбор не завершён: {record.error or 'причина не записана'}. "
+            "Повторная загрузка того же файла разберёт его заново."
+        )
+    elif record.status is ImportStatus.INVALID:
+        lines.append("Файл непригоден для импорта:")
+        lines += [f"  • {issue.message}" for issue in issues if issue.severity is Severity.ERROR]
+    else:
+        lines += [
+            f"Строк на листе товаров: {_n(summary.rows_total)} — разделов {_n(summary.headings)}, "
+            f"строк товаров {_n(summary.product_rows)}",
+            f"Товаров (кодов 1С): {_n(summary.products)}, "
+            f"в нескольких разделах: {_n(summary.cross_listed)}",
+            f"Принято в импорт: {_n(summary.accepted)}, "
+            f"исключено из-за ошибок: {_n(summary.rejected)}",
+            f"Ошибок: {_n(summary.errors)}, предупреждений: {_n(summary.warnings)}",
+        ]
+        lines += [
+            f"  • {ISSUE_LABELS.get(code, code)}: {_n(count)}"
+            for code, count in summary.issues_by_code.items()
+        ]
+        comparison = summary.comparison
+        if comparison is None:
+            lines.append("Сравнение с текущим каталогом: база знаний бота не собрана.")
+        else:
+            lines.append(
+                f"Сравнение с текущим каталогом по коду 1С: есть в каталоге "
+                f"{_n(comparison.in_catalog)}, новых {_n(comparison.new)}, "
+                f"нет в файле {_n(comparison.missing_from_file)}"
+            )
+        if issues:
+            total = summary.errors + summary.warnings
+            shown = f" (показано {len(issues)} из {_n(total)})" if total > len(issues) else ""
+            lines.append(f"Проблемы строк{shown}:")
+            lines += [f"  {_issue_line(issue)}" for issue in issues]
+
+    lines.append("Каталог бота не изменён: утверждение и применение импорта появятся в EPIC 4.")
+    return "\n".join(lines)
+
+
+def format_imports(records: list[CatalogImport]) -> str:
+    if not records:
+        return "Импортов пока нет."
+    return "\n".join(
+        f"{record.id}  {record.status:<8}  {record.file.filename}  "
+        f"товаров {_n(record.summary.products)}, ошибок {_n(record.summary.errors)}, "
+        f"предупреждений {_n(record.summary.warnings)}  {record.created_at}"
+        for record in records
+    )
+
+
+def _issue_line(issue: Issue) -> str:
+    parts = ["ОШИБКА" if issue.severity is Severity.ERROR else "оговорка"]
+    if issue.sheet != 1:
+        parts.append(f"лист {issue.sheet}")
+    if issue.row_number is not None:
+        parts.append(f"строка {issue.row_number}")
+    if issue.column:
+        parts.append(f"колонка {issue.column}")
+    if issue.sku_1c:
+        parts.append(f"код {issue.sku_1c}")
+    return f"{', '.join(parts)}: {issue.message}"
+
+
+def _summary(
+    sheet: ParsedSheet, issues: list[Issue], accepted: int = 0, rejected: int = 0
+) -> ImportSummary:
+    coded = [product for product in sheet.products if product.sku_1c]
+    severities = Counter(issue.severity for issue in issues)
+    return ImportSummary(
+        rows_total=sheet.rows_total,
+        headings=len(sheet.headings),
+        product_rows=len(sheet.product_rows),
+        products=len({product.sku_1c for product in coded}),
+        cross_listed=sum(len(product.category_paths) > 1 for product in coded),
+        accepted=accepted,
+        rejected=rejected,
+        errors=severities[Severity.ERROR],
+        warnings=severities[Severity.WARNING],
+        issues_by_code=dict(Counter(issue.code for issue in issues).most_common()),
+    )
+
+
+def _invalid(issue: Issue) -> Inspection:
+    return Inspection(
+        ImportStatus.INVALID,
+        ImportSummary(errors=1, issues_by_code={issue.code: 1}),
+        issues=[issue],
+    )
+
+
+def _n(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")

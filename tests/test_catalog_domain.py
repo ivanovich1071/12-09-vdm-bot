@@ -502,8 +502,8 @@ class _Book:
     def __init__(self, rows: list[dict[str, str]]) -> None:
         self._rows = rows
 
-    def rows(self, _sheet: int) -> Iterator[dict[str, str]]:
-        return iter(self._rows)
+    def numbered_rows(self, _sheet: int) -> Iterator[tuple[int, dict[str, str]]]:
+        return enumerate(self._rows, start=1)
 
 
 def test_ingest_keeps_unknown_stock():
