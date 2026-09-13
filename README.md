@@ -79,9 +79,10 @@ python run.py media --sync
 python run.py search "мячи для спортивного зала в наличии до 2000 руб"
 
 # виджет и демо-страница: http://localhost:8000/demo
+# там же Core API (http://localhost:8000/api/health) и Mini App (/miniapp)
 python run.py widget
 
-# Telegram-бот (нужен TELEGRAM_TOKEN)
+# Telegram-бот через Core API: диалог, файл заказа, /spec, предзаказ (нужен TELEGRAM_TOKEN)
 python run.py telegram
 
 # тесты и линтер
@@ -99,9 +100,11 @@ ruff check src tests run.py
 ## Устройство
 
 ```text
-Telegram · виджет · (Mini App, MAX)     адаптеры, без бизнес-логики
+Telegram · Mini App · виджет · (MAX)   адаптеры, без бизнес-логики
             ↓
-       core/  ядро диалога              корзина · заказ · согласия · примитивы ответа
+   core_api/  Core API                  /api и CoreApi в процессе: один контракт
+            ↓
+ core/ диалог · procurement/ закупка · order_import/ заказ клиента · preorder/ предзаказ
             ↓
 agent · catalog · norms · orders · privacy · media
             ↓
@@ -121,11 +124,17 @@ agent · catalog · norms · orders · privacy · media
 | `src/orders/` | Приёмники заказа: файл, Excel, Google Sheets, заглушка CRM |
 | `src/media/` | Фото и характеристики со страниц сайта, кэш, запись в базу знаний |
 | `src/privacy/` | Маскирование ПДн, согласие |
-| `src/adapters/`, `src/web/` | Telegram; веб-виджет и HTTP |
+| `src/norms/` (NEXT-1) | Плюс нормативный движок: `NormRepository`, `NormSelector`, `NormMappingService` |
+| `src/procurement/` | Закупка: задача, требование, подбор по фильтрам каталога, количество с источником, спецификация с версиями |
+| `src/documents/` | Выгрузка спецификации в Excel и Word без новых зависимостей, шаблоны |
+| `src/order_import/` | Заказ клиента: разбор Excel/Word/PDF/CSV, нормализация, сопоставление, оценка цены, наличия, норматива |
+| `src/preorder/` | Предзаказ: статусы и история, передача менеджеру с согласием, уведомления, ручные решения |
+| `src/core_api/` | Core API: сессии, DTO, формат ошибок, `CoreApi` и маршруты `/api` |
+| `src/adapters/`, `src/web/` | Telegram через Core API (`gateway.py`), вход Mini App; веб-виджет, Mini App и HTTP |
 | `src/observability/` | Журнал диалогов |
 
-Планируемые модули v2 (`procurement/`, `order_import/`,
-`preorder/`, `documents/`, `knowledge/`, `admin/`) появляются по EPIC — см.
+Ядро, API и каналы описаны в [docs/CORE.md](docs/CORE.md). Впереди — `knowledge/`
+(Obsidian как источник базы знаний) и `admin/`, см.
 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
 
 ## Документы
@@ -135,6 +144,7 @@ agent · catalog · norms · orders · privacy · media
 | [ДОРОЖНАЯ_КАРТА.md](ДОРОЖНАЯ_КАРТА.md) | Статус EPIC v2, решения, блокеры; история v1 |
 | [docs/TZ_V2.md](docs/TZ_V2.md) | Сводное техническое задание v2 |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Принятые решения по вопросам аудита |
+| [docs/CORE.md](docs/CORE.md) | NEXT-1…4: Procurement Core, Order Core, Core API, Telegram и Mini App — решения, контракт, проверки |
 | [docs/ARCHITECTURE_CHANGE.md](docs/ARCHITECTURE_CHANGE.md) | EPIC 4: версии каталога, diff, горячая замена — архитектура, замеры, выкат |
 | [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) | План EPIC 0.5–15, оценки, зависимости |
 | [docs/AUDIT.md](docs/AUDIT.md) | Аудит baseline: компоненты, расхождения с ТЗ, риски |
@@ -169,9 +179,15 @@ agent · catalog · norms · orders · privacy · media
   Проверено на реальной выгрузке 26.08: повторная загрузка — UNCHANGED 5 936, новая
   цена видна боту без перезапуска (D11, docs/ARCHITECTURE_CHANGE.md). Рабочий
   `data/kb` переводится на версии командой `catalog init` при выкате.
-- **Дальше (D12):** Procurement Core → Order Core → Core API → Telegram + Mini App,
-  затем MAX и Web Widget на том же Core API.
-- **Тесты:** 591 passed, ruff чистый.
+- **NEXT-1…4 (D12, D13) — ядро и первый канал, 13.09:**
+  - Procurement Core: норматив → подбор → количество → спецификация → Excel/Word;
+  - Order Core: файл заказа → сопоставление → цена, наличие, норматив → оценка → предзаказ;
+  - Core API `/api` с единым контрактом ответа и ошибок;
+  - Telegram-бот и Mini App — через Core API.
+
+  Всё проверено без Telegram сквозным сценарием и на реальном каталоге (docs/CORE.md).
+- **Дальше (D12):** NEXT-5 MAX + Mini App (ждёт токена), NEXT-6 Web Widget, NEXT-7 Admin / CRM.
+- **Тесты:** 724 passed, ruff чистый.
 
 **Ветки:**
 
@@ -182,6 +198,8 @@ agent · catalog · norms · orders · privacy · media
 - `epic-2/catalog-import` — EPIC 2, от EPIC 1;
 - `epic-3/matching` — EPIC 3, от EPIC 2;
 - `epic-4/catalog-versions` — EPIC 4, от EPIC 3.
+- `next-1/procurement-core` → `next-2/order-core` → `next-3/core-api` →
+  `next-4/telegram-miniapp` — NEXT-1…4, каждая от предыдущей.
 
 Перед пушем история проверяется gitleaks; разобранные ложные срабатывания
 лежат в `.gitleaksignore`.
