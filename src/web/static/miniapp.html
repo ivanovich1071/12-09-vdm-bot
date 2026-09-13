@@ -304,7 +304,7 @@
     preorder: async function () {
       var p = state.preorder;
       if (!p) { screen.innerHTML = '<h2>Предзаказ</h2><div class="card">Оформите предзаказ из спецификации или проверенного заказа.</div>'; return; }
-      state.session = (await api("GET", "/api/sessions/" + state.session.id)).data;
+      state.session = (await api("GET", "/api/session")).data;
       var consent = state.session.consent;
       var html = "<h2>Предзаказ " + esc(p.id) + "</h2>" + chip(p.status) + notices(p.warnings) +
         '<div class="card">Позиций ' + p.totals.positions + " на " + money(p.totals.amount) + " по текущим ценам. " +
@@ -320,7 +320,7 @@
       if (send) send.addEventListener("click", function () { guard(async function () {
         if (!consent.active) {
           if (!document.getElementById("agree").checked) throw new Error("Без согласия на обработку персональных данных передать менеджеру нельзя.");
-          await api("POST", "/api/sessions/" + state.session.id + "/consent", { granted: true });
+          await api("POST", "/api/session/consent", { granted: true });
         }
         var customer = {};
         ["name", "phone", "email", "organization", "region", "comment"].forEach(function (f) { customer[f] = document.getElementById(f).value.trim(); });

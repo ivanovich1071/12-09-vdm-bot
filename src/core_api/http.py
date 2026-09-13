@@ -208,6 +208,26 @@ def create_router(get_core: Callable[[], CoreApi], settings: Settings) -> APIRou
     def delete_data(request: Request, current: CoreSession = Depends(by_path), api: CoreApi = Depends(core)) -> JSONResponse:
         return ok(request, api.delete_data(current))
 
+    # Текущая сессия — по заголовку `X-Session-Id`. Идентификатор сессии и есть пропуск, а
+    # адрес запроса оседает в журналах сервера и прокси: публичному клиенту (Mini App)
+    # класть его в путь незачем. Маршруты с `{session_id}` оставлены для совместимости.
+
+    @router.get("/session")
+    def current_session(request: Request, current: CoreSession = Depends(session), api: CoreApi = Depends(core)) -> JSONResponse:
+        return ok(request, api.get_session(current))
+
+    @router.post("/session/consent")
+    def current_consent(request: Request, body: dto.ConsentIn, current: CoreSession = Depends(session), api: CoreApi = Depends(core)) -> JSONResponse:
+        return ok(request, api.consent(current, body.granted))
+
+    @router.get("/session/data")
+    def current_export(request: Request, current: CoreSession = Depends(session), api: CoreApi = Depends(core)) -> JSONResponse:
+        return ok(request, api.export_data(current))
+
+    @router.delete("/session/data")
+    def current_delete(request: Request, current: CoreSession = Depends(session), api: CoreApi = Depends(core)) -> JSONResponse:
+        return ok(request, api.delete_data(current))
+
     # --- Диалог -------------------------------------------------------------------------
 
     @router.post("/dialogue/message")

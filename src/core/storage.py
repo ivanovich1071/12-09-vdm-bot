@@ -356,6 +356,19 @@ class Storage:
         )
         self._db.commit()
 
+    def dialog_state_stamp(self, user_id: str, channel: str) -> tuple[str, int, int] | None:
+        """Отметка сохранённого разговора: время записи и размеры, без чтения переписки.
+
+        Время хранится с точностью до секунды, поэтому к нему добавлены длины — две
+        записи из разных процессов в одну секунду иначе не различить.
+        """
+        row = self._db.execute(
+            "SELECT updated_at, length(history), length(profile) FROM dialog_state "
+            "WHERE user_id = ? AND channel = ?",
+            (user_id, channel),
+        ).fetchone()
+        return (row[0], row[1], row[2]) if row else None
+
     def forget_dialog(self, user_id: str, channel: str | None = None) -> None:
         if channel is None:
             self._db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))

@@ -190,8 +190,14 @@ app = create_app() if __name__ != "__main__" else None
 def main() -> None:
     import uvicorn
 
+    from observability import redact
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
+    # Токен бота и ключи — вне журнала, включая записи uvicorn.
+    redact.install(settings.secret_values)
+    for name in settings.ignored_env:
+        log.warning("%s больше не читается — см. .env.example", name)
     uvicorn.run(
         # Прогрев провайдера при запуске: отказ Cloud.ru должен стоить времени
         # старта, а не первого сообщения пользователя.

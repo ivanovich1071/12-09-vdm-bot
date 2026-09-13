@@ -82,7 +82,8 @@ python run.py search "мячи для спортивного зала в нал�
 # там же Core API (http://localhost:8000/api/health) и Mini App (/miniapp)
 python run.py widget
 
-# Telegram-бот через Core API: диалог, файл заказа, /spec, предзаказ (нужен TELEGRAM_TOKEN)
+# Telegram-бот через Core API: диалог, файл заказа, /spec, предзаказ (нужен TELEGRAM_BOT_TOKEN)
+python run.py telegram --check   # токен, webhook, модель, Mini App — без запуска
 python run.py telegram
 
 # тесты и линтер
@@ -186,8 +187,18 @@ agent · catalog · norms · orders · privacy · media
   - Telegram-бот и Mini App — через Core API.
 
   Всё проверено без Telegram сквозным сценарием и на реальном каталоге (docs/CORE.md).
-- **Дальше (D12):** NEXT-5 MAX + Mini App (ждёт токена), NEXT-6 Web Widget, NEXT-7 Admin / CRM.
-- **Тесты:** 724 passed, ruff чистый.
+- **NEXT-4.1 (D14) — живой Telegram с нового бота:**
+  - токен — только `TELEGRAM_BOT_TOKEN`, секреты маскируются в журнале;
+  - Mini App не передаёт идентификатор сессии в адресе;
+  - бот работает только через Core API;
+  - разговор, который ведут бот и Mini App, не теряется;
+  - проверка перед запуском — `python run.py telegram --check`.
+
+  Живой запуск ждёт токена нового бота и публичного HTTPS-адреса; инструкция и
+  чек-лист — docs/CORE.md, раздел NEXT-4.1.
+- **Дальше (D12):** после живой проверки Telegram — NEXT-5 MAX + Mini App (ждёт токена),
+  NEXT-6 Web Widget, NEXT-7 Admin / CRM.
+- **Тесты:** 741 passed, ruff чистый.
 
 **Ветки:**
 
@@ -199,7 +210,8 @@ agent · catalog · norms · orders · privacy · media
 - `epic-3/matching` — EPIC 3, от EPIC 2;
 - `epic-4/catalog-versions` — EPIC 4, от EPIC 3.
 - `next-1/procurement-core` → `next-2/order-core` → `next-3/core-api` →
-  `next-4/telegram-miniapp` — NEXT-1…4, каждая от предыдущей.
+  `next-4/telegram-miniapp` → `next-4-1/telegram-live` — NEXT-1…4.1, каждая от
+  предыдущей.
 
 Перед пушем история проверяется gitleaks; разобранные ложные срабатывания
 лежат в `.gitleaksignore`.

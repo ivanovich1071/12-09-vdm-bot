@@ -98,7 +98,9 @@ def main() -> None:
                       help="сверить пункты базы знаний с текстами приказов")
 
     sub.add_parser("widget", help="поднять веб-виджет и демо-страницу")
-    sub.add_parser("telegram", help="запустить Telegram-бота")
+    telegram = sub.add_parser("telegram", help="запустить Telegram-бота")
+    telegram.add_argument("--check", action="store_true",
+                          help="проверить токен, webhook и Mini App, не запуская бота")
     sub.add_parser("llm", help="проверить провайдеров модели по шагам")
 
     search = sub.add_parser("search", help="проверить поиск из консоли")
@@ -188,6 +190,10 @@ def main() -> None:
         from adapters.telegram.bot import use_compatible_event_loop
 
         use_compatible_event_loop()
+        if args.check:
+            from adapters.telegram.preflight import main as preflight
+
+            sys.exit(asyncio.run(preflight()))
         asyncio.run(run_bot())
 
     elif args.command == "llm":

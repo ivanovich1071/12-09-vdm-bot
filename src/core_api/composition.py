@@ -70,3 +70,17 @@ def build_core(
     engine.storage.add_user_data_hook(CoreUserData(procurement_repository, orders, preorder_repository))
     engine.storage.add_user_data_hook(SessionUserData(sessions))
     return CoreServices(settings, engine, db, norms, procurement, orders, preorders, sessions)
+
+
+def build_core_api(settings: Settings, *, warm_llm: bool = False, verifiers=None):  # noqa: ANN001, ANN201
+    """Готовый Core API для процесса канала.
+
+    Адаптер получает фасад целиком и не собирает ни движок диалога, ни хранилище, ни
+    каталог: обойти Core API ему нечем. Фасад импортируется здесь, а не в начале
+    модуля: `core_api.facade` сам зависит от `CoreServices`.
+    """
+    from core.app import build_engine
+    from core_api.facade import CoreApi
+
+    engine = build_engine(settings, warm_llm=warm_llm)
+    return CoreApi(build_core(settings, engine), verifiers)

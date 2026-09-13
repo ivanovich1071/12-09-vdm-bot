@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ENV_FILE = Path(".env")
+# Переменные, которые больше не читаются. TELEGRAM_TOKEN заменён на TELEGRAM_BOT_TOKEN
+# (NEXT-4.1): бот создаётся заново, и токен прежнего бота не должен подхватиться.
+LEGACY_ENV = ("TELEGRAM_TOKEN",)
 
 
 def load_env(path: Path = ENV_FILE) -> None:
@@ -84,7 +87,12 @@ class Settings:
     openrouter_price_out: float = 0.0
 
     # Каналы
+    # Токен бота от @BotFather — переменная TELEGRAM_BOT_TOKEN. Прежнее имя
+    # TELEGRAM_TOKEN не читается: под ним в старых .env лежит токен прежнего бота,
+    # и новый бот не должен молча запуститься с ним.
     telegram_token: str = ""
+    # Устаревшие переменные, заданные в окружении, — чтобы сказать о них при запуске.
+    ignored_env: list[str] = field(default_factory=list)
     # Публичный HTTPS-адрес Mini App (…/miniapp). Задан — бот ставит кнопку меню «Приложение».
     telegram_miniapp_url: str = ""
     max_token: str = ""
@@ -173,7 +181,8 @@ class Settings:
             cloudru_price_out=float(env.get("CLOUDRU_PRICE_OUT", cls.cloudru_price_out)),
             openrouter_price_in=float(env.get("OPENROUTER_PRICE_IN", cls.openrouter_price_in)),
             openrouter_price_out=float(env.get("OPENROUTER_PRICE_OUT", cls.openrouter_price_out)),
-            telegram_token=env.get("TELEGRAM_TOKEN", ""),
+            telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
+            ignored_env=[name for name in LEGACY_ENV if env.get(name)],
             telegram_miniapp_url=env.get("TELEGRAM_MINIAPP_URL", ""),
             max_token=env.get("MAX_TOKEN", ""),
             site_url=env.get("SITE_URL", cls.site_url),
@@ -198,6 +207,18 @@ class Settings:
             widget_host=env.get("WIDGET_HOST", cls.widget_host),
             widget_port=int(env.get("WIDGET_PORT", cls.widget_port)),
         )
+
+    @property
+    def secret_values(self) -> tuple[str, ...]:
+        """Значения, которых не должно быть в журнале (`observability/redact.py`)."""
+        values = (
+            self.telegram_token,
+            self.core_api_key,
+            self.core_manager_key,
+            self.cloudru_api_key,
+            self.openrouter_api_key,
+        )
+        return tuple(value for value in values if value)
 
     @property
     def core_database_path(self) -> str:

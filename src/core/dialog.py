@@ -171,6 +171,10 @@ class Session:
     # подтвердили за разговор. Модель ссылается на пункт из прошлого хода так же
     # свободно, как на цену, и проверка по одному ходу отвергала бы честный ответ.
     norm_refs: set[tuple[str, str]] = field(default_factory=set)
+    # Какое сохранённое состояние разговора видел этот процесс. Разговор одного человека
+    # ведут два процесса с общим хранилищем — бот и сервер Mini App, — и по отметке
+    # процесс замечает, что разговор продолжился у соседа.
+    state_stamp: tuple | None = None
 
     def remember(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": self.masker.mask(content)})
@@ -257,6 +261,7 @@ class DialogEngine:
         if saved:
             session.history = saved["history"]
             session.profile = DialogProfile.from_dict(saved["profile"])
+            session.state_stamp = self._stamp(session)
         return session
 
     def _remember(self, session: Session) -> None:
@@ -266,6 +271,41 @@ class DialogEngine:
             )
         except Exception as exc:  # запись состояния не стоит ответа пользователю
             log.warning("Состояние диалога %s не сохранено: %s", session.user_id, exc)
+            return
+        session.state_stamp = self._stamp(session)
+
+    def _stamp(self, session: Session) -> tuple | None:
+        try:
+            return self.storage.dialog_state_stamp(session.user_id, session.channel)
+        except Exception as exc:  # сверка не стоит ответа пользователю
+            log.warning("Отметка разговора %s не прочитана: %s", session.user_id, exc)
+            return session.state_stamp
+
+    def _sync(self, session: Session) -> None:
+        """Подхватить разговор, продолженный другим процессом.
+
+        Бот и сервер Mini App — разные процессы с общим хранилищем, а сессия диалога
+        живёт в памяти каждого. Без сверки бот продолжал бы по своей копии и при записи
+        затёр бы то, что человек обсудил в Mini App, а переписка, удалённая там по
+        /delete_data, вернулась бы на диск с первым же ответом бота.
+        """
+        stamp = self._stamp(session)
+        if stamp == session.state_stamp:
+            return
+        saved = None
+        if stamp is not None:
+            try:
+                saved = self.storage.load_dialog_state(session.user_id, session.channel)
+            except Exception as exc:  # как при восстановлении: не мешаем ответить
+                log.warning("Состояние диалога %s не прочитано: %s", session.user_id, exc)
+                return
+        if saved:
+            session.history = saved["history"]
+            session.profile = DialogProfile.from_dict(saved["profile"])
+        else:
+            # Удалено снаружи — по сроку хранения или по требованию субъекта.
+            session.forget()
+        session.state_stamp = stamp if saved else None
 
     # --- Точки входа ---------------------------------------------------------
 
@@ -283,6 +323,7 @@ class DialogEngine:
             # Шаги сбора контактов — это чистые персональные данные и ничего не дают
             # для настройки промптов. В журнал вместо них идёт отметка о шаге.
             session = self.session(user_id, channel)
+            self._sync(session)
             collecting = session.checkout_step is not None
             session.usage = {}
             session.route = {}
@@ -298,6 +339,7 @@ class DialogEngine:
             # нажатие «Корзина» в журнал уходили токены и рубли предыдущего ответа
             # модели — 02.09 один и тот же ход оказался посчитан трижды.
             session = self.session(user_id, channel)
+            self._sync(session)
             session.usage = {}
             session.route = {}
             responses = self._handle_action(user_id, channel, action)

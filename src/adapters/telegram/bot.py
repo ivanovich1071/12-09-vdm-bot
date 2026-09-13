@@ -1,10 +1,12 @@
 """Адаптер Telegram.
 
-Ничего не решает сам: переводит сообщения и нажатия в вызовы ядра, а примитивы
-ответа — в сообщения Telegram. Любое правило продажи, согласия или корзины живёт
-в `core/dialog.py`, иначе каналы разойдутся.
+Ничего не решает сам: переводит сообщения и нажатия в вызовы Core API (через
+`TelegramGateway`), а ответы — в сообщения Telegram. Правила консультанта и
+продажника, корзины, подбора, заказа и согласия живут в ядре, иначе каналы
+разойдутся. Движок диалога, каталог и хранилище бот не собирает и не трогает.
 
-    python -m adapters.telegram.bot
+    python run.py telegram          # бот
+    python run.py telegram --check  # токен, webhook, Mini App — без запуска
 """
 
 from __future__ import annotations
@@ -28,9 +30,7 @@ from aiogram.types import (
 )
 
 from adapters.telegram.gateway import ContactRequest, FileReply, TelegramGateway
-from core.app import build_engine
 from core.config import Settings
-from core.dialog import DialogEngine
 from core.ui import (
     Keyboard,
     Message,
@@ -41,8 +41,8 @@ from core.ui import (
     price_text,
     stock_text,
 )
-from core_api.composition import build_core
-from core_api.facade import CoreApi
+from core_api.composition import build_core_api
+from observability import redact
 
 log = logging.getLogger(__name__)
 CHANNEL = "telegram"
@@ -400,31 +400,24 @@ def _remember_photo(storage, card: ProductCard, sent) -> None:  # noqa: ANN001
     storage.save_telegram_photo(card.image_path, card.product.sku_1c, sizes[-1].file_id)
 
 
-def build_dispatcher(engine: DialogEngine, gateway: TelegramGateway | None = None) -> Dispatcher:
-    """Обработчики Telegram.
+def build_dispatcher(gateway: TelegramGateway) -> Dispatcher:
+    """Обработчики Telegram — все через Core API (`TelegramGateway`).
 
-    С `gateway` бот работает через Core API (NEXT-4): диалог, файл заказа, спецификация,
-    предзаказ. Без него — прежний путь напрямую в движок диалога; он остаётся, пока
-    Telegram переводится на Core API постепенно.
+    Прежнего пути напрямую в движок диалога больше нет (NEXT-4.1): бот не может
+    обойти Core API, даже случайно.
     """
     dispatcher = Dispatcher()
-    target = gateway or engine
 
     @dispatcher.message(F.text)
     async def on_text(message: TgMessage, bot: Bot) -> None:
         # Команды разбирает ядро: /start одинаково начинает разговор заново и в
         # Telegram, и в виджете, и правило это должно жить в одном месте.
         user, chat, text = str(message.from_user.id), message.chat.id, message.text
-        work = (
-            (lambda: gateway.text(user, text))
-            if gateway is not None
-            else (lambda: engine.handle_text(user, CHANNEL, text))
-        )
         await _reply(
             bot,
             chat,
-            target,
-            work,
+            gateway,
+            lambda: gateway.text(user, text),
             # Строка кнопок ставится на приветствие: /start человек зовёт и в
             # начале разговора, и когда хочет начать заново.
             persistent=text.strip().lower().startswith("/start"),
@@ -434,24 +427,16 @@ def build_dispatcher(engine: DialogEngine, gateway: TelegramGateway | None = Non
     async def on_callback(query: CallbackQuery, bot: Bot) -> None:
         user, chat, data = str(query.from_user.id), query.message.chat.id, query.data
         await _quietly(query.answer())
-        work = (
-            (lambda: gateway.action(user, data))
-            if gateway is not None
-            else (lambda: engine.handle_action(user, CHANNEL, data))
-        )
         await _reply(
             bot,
             chat,
-            target,
-            work,
+            gateway,
+            lambda: gateway.action(user, data),
             origin=query.message,
             # «Начать заново» кнопкой возвращает то же приветствие, что и /start,
             # — и строку кнопок вместе с ним.
             persistent=data == "restart_yes",
         )
-
-    if gateway is None:
-        return dispatcher
 
     @dispatcher.message(F.document)
     async def on_document(message: TgMessage, bot: Bot) -> None:
@@ -485,12 +470,14 @@ def build_dispatcher(engine: DialogEngine, gateway: TelegramGateway | None = Non
 async def _reply(  # noqa: ANN001
     bot: Bot,
     chat_id: int,
-    engine: DialogEngine,
+    source,
     work,
     origin: TgMessage | None = None,
     persistent: bool = False,
 ) -> None:
     """Ответ на сообщение: считаем в отдельном потоке, показываем «печатает».
+
+    `source` — шлюз: у него рендер берёт только кэш `file_id` снимков Telegram.
 
     Ядро диалога синхронное, а ход с обращением к модели занимает от минуты до
     трёх. Вызванное прямо в обработчике, оно вставало поперёк цикла событий: бот
@@ -517,7 +504,7 @@ async def _reply(  # noqa: ANN001
         return
 
     try:
-        await send(bot, chat_id, responses, engine.storage, origin, persistent=persistent)
+        await send(bot, chat_id, responses, source.storage, origin, persistent=persistent)
     except TelegramNetworkError as exc:
         # Ответ уже посчитан, но связь оборвалась. Молчим в чат и остаёмся живыми:
         # опрос продолжится, а человек повторит вопрос.
@@ -597,16 +584,24 @@ def use_compatible_event_loop() -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
+    # Токен стоит в адресе каждого запроса к Telegram и может оказаться в тексте ошибки —
+    # маскируем его в журнале до того, как бот сделает первый запрос.
+    redact.install(settings.secret_values)
+    if "TELEGRAM_TOKEN" in settings.ignored_env:
+        log.warning(
+            "TELEGRAM_TOKEN больше не читается: токен бота — только в TELEGRAM_BOT_TOKEN. "
+            "Удалите старую строку из .env."
+        )
     if not settings.telegram_token:
-        raise SystemExit("Не задан TELEGRAM_TOKEN — бот не запускается.")
+        raise SystemExit("Не задан TELEGRAM_BOT_TOKEN — бот не запускается.")
 
     bot = Bot(settings.telegram_token, default=_default_properties(), session=_session())
     bot.session.middleware(RetryOnNetworkError())
-    engine = build_engine(settings, warm_llm=True)
+    # Бот получает готовый Core API и сам не собирает ни движок, ни хранилище.
     gateway = TelegramGateway(
-        CoreApi(build_core(settings, engine)), settings.order_upload_max_mb * 1024 * 1024
+        build_core_api(settings, warm_llm=True), settings.order_upload_max_mb * 1024 * 1024
     )
-    dispatcher = build_dispatcher(engine, gateway)
+    dispatcher = build_dispatcher(gateway)
     await _publish_commands(bot)
     await _publish_miniapp(bot, settings.telegram_miniapp_url)
     log.info("Telegram-бот запущен")

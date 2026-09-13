@@ -105,6 +105,28 @@ def test_preorders_command(env):
     assert "PO-" in listing.text and "готов к передаче" in listing.text
 
 
+def test_telegram_users_cannot_reach_each_other(env):
+    api, gateway = env
+    alice, bob = "1001", "1002"
+    gateway.action(alice, "add:I1")
+    [excel] = gateway.text(alice, "/spec")
+    spec_id = next(a for a in actions(excel) if a.startswith("po_spec:")).split(":", 1)[1]
+    [evaluation] = gateway.upload(alice, "заказ.xlsx", xlsx([HEADER, ["1", "B1", "Мяч баскетбольный № 3", "2", "908"]]))
+    order_id = next(a for a in actions(evaluation) if a.startswith("po_order:")).split(":", 1)[1]
+    _, consent = gateway.action(alice, f"po_order:{order_id}")
+    preorder_id = next(a for a in actions(consent) if a.startswith("po_consent:")).split(":", 1)[1]
+
+    for foreign in (f"spec_xlsx:{spec_id}", f"spec_docx:{spec_id}", f"po_spec:{spec_id}", f"po_order:{order_id}"):
+        [reply] = gateway.action(bob, foreign)
+        assert type(reply) is Message and "не найден" in reply.text, (foreign, reply)
+    # Чужой предзаказ не отправить и через согласие с контактом.
+    gateway.action(bob, f"po_consent:{preorder_id}")
+    [refused] = gateway.contact(bob, "Боб", "+79001112233")
+    assert "не найден" in refused.text and api.notifier.sent == []
+    assert "пока нет" in gateway.text(bob, "/preorders")[0].text
+    assert "Корзина пуста" in gateway.text(bob, "/spec")[0].text
+
+
 def test_delete_data_resets_adapter_session(env):
     _, gateway = env
     gateway.text(USER, "здравствуйте")
@@ -134,10 +156,10 @@ async def test_renderer_sends_files_and_contact_button():
     assert text == "Пришлите контакт" and markup.keyboard[0][0].request_contact is True
 
 
-def test_dispatcher_with_gateway_handles_files_and_contacts(env):
-    api, gateway = env
-    assert len(build_dispatcher(api.engine).message.handlers) == 1
-    assert len(build_dispatcher(api.engine, gateway).message.handlers) == 3
+def test_dispatcher_handles_text_files_and_contacts_through_gateway(env):
+    _, gateway = env
+    dispatcher = build_dispatcher(gateway)
+    assert len(dispatcher.message.handlers) == 3 and len(dispatcher.callback_query.handlers) == 1
 
 
 ALLOWED = {
