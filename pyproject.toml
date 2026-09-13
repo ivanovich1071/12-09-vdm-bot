@@ -55,3 +55,7 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# `Depends(...)` в значениях по умолчанию — способ FastAPI объявлять зависимости.
+"src/core_api/http.py" = ["B008"]

@@ -54,10 +54,18 @@ class ActionIn(BaseModel):
     action: str = Field(min_length=1, max_length=128)
 
 
-def create_app(settings: Settings | None = None, warm_llm: bool = False) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    warm_llm: bool = False,
+    *,
+    engine=None,  # noqa: ANN001 — core.dialog.DialogEngine, для тестов и встраивания
+    core=None,  # noqa: ANN001 — core_api.facade.CoreApi
+    verifiers=None,  # noqa: ANN001 — способы входа публичных клиентов Core API
+) -> FastAPI:
     settings = settings or Settings.from_env()
-    engine = build_engine(settings, warm_llm=warm_llm)
+    engine = engine or build_engine(settings, warm_llm=warm_llm)
     app = FastAPI(title="ЭЛТИ-КУДИЦ · бот-консультант", docs_url=None, redoc_url=None)
+    _install_core_api(app, settings, engine, core, verifiers)
 
     # Виджет ставится на сайт заказчика, поэтому список источников задаётся явно:
     # открывать его всему интернету незачем.
@@ -136,6 +144,31 @@ def create_app(settings: Settings | None = None, warm_llm: bool = False) -> Fast
         return HTMLResponse(html.replace("__BASE_URL__", str(request.base_url).rstrip("/")))
 
     return app
+
+
+def _install_core_api(app: FastAPI, settings: Settings, engine, core, verifiers) -> None:  # noqa: ANN001
+    """Core API на `/api` в том же процессе, что виджет: одна версия каталога, одно хранилище.
+
+    Ядро собирается при первом обращении к `/api`: запуск виджета и существующие
+    ручки от этого не зависят и базу ядра не трогают.
+    """
+    import threading
+
+    from core_api.composition import build_core
+    from core_api.facade import CoreApi
+    from core_api.http import install
+
+    holder: dict[str, CoreApi] = {"core": core} if core is not None else {}
+    lock = threading.Lock()
+
+    def get_core() -> CoreApi:
+        if "core" not in holder:
+            with lock:
+                if "core" not in holder:
+                    holder["core"] = CoreApi(build_core(settings, engine), verifiers)
+        return holder["core"]
+
+    install(app, get_core, settings)
 
 
 app = create_app() if __name__ != "__main__" else None

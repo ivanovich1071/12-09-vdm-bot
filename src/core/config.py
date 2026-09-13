@@ -56,6 +56,8 @@ class Settings:
     core_db_path: str = ""
     # Загрузка готового заказа клиента (Excel, Word, PDF, CSV).
     order_upload_max_mb: int = 20
+    # Отчёты менеджеру о предзаказах, пока CRM недоступна.
+    preorders_dir: str = "data/preorders"
     # Ключ адаптеров к Core API (серверные каналы) и ключ ручных операций менеджера.
     # Пусто — соответствующие ручки отвечают 503: без ключа API не открывается.
     core_api_key: str = ""
@@ -153,6 +155,7 @@ class Settings:
             ),
             core_db_path=env.get("CORE_DB_PATH", cls.core_db_path),
             order_upload_max_mb=int(env.get("ORDER_UPLOAD_MAX_MB", cls.order_upload_max_mb)),
+            preorders_dir=env.get("PREORDERS_DIR", cls.preorders_dir),
             core_api_key=env.get("CORE_API_KEY", ""),
             core_manager_key=env.get("CORE_MANAGER_KEY", ""),
             llm_provider=env.get("LLM_PROVIDER", cls.llm_provider).strip().lower(),

@@ -52,3 +52,15 @@ class Conflict(DomainError):
 
 class Forbidden(DomainError):
     code = "FORBIDDEN"
+
+
+class Unauthorized(DomainError):
+    """Нет сессии или ключа адаптера."""
+
+    code = "UNAUTHORIZED"
+
+
+class Unavailable(DomainError):
+    """Возможность выключена конфигурацией: например, не задан ключ."""
+
+    code = "SERVICE_UNAVAILABLE"

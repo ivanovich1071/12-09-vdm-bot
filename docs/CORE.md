@@ -161,3 +161,100 @@ Telegram · MAX · Web Widget · Mini Apps  →  Core API  →  Dialogue · Proc
 | Строки: код 1С, точное название, цена −10 %, опечатка, выдуманный товар, без количества | Excel, Word, PDF — одинаково: `MATCHED_EXACT`, `MATCHED_HIGH`, `PRICE_CHANGED`, `MATCHED_REVIEW`, `NOT_FOUND`, `QUANTITY_UNKNOWN`; итог `REVIEW_REQUIRED` |
 | Спецификация 1057 → Excel → загрузка → оценка → предзаказ → менеджер | все строки `MATCHED_EXACT`, `PRICE_OK`, `NORM_OK`, сумма совпадает; `SENT_TO_MANAGER`, отчёт менеджеру записан |
 | Время | разбор файла 0,02–0,03 с; первая оценка 0,6 с (индекс названий на версию), следующие 0,01–0,02 с |
+
+## NEXT-3. Core API
+
+Единый API между каналами и ядром. Два входа, один контракт:
+
+- **в процессе** — `core_api/facade.py`, класс `CoreApi`. Им пользуется Telegram-адаптер;
+- **по HTTP** — `core_api/http.py`, маршруты `/api/*` в том же приложении, что виджет
+  (`web/app.py`). Одна версия каталога, одно хранилище.
+
+Ядро для `/api` собирается при первом обращении (`core_api/composition.py`). Запуск
+виджета и прежние ручки от него не зависят.
+
+| Модуль | Что делает |
+|---|---|
+| `core_api/composition.py` | `build_core`: база ядра, нормативная база, сервисы закупки, заказов, предзаказов, сессий; подключает данные ядра к `Storage` (ФЗ-152) |
+| `core_api/sessions.py`, `core/schema/0004_sessions.sql` | `CoreSession`, `SessionService`, `IdentityVerifier` |
+| `core_api/dto.py` | Модели запросов и ответов, `extra="forbid"` |
+| `core_api/render.py` | Ответ диалога в нейтральном виде: числа и коды, а не текст для конкретного канала |
+| `core_api/facade.py` | `CoreApi` — все операции ядра |
+| `core_api/http.py` | Маршруты, конверт ответа, формат ошибок, идентификатор запроса |
+
+### Контракт
+
+**Успех:**
+
+```json
+{"schema": "vdm.core.v1", "status": "ok", "request_id": "…", "session_id": "…",
+ "task_id": "…", "catalog_version": "2026-09-13-001", "norm_version": "norms-…",
+ "data": {}, "warnings": [{"code": "…", "message": "…", "details": {}}], "errors": []}
+```
+
+**Ошибка:**
+
+```json
+{"schema": "vdm.core.v1", "status": "error", "request_id": "…",
+ "error": {"code": "SPECIFICATION_NOT_DRAFT", "message": "…", "details": {}}}
+```
+
+| HTTP | Когда |
+|---|---|
+| 400 | `InvalidRequest`: неизвестный товар, неверное количество, неподдерживаемый файл |
+| 401 | нет сессии, неверный ключ адаптера, не прошла подпись канала |
+| 403 | нет согласия на ПДн, неверный ключ менеджера |
+| 404 | ресурса нет или он чужой — ответ одинаковый |
+| 409 | переход статуса невозможен, оценка устарела, спецификация заменена |
+| 422 | `VALIDATION_ERROR`: поля запроса, `details.fields` |
+| 503 | ключ API или менеджера не настроен |
+| 500 | `INTERNAL_ERROR`, без трассировки |
+
+Формат ошибок действует только на `/api`: `/widget/*`, `/health`, `/media/*` отвечают
+как раньше. Отдельного `/ask` в проекте нет: совместимый контракт каналов —
+`/widget/*`, он не изменён.
+
+### Доступ
+
+| Кто | Как |
+|---|---|
+| Анонимный клиент | `POST /api/sessions` без тела — `user_ref` выдаёт сервер |
+| Серверный адаптер (бот) | `X-Core-Api-Key` = `CORE_API_KEY`, в теле `channel` и `user_ref` |
+| Публичный клиент канала (Mini App) | `credentials: {type, value}`; подпись проверяет `IdentityVerifier`, подключённый адаптером канала |
+| Все запросы сессии | заголовок `X-Session-Id` |
+| Менеджер | `X-Manager-Key` = `CORE_MANAGER_KEY`, `X-Manager-Actor` — логин латиницей |
+
+`user_ref` — тот же ключ, что у корзины, согласия и данных субъекта в `Storage`.
+Пользователь бота и его сессия Core API видят одну корзину, `/delete_data` удаляет
+всё сразу. В коде API нет ни одной проверки канала: это проверяет
+`test_core_api_has_no_channel_logic`.
+
+### Маршруты
+
+| Группа | Маршруты |
+|---|---|
+| Служебные | `GET /api/health`, `GET /api/catalog/status` |
+| Сессии и ПДн | `POST /api/sessions`, `GET /api/sessions/{id}`, `POST /api/sessions/{id}/consent`, `GET` и `DELETE /api/sessions/{id}/data` |
+| Диалог | `POST /api/dialogue/message`, `POST /api/dialogue/action` |
+| Закупка | `POST /api/procurement/tasks`, `GET` и `PATCH /api/procurement/tasks/{id}`, `…/choose`, `…/reject`, `…/quantity`, `POST /api/procurement/select`, `POST /api/procurement/specification`, `GET /api/procurement/specifications/{id}`, `…/check`, `POST …/revise`, `GET …/export?format=xlsx\|docx` |
+| Товар и корзина | `GET /api/products/{id}`, `GET /api/cart`, `POST /api/cart/items`, `DELETE /api/cart`, `POST /api/cart/specification` |
+| Заказ и предзаказ | `POST /api/orders/upload?filename=…` (тело — байты файла), `GET /api/orders/{id}`, `POST …/evaluate`, `GET …/evaluation`, `POST /api/preorders`, `GET /api/preorders/{id}`, `POST …/send`, `GET /api/history` |
+| Менеджер | `GET /api/manager/preorders?status=`, `GET /api/manager/preorders/{id}`, `POST …/review`, `…/confirm`, `…/reject`, `…/items/{line}/match`, `…/items/{line}/quantity`, `POST /api/manager/orders/{id}/items/{line}/match`, `POST /api/manager/recodings`, `GET /api/manager/decisions`, `POST /api/manager/notifications/retry` |
+
+Загрузка файла идёт телом запроса, а не `multipart`: `python-multipart` не нужен.
+
+### Версии
+
+Всё, что связано с каталогом, возвращает `catalog_version`: подбор, товар,
+спецификация (и заголовок `X-Catalog-Version` у выгрузки), заказ, оценка,
+предзаказ. Нормативные операции — ещё и `norm_version`.
+
+### ПДн
+
+Отдельного механизма в API нет:
+
+- согласие пишется в журнал `Storage.record_consent`;
+- выгрузка и удаление — `Storage.export_user_data` и команда `/delete_data` диалога;
+- модули ядра подключены к ним через `Storage.add_user_data_hook`, включая сессии API;
+- контакты клиента принимаются только при передаче предзаказа менеджеру и только
+  с действующим согласием.

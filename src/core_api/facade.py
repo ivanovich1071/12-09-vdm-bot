@@ -1,0 +1,435 @@
+"""Core API как объект: одна точка входа для HTTP-слоя и адаптеров в том же процессе.
+
+HTTP (`core_api/http.py`) и Telegram вызывают одни и те же методы и получают одни и
+те же DTO. Здесь нет ни одной проверки канала: канал — просто поле сессии.
+
+Каждая операция закрепляет версию каталога (`CatalogRuntime.turn`); вложенные
+вызовы доменных сервисов берут ту же версию, и она же попадает в ответ.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+from pydantic import BaseModel
+
+from core.errors import InvalidRequest, NotFound, Unauthorized
+from core.models import CartItem, Customer
+from core_api import dto, render
+from core_api.composition import CoreServices
+from core_api.sessions import ADAPTER, ANONYMOUS, CoreSession, IdentityVerifier
+from documents.exporters import ExportedDocument
+from order_import.models import OrderContext
+from preorder.models import PreorderStatus
+from privacy.consent import CONSENT_VERSION
+from procurement.specification import SpecificationLine
+
+
+@dataclass
+class Result:
+    data: BaseModel
+    session_id: str | None = None
+    task_id: str | None = None
+    catalog_version: str | None = None
+    norm_version: str | None = None
+    warnings: list[dict[str, Any]] = field(default_factory=list)
+
+
+class CoreApi:
+    def __init__(self, services: CoreServices, verifiers: Mapping[str, IdentityVerifier] | None = None) -> None:
+        self.services = services
+        self.verifiers = dict(verifiers or {})
+
+    @property
+    def runtime(self):  # noqa: ANN201 — catalog.runtime.CatalogRuntime
+        return self.services.engine.runtime
+
+    @property
+    def storage(self):  # noqa: ANN201 — core.storage.Storage
+        return self.services.engine.storage
+
+    # --- Служебное ----------------------------------------------------------------
+
+    def health(self) -> dict[str, Any]:
+        state = self.runtime.state
+        return {"status": "ok", "catalog_version": state.label, "products": len(state.index.products)}
+
+    def catalog_status(self) -> Result:
+        with self.runtime.turn() as state:
+            data = dto.CatalogStatusOut(
+                catalog_version=state.label,
+                catalog_sha256=state.sha256,
+                products=len(state.index.products),
+                norm_version=self.services.norms.version,
+                norm_items_loaded=self.services.norms.loaded,
+            )
+            return Result(data, catalog_version=state.label, norm_version=self.services.norms.version)
+
+    # --- Сессии и ПДн --------------------------------------------------------------
+
+    def open_session(
+        self,
+        *,
+        channel: str,
+        user_ref: str | None = None,
+        credentials: dto.CredentialsIn | None = None,
+        trusted: bool = False,
+    ) -> Result:
+        origin = ANONYMOUS
+        if credentials is not None:
+            verifier = self.verifiers.get(credentials.type)
+            if verifier is None:
+                raise InvalidRequest(
+                    f"Способ входа «{credentials.type}» не подключён.", code="UNSUPPORTED_CREDENTIALS"
+                )
+            user_ref, channel, origin = verifier.verify(credentials.value), verifier.channel, credentials.type
+        elif user_ref is not None:
+            if not trusted:
+                raise Unauthorized(
+                    "Пользователя канала называет только адаптер с ключом Core API.", code="API_KEY_REQUIRED"
+                )
+            origin = ADAPTER
+        session = self.services.sessions.open(channel, user_ref, origin)
+        return Result(self._session_out(session), session_id=session.id)
+
+    def session(self, session_id: str) -> CoreSession:
+        return self.services.sessions.get(session_id)
+
+    def get_session(self, session: CoreSession) -> Result:
+        return Result(self._session_out(session), session_id=session.id)
+
+    def consent(self, session: CoreSession, granted: bool) -> Result:
+        """Согласие — в тот же журнал, что у бота: версия текста и действие."""
+        self.storage.record_consent(session.user_ref, session.channel, CONSENT_VERSION, "granted" if granted else "revoked")
+        return Result(self._session_out(session), session_id=session.id)
+
+    def export_data(self, session: CoreSession) -> Result:
+        return Result(dto.UserDataOut(data=self.storage.export_user_data(session.user_ref)), session_id=session.id)
+
+    def delete_data(self, session: CoreSession) -> Result:
+        # Та же команда, что у бота: удаление в хранилище, в памяти диалога и в модулях ядра.
+        self.services.engine.handle_text(session.user_ref, session.channel, "/delete_data")
+        return Result(dto.UserDataOut(data=self.storage.export_user_data(session.user_ref)), session_id=session.id)
+
+    # --- Диалог ---------------------------------------------------------------------
+
+    def message(self, session: CoreSession, text: str) -> Result:
+        with self.runtime.turn() as state:
+            replies = self.services.engine.handle_text(session.user_ref, session.channel, text)
+            return Result(dto.DialogueOut(responses=render.responses(replies)), session.id, catalog_version=state.label)
+
+    def action(self, session: CoreSession, action: str) -> Result:
+        with self.runtime.turn() as state:
+            replies = self.services.engine.handle_action(session.user_ref, session.channel, action)
+            return Result(dto.DialogueOut(responses=render.responses(replies)), session.id, catalog_version=state.label)
+
+    # --- Закупка -------------------------------------------------------------------------
+
+    def create_task(self, session: CoreSession, text: str | None, fields: dict[str, Any]) -> Result:
+        task = self.services.procurement.create_task(session.user_ref, session.channel, text=text, fields=fields)
+        return self._task(session, task)
+
+    def get_task(self, session: CoreSession, task_id: str) -> Result:
+        return self._task(session, self.services.procurement.get_task(task_id, session.user_ref))
+
+    def update_task(self, session: CoreSession, task_id: str, text: str | None, fields: dict[str, Any]) -> Result:
+        task = self.services.procurement.update_task(task_id, session.user_ref, text=text, fields=fields)
+        return self._task(session, task)
+
+    def select(self, session: CoreSession, task_id: str, restart: bool) -> Result:
+        with self.runtime.turn():
+            result = self.services.procurement.select(task_id, session.user_ref, restart=restart)
+        data = dto.SelectionOut.model_validate(result.to_dict())
+        return Result(
+            data,
+            session.id,
+            task_id,
+            result.catalog_version,
+            result.norm_version,
+            [notice.to_dict() for notice in result.warnings],
+        )
+
+    def choose(self, session: CoreSession, task_id: str, product_ids: Sequence[str]) -> Result:
+        return self._task(session, self.services.procurement.choose(task_id, session.user_ref, product_ids))
+
+    def reject(self, session: CoreSession, task_id: str, product_ids: Sequence[str], objection: str | None) -> Result:
+        return self._task(session, self.services.procurement.reject(task_id, session.user_ref, product_ids, objection))
+
+    def set_quantity(self, session: CoreSession, task_id: str, product_id: str, quantity: int) -> Result:
+        return self._task(session, self.services.procurement.set_quantity(task_id, session.user_ref, product_id, quantity))
+
+    def build_specification(
+        self, session: CoreSession, task_id: str, items: Sequence[dto.SpecificationItemIn] | None
+    ) -> Result:
+        lines = [SpecificationLine(item.product_id, item.quantity) for item in items] if items else None
+        spec = self.services.procurement.build_specification(task_id, session.user_ref, lines)
+        return self._specification(session, spec)
+
+    def get_specification(self, session: CoreSession, spec_id: str) -> Result:
+        return self._specification(session, self.services.procurement.get_specification(spec_id, session.user_ref))
+
+    def check_specification(self, session: CoreSession, spec_id: str) -> Result:
+        freshness = self.services.procurement.check_specification(spec_id, session.user_ref)
+        return Result(dto.FreshnessOut.model_validate(freshness.to_dict()), session.id, catalog_version=freshness.current_version)
+
+    def revise_specification(self, session: CoreSession, spec_id: str) -> Result:
+        return self._specification(session, self.services.procurement.revise_specification(spec_id, session.user_ref))
+
+    def export_specification(self, session: CoreSession, spec_id: str, fmt: str) -> tuple[ExportedDocument, str, str]:
+        spec = self.services.procurement.get_specification(spec_id, session.user_ref)
+        document = self.services.procurement.export_specification(spec_id, session.user_ref, fmt)
+        return document, spec.catalog_version, spec.norm_version
+
+    # --- Товар и корзина --------------------------------------------------------------------
+
+    def product(self, session: CoreSession, product_id: str, task_id: str | None = None) -> Result:
+        audience = (
+            self.services.procurement.get_task(task_id, session.user_ref).audience
+            if task_id
+            else self.services.engine.session(session.user_ref, session.channel).profile.audience
+        )
+        with self.runtime.turn() as state:
+            product = state.index.get(product_id)
+            if product is None or not product.is_active:
+                raise NotFound(f"Товара {product_id} нет в каталоге.", code="PRODUCT_NOT_FOUND", details={"product_id": product_id})
+            photos = list(product.images)
+            if self.services.engine.photo_path(product):
+                photos.insert(0, f"/media/{product.id}")
+            card = product.card
+            data = dto.ProductOut(
+                id=product.id,
+                article=product.article,
+                name=product.name,
+                price=product.price,
+                currency=product.currency,
+                availability=str(product.availability),
+                quantity_available=product.quantity_available,
+                description=product.description,
+                kit_contents=list(product.kit_contents),
+                characteristics=dict(product.characteristics),
+                photos=photos,
+                url=product.url,
+                rooms=sorted(product.rooms),
+                institution_types=sorted(product.institution_types),
+                norm_mappings=[m.to_dict() for m in self.services.procurement.mapping.mappings(product, audience)],
+                sources={name: {"kind": ref.kind, "origin": ref.origin} for name, ref in card.sources.items()},
+            )
+            return Result(data, session.id, task_id, state.label, self.services.norms.version)
+
+    def cart(self, session: CoreSession) -> Result:
+        with self.runtime.turn() as state:
+            return Result(self._cart_out(session), session.id, catalog_version=state.label)
+
+    def set_cart_item(self, session: CoreSession, product_id: str, quantity: int) -> Result:
+        with self.runtime.turn() as state:
+            product = state.index.get(product_id)
+            if product is None or not product.is_active:
+                raise NotFound(f"Товара {product_id} нет в каталоге.", code="PRODUCT_NOT_FOUND", details={"product_id": product_id})
+            cart = self.storage.load_cart(session.user_ref)
+            if cart.find(product_id) is not None:
+                cart.set_quantity(product_id, quantity)
+            elif quantity > 0:
+                profile = self.services.engine.session(session.user_ref, session.channel).profile
+                norm = product.norm_for(profile.audience, profile.room or "")
+                cart.add(CartItem(product.sku_1c, product.name, product.price, quantity, product.url, norm.citation if norm else None))
+            self.storage.save_cart(cart)
+            return Result(self._cart_out(session), session.id, catalog_version=state.label)
+
+    def clear_cart(self, session: CoreSession) -> Result:
+        cart = self.storage.load_cart(session.user_ref)
+        cart.clear()
+        self.storage.save_cart(cart)
+        return self.cart(session)
+
+    def cart_specification(self, session: CoreSession) -> Result:
+        """Спецификация из корзины: задача собирается из того, что диалог уже знает."""
+        cart = self.storage.load_cart(session.user_ref)
+        if cart.is_empty:
+            raise InvalidRequest("Корзина пуста.", code="EMPTY_CART")
+        profile = self.services.engine.session(session.user_ref, session.channel).profile
+        fields: dict[str, Any] = {
+            "institution_type": profile.institution,
+            "room": profile.room,
+            "age_group": profile.age,
+            "deadline": profile.deadline,
+            "norm_document": profile.norm_doc_ids[0] if profile.norm_doc_ids else None,
+        }
+        procurement = self.services.procurement
+        task = procurement.create_task(session.user_ref, session.channel, fields={k: v for k, v in fields.items() if v})
+        spec = procurement.build_specification(
+            task.id, session.user_ref, [SpecificationLine(item.sku_1c, item.quantity) for item in cart.items]
+        )
+        return self._specification(session, spec)
+
+    # --- Заказ клиента и предзаказ ------------------------------------------------------------
+
+    def upload_order(self, session: CoreSession, filename: str, content: bytes, context: OrderContext) -> Result:
+        order = self.services.orders.upload(session.user_ref, session.channel, filename, content, context)
+        return self._order(session, order)
+
+    def get_order(self, session: CoreSession, order_id: str) -> Result:
+        return self._order(session, self.services.orders.get_order(order_id, session.user_ref))
+
+    def evaluate_order(self, session: CoreSession, order_id: str) -> Result:
+        return self._evaluation(session, self.services.orders.evaluate(order_id, session.user_ref))
+
+    def order_evaluation(self, session: CoreSession, order_id: str) -> Result:
+        evaluation = self.services.orders.latest_evaluation(order_id, session.user_ref)
+        if evaluation is None:
+            raise NotFound("Заказ ещё не проверен.", code="EVALUATION_NOT_FOUND", details={"order_id": order_id})
+        return self._evaluation(session, evaluation)
+
+    def create_preorder(self, session: CoreSession, source: str, source_id: str, comment: str | None) -> Result:
+        service = self.services.preorders
+        if source == "specification":
+            preorder = service.create_from_specification(source_id, session.user_ref, session.channel, comment)
+        else:
+            preorder = service.create_from_order(source_id, session.user_ref, session.channel, comment)
+        return self._preorder(session, preorder)
+
+    def get_preorder(self, session: CoreSession, preorder_id: str) -> Result:
+        return self._preorder(session, self.services.preorders.get(preorder_id, session.user_ref))
+
+    def send_preorder(self, session: CoreSession, preorder_id: str, customer: dto.CustomerIn) -> Result:
+        preorder = self.services.preorders.send_to_manager(
+            preorder_id, session.user_ref, Customer(**customer.model_dump())
+        )
+        return self._preorder(session, preorder)
+
+    def history(self, session: CoreSession) -> Result:
+        owner = session.user_ref
+        services = self.services
+        data = dto.HistoryOut(
+            tasks=[
+                {"id": t.id, "stage": str(t.stage), "institution_type": t.institution_type, "room": t.room, "updated_at": t.updated_at}
+                for t in services.procurement.repository.tasks_of(owner)
+            ],
+            specifications=[
+                {"id": s.id, "task_id": s.task_id, "status": str(s.status), "amount": s.totals.amount, "catalog_version": s.catalog_version, "created_at": s.created_at}
+                for s in services.procurement.repository.specifications_of(owner)
+            ],
+            orders=[
+                {"id": o.id, "status": str(o.status), "filename": o.source_file.filename, "items": len(o.items), "created_at": o.created_at}
+                for o in services.orders.orders_of(owner)
+            ],
+            preorders=[
+                {"id": p.id, "status": str(p.status), "amount": p.totals.amount, "review_required": p.review_required, "created_at": p.created_at}
+                for p in services.preorders.of_owner(owner)
+            ],
+        )
+        return Result(data, session.id)
+
+    # --- Менеджер ------------------------------------------------------------------------------
+
+    def manager_queue(self, status: str) -> Result:
+        try:
+            wanted = PreorderStatus(status)
+        except ValueError as exc:
+            raise InvalidRequest(f"Статуса «{status}» нет.", code="INVALID_STATUS") from exc
+        items = [self._preorder_out(p) for p in self.services.preorders.manager_queue(wanted)]
+        return Result(dto.PreorderListOut(preorders=items))
+
+    def manager_preorder(self, preorder_id: str) -> Result:
+        return Result(self._preorder_out(self.services.preorders.manager_get(preorder_id)))
+
+    def manager_review(self, preorder_id: str, actor: str) -> Result:
+        return Result(self._preorder_out(self.services.preorders.start_review(preorder_id, actor)))
+
+    def manager_confirm(self, preorder_id: str, actor: str, comment: str | None) -> Result:
+        return Result(self._preorder_out(self.services.preorders.confirm(preorder_id, actor, comment)))
+
+    def manager_reject(self, preorder_id: str, actor: str, reason: str) -> Result:
+        return Result(self._preorder_out(self.services.preorders.reject(preorder_id, actor, reason)))
+
+    def manager_match(self, preorder_id: str, line_no: int, product_id: str, actor: str) -> Result:
+        return Result(self._preorder_out(self.services.preorders.manual_match(preorder_id, line_no, product_id, actor)))
+
+    def manager_quantity(self, preorder_id: str, line_no: int, quantity: int, actor: str) -> Result:
+        return Result(self._preorder_out(self.services.preorders.set_quantity(preorder_id, line_no, quantity, actor)))
+
+    def manager_match_order_line(self, order_id: str, line_no: int, product_id: str, actor: str) -> Result:
+        order = self.services.orders.manual_match(order_id, line_no, product_id, actor)
+        return Result(dto.OrderOut.model_validate(order.to_dict()))
+
+    def manager_recoding(self, old_sku: str, new_sku: str, actor: str, comment: str | None) -> Result:
+        return Result(dto.DecisionOut(id=self.services.preorders.record_recoding(old_sku, new_sku, actor, comment)))
+
+    def manager_decisions(self, kind: str | None) -> Result:
+        return Result(dto.DecisionsOut(decisions=self.services.preorders.decisions(kind)))
+
+    def manager_retry_notifications(self) -> Result:
+        return Result(dto.CountOut(count=self.services.preorders.retry_notifications()))
+
+    # --- Внутреннее -----------------------------------------------------------------------------
+
+    def _session_out(self, session: CoreSession) -> dto.SessionOut:
+        active = self.storage.active_consent(session.user_ref) is not None
+        return dto.SessionOut(**session.to_dict(), consent=dto.ConsentOut(version=CONSENT_VERSION, active=active))
+
+    def _task(self, session: CoreSession, task) -> Result:  # noqa: ANN001 — procurement.models.ProcurementTask
+        data = task.to_dict()
+        data.pop("owner")
+        return Result(dto.TaskOut.model_validate(data), session.id, task.id)
+
+    def _specification(self, session: CoreSession, spec) -> Result:  # noqa: ANN001
+        return Result(
+            dto.SpecificationOut.model_validate(spec.to_dict()),
+            session.id,
+            spec.task_id,
+            spec.catalog_version,
+            spec.norm_version,
+            [notice.to_dict() for notice in spec.warnings],
+        )
+
+    def _order(self, session: CoreSession, order) -> Result:  # noqa: ANN001
+        return Result(
+            dto.OrderOut.model_validate(order.to_dict()),
+            session.id,
+            order.context.task_id,
+            order.catalog_version,
+            order.norm_version,
+            [notice.to_dict() for notice in order.warnings],
+        )
+
+    def _evaluation(self, session: CoreSession, evaluation) -> Result:  # noqa: ANN001
+        return Result(
+            dto.EvaluationOut.model_validate(evaluation.to_dict()),
+            session.id,
+            catalog_version=evaluation.catalog_version,
+            norm_version=evaluation.norm_version,
+        )
+
+    def _preorder(self, session: CoreSession, preorder) -> Result:  # noqa: ANN001
+        return Result(
+            self._preorder_out(preorder),
+            session.id,
+            catalog_version=preorder.catalog_version,
+            norm_version=preorder.norm_version,
+            warnings=[notice.to_dict() for notice in preorder.warnings],
+        )
+
+    @staticmethod
+    def _preorder_out(preorder) -> dto.PreorderOut:  # noqa: ANN001
+        return dto.PreorderOut.model_validate(preorder.to_dict())
+
+    def _cart_out(self, session: CoreSession) -> dto.CartOut:
+        cart = self.storage.load_cart(session.user_ref)
+        return dto.CartOut(
+            items=[
+                {
+                    "product_id": item.sku_1c,
+                    "name": item.name,
+                    "quantity": item.quantity,
+                    "price": item.price,
+                    "total": item.total if item.price is not None else None,
+                    "url": item.url,
+                    "norm_citation": item.norm_citation,
+                }
+                for item in cart.items
+            ],
+            count=cart.count,
+            total=cart.total,
+            complete=all(item.price is not None for item in cart.items),
+        )
