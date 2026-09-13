@@ -4,7 +4,12 @@
 # (HTTP против long polling), и падение одного не должно ронять другой.
 #
 #   docker compose up -d --build
-#   docker compose run --rm ingest   # пересобрать базу знаний после новой выгрузки
+#   docker compose run --rm catalog import-1c --file data/raw/pricelist.xlsx   # новая выгрузка на проверку
+#   docker compose run --rm catalog import-1c --diff <ID>                      # что изменится
+#   docker compose run --rm catalog catalog approve <ID>                       # утвердить и применить
+#
+# Каталог ведётся версиями (EPIC 4): виджет и Telegram сами подхватывают новую
+# версию по указателю data/kb/current, перезапуск не нужен.
 
 services:
   widget:
@@ -34,10 +39,12 @@ services:
     depends_on:
       - widget
 
-  # Разовая задача: запускается вручную, когда заказчик прислал новую выгрузку 1С.
-  ingest:
+  # Разовые команды каталога: импорт 1С, diff, утверждение, версии, откат, фото, реестр.
+  # Прямая пересборка `ingest` каталог бота при версиях не меняет.
+  catalog:
     build: .
-    command: python run.py ingest --source data/raw/pricelist.xlsx
+    entrypoint: ["python", "run.py"]
+    command: ["catalog", "versions"]
     env_file: .env
     volumes:
       - ./data:/app/data

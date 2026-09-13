@@ -11,10 +11,9 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from functools import cached_property
 
 from catalog.models import Product
-from catalog.repository import InMemoryCatalogRepository
+from catalog.runtime import CatalogRuntime, CatalogRuntimeState
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
 from catalog.service import CatalogService
 from core import intent
@@ -188,7 +187,7 @@ class Session:
 class DialogEngine:
     def __init__(
         self,
-        index: CatalogIndex,
+        index: CatalogIndex | CatalogRuntime,
         storage: Storage,
         orders: OrderService,
         settings: Settings,
@@ -196,7 +195,13 @@ class DialogEngine:
         dialog_log=None,  # noqa: ANN001 — observability/dialog_log.py
         media=None,  # noqa: ANN001 — media/service.py, фото добираются с сайта
     ) -> None:
-        self.index = index
+        # Каталог — одно состояние на процесс (`catalog/runtime.py`). Индекс,
+        # переданный напрямую, становится состоянием без версии: так работают тесты.
+        self.runtime = (
+            index
+            if isinstance(index, CatalogRuntime)
+            else CatalogRuntime(CatalogRuntimeState.from_index(index))
+        )
         self.storage = storage
         self.orders = orders
         self.settings = settings
@@ -204,19 +209,31 @@ class DialogEngine:
         self.dialog_log = dialog_log
         self.media = media
         self._sessions: dict[str, Session] = {}
-        self._roots: list[str] | None = None
         # Пункты приказов с формулировками и поиском по словам. Файла может не
         # быть — тогда бот называет номер пункта без текста, как и раньше.
         self.norm_texts = norm_items.ItemIndex(norm_items.load())
 
-    @cached_property
+    @property
+    def index(self) -> CatalogIndex:
+        """Индекс версии, закреплённой за текущим ходом, а вне хода — текущей."""
+        return self.runtime.state.index
+
+    @index.setter
+    def index(self, value: CatalogIndex) -> None:
+        self.runtime.replace(CatalogRuntimeState.from_index(value))
+
+    @property
     def catalog(self) -> CatalogService:
-        """Каталог через доменный слой (EPIC 1) — поверх того же индекса, что `index`.
+        """Каталог через доменный слой (EPIC 1) — из того же состояния, что `index`.
 
         Прежние вызовы `self.index` пока не переведены: бот и агент переходят на
         сервис в следующих EPIC, поведение диалога здесь не меняется.
         """
-        return CatalogService(InMemoryCatalogRepository(self.index))
+        return self.runtime.state.catalog
+
+    @property
+    def catalog_version(self) -> str | None:
+        return self.runtime.state.version
 
     def session(self, user_id: str, channel: str) -> Session:
         key = f"{channel}:{user_id}"
@@ -252,34 +269,40 @@ class DialogEngine:
 
     # --- Точки входа ---------------------------------------------------------
 
+    # Каждая точка входа закрепляет одну версию каталога на весь ход: поиск, пункт
+    # приказа, карточка и цена внутри одного ответа берутся из одного снимка.
+
     def start(self, user_id: str, channel: str) -> list[Response]:
-        self.session(user_id, channel)
-        return [Message(GREETING, keyboard=self._main_menu())]
+        with self.runtime.turn():
+            self.session(user_id, channel)
+            return [Message(GREETING, keyboard=self._main_menu())]
 
     def handle_text(self, user_id: str, channel: str, text: str) -> list[Response]:
-        started = time.monotonic()
-        # Шаги сбора контактов — это чистые персональные данные и ничего не дают
-        # для настройки промптов. В журнал вместо них идёт отметка о шаге.
-        session = self.session(user_id, channel)
-        collecting = session.checkout_step is not None
-        session.usage = {}
-        session.route = {}
-        responses = self._handle_text(user_id, channel, text)
-        logged = "<контактные данные при оформлении>" if collecting else text
-        self._log(user_id, channel, "text", logged, responses, started)
-        return responses
+        with self.runtime.turn():
+            started = time.monotonic()
+            # Шаги сбора контактов — это чистые персональные данные и ничего не дают
+            # для настройки промптов. В журнал вместо них идёт отметка о шаге.
+            session = self.session(user_id, channel)
+            collecting = session.checkout_step is not None
+            session.usage = {}
+            session.route = {}
+            responses = self._handle_text(user_id, channel, text)
+            logged = "<контактные данные при оформлении>" if collecting else text
+            self._log(user_id, channel, "text", logged, responses, started)
+            return responses
 
     def handle_action(self, user_id: str, channel: str, action: str) -> list[Response]:
-        started = time.monotonic()
-        # Расход и роль сбрасываются так же, как в текстовом ходе. Без этого на
-        # нажатие «Корзина» в журнал уходили токены и рубли предыдущего ответа
-        # модели — 02.09 один и тот же ход оказался посчитан трижды.
-        session = self.session(user_id, channel)
-        session.usage = {}
-        session.route = {}
-        responses = self._handle_action(user_id, channel, action)
-        self._log(user_id, channel, "action", action, responses, started)
-        return responses
+        with self.runtime.turn():
+            started = time.monotonic()
+            # Расход и роль сбрасываются так же, как в текстовом ходе. Без этого на
+            # нажатие «Корзина» в журнал уходили токены и рубли предыдущего ответа
+            # модели — 02.09 один и тот же ход оказался посчитан трижды.
+            session = self.session(user_id, channel)
+            session.usage = {}
+            session.route = {}
+            responses = self._handle_action(user_id, channel, action)
+            self._log(user_id, channel, "action", action, responses, started)
+            return responses
 
     def _log(
         self,
@@ -682,15 +705,8 @@ class DialogEngine:
 
     @property
     def roots(self) -> list[str]:
-        """Корневые разделы каталога в порядке появления в выгрузке."""
-        if self._roots is None:
-            found: list[str] = []
-            for product in self.index.products:
-                for root in product.roots:
-                    if root not in found:
-                        found.append(root)
-            self._roots = found
-        return self._roots
+        """Корневые разделы каталога в порядке появления в выгрузке — из состояния версии."""
+        return list(self.runtime.state.roots)
 
     def _sections(self) -> list[Response]:
         keyboard = Keyboard()

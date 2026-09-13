@@ -60,16 +60,20 @@ python -m venv .venv
 .venv\Scripts\pip install -e ".[dev]"
 cp .env.example .env
 
-# собрать базу знаний из выгрузки 1С
+# первый запуск: база знаний из выгрузки 1С и перевод каталога на версии
 python run.py ingest --source data/raw/<выгрузка>.xlsx
+python run.py catalog init
 
-# загрузить выгрузку на проверку: разбор и предпросмотр, база знаний бота не меняется
+# новая выгрузка: на проверку → изменения → утверждение; бот подхватит без перезапуска
 python run.py import-1c --file data/raw/<выгрузка>.xlsx
-python run.py import-1c --list
+python run.py import-1c --diff <ID> --filter price-up
+python run.py catalog approve <ID>
+python run.py catalog versions
+python run.py catalog rollback <ВЕРСИЯ>
 
-# реестр заказчика «пункт приказа 1057 → код 1С», затем пересборка
+# реестр «пункт приказа 1057 → код 1С» и фото с сайта — сразу новой версией каталога
 python run.py norms --source <реестр>.pdf
-python run.py ingest --source data/raw/<выгрузка>.xlsx
+python run.py media --sync
 
 # проверить поиск из консоли
 python run.py search "мячи для спортивного зала в наличии до 2000 руб"
@@ -101,15 +105,17 @@ Telegram · виджет · (Mini App, MAX)     адаптеры, без биз�
             ↓
 agent · catalog · norms · orders · privacy · media
             ↓
-  выгрузка 1С → products.jsonl → индекс каталога в памяти
+  выгрузка 1С → импорт → diff → утверждение → версия каталога
+  (снимок + указатель data/kb/current) → состояние каталога в памяти процесса
 ```
 
 | Каталог | Что внутри |
 |---|---|
 | `src/core/` | Диалог, профиль задачи, корзина, заказ, хранилище SQLite, примитивы ответа |
 | `src/agent/` | Консультант и продавец, маршрутизатор, провайдеры моделей, инструменты, проверка ответа, промпты |
-| `src/catalog/` | Контракт товара, размещение (учреждение, кабинет, возраст), запрос, репозиторий и сервис каталога; поиск: точный по пункту перечня, BM25, триграммы |
-| `src/catalog_import/` | Импорт выгрузки 1С на проверку: общий разбор, проверка строк, файлы по sha256, база импорта с миграциями, предпросмотр |
+| `src/catalog/` | Контракт товара, размещение (учреждение, кабинет, возраст), запрос, репозиторий и сервис каталога; поиск: точный по пункту перечня, BM25, триграммы; указатель и резолвер текущей версии, состояние каталога с горячей заменой |
+| `src/catalog_import/` | Импорт выгрузки 1С на проверку: общий разбор, проверка строк, файлы по sha256, база импорта с миграциями, diff против текущей версии, предпросмотр |
+| `src/catalog_versions/` | Версии каталога: сборка карточек, baseline, утверждение, применение под замком, история товаров, откат, версии фото и реестра, восстановление |
 | `src/ingest/` | Сборка базы знаний из выгрузки, реестр приказа 1057, дерево каталога, чтение xlsx, очистка описаний |
 | `src/norms/` | Приказы, пункты перечней, привязка товаров, справка по документам |
 | `src/orders/` | Приёмники заказа: файл, Excel, Google Sheets, заглушка CRM |
@@ -129,6 +135,7 @@ agent · catalog · norms · orders · privacy · media
 | [ДОРОЖНАЯ_КАРТА.md](ДОРОЖНАЯ_КАРТА.md) | Статус EPIC v2, решения, блокеры; история v1 |
 | [docs/TZ_V2.md](docs/TZ_V2.md) | Сводное техническое задание v2 |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Принятые решения по вопросам аудита |
+| [docs/ARCHITECTURE_CHANGE.md](docs/ARCHITECTURE_CHANGE.md) | EPIC 4: версии каталога, diff, горячая замена — архитектура, замеры, выкат |
 | [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) | План EPIC 0.5–15, оценки, зависимости |
 | [docs/AUDIT.md](docs/AUDIT.md) | Аудит baseline: компоненты, расхождения с ТЗ, риски |
 | [docs/ARCHITECTURE_CURRENT.md](docs/ARCHITECTURE_CURRENT.md) | Как устроен бот на момент baseline |
@@ -152,9 +159,19 @@ agent · catalog · norms · orders · privacy · media
 - **EPIC 3 (сопоставление) принят:** `catalog/matcher.py` — код 1С, название,
   артикул поставщика, похожее название; импорт 1С проверяет существующие коды
   и ищет перекодировку только среди исчезнувших (D10).
-- **EPIC 4 (diff, версии, откат):** решения приняты, конструкция —
-  docs/IMPLEMENTATION_PLAN.md, §6 (D11); реализация не начата.
-- **Тесты:** 519 passed, ruff чистый.
+- **EPIC 4 COMPLETED (diff, версии, откат, горячая замена):**
+  - `import-1c --diff` / `--rediff`;
+  - `catalog init / approve / versions / rollback / check / recover / history`;
+  - указатель `data/kb/current` и резолвер; бот закрепляет версию на ход и меняет
+    её без перезапуска;
+  - `ingest`, `media`, `norms` — через версии.
+
+  Проверено на реальной выгрузке 26.08: повторная загрузка — UNCHANGED 5 936, новая
+  цена видна боту без перезапуска (D11, docs/ARCHITECTURE_CHANGE.md). Рабочий
+  `data/kb` переводится на версии командой `catalog init` при выкате.
+- **Дальше (D12):** Procurement Core → Order Core → Core API → Telegram + Mini App,
+  затем MAX и Web Widget на том же Core API.
+- **Тесты:** 591 passed, ruff чистый.
 
 **Ветки:**
 
@@ -164,7 +181,7 @@ agent · catalog · norms · orders · privacy · media
 - `epic-1/catalog-domain` — EPIC 1;
 - `epic-2/catalog-import` — EPIC 2, от EPIC 1;
 - `epic-3/matching` — EPIC 3, от EPIC 2;
-- `epic-4/catalog-versions` — EPIC 4, от EPIC 3 (пока только решения).
+- `epic-4/catalog-versions` — EPIC 4, от EPIC 3.
 
 Перед пушем история проверяется gitleaks; разобранные ложные срабатывания
 лежат в `.gitleaksignore`.

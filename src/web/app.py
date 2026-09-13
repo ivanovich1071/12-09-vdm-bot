@@ -70,9 +70,13 @@ def create_app(settings: Settings | None = None, warm_llm: bool = False) -> Fast
 
     @app.get("/health")
     def health() -> dict[str, object]:
+        # Одно состояние на запрос: число товаров и версия — из одного снимка.
+        state = engine.runtime.state
         return {
             "status": "ok",
-            "products": len(engine.index.products),
+            "products": len(state.index.products),
+            "catalog_version": state.version or "legacy",
+            "catalog_sha256": state.sha256,
             "llm": settings.llm_enabled,
             "order_sink": getattr(engine.orders.sink, "name", "?"),
         }
@@ -109,7 +113,7 @@ def create_app(settings: Settings | None = None, warm_llm: bool = False) -> Fast
         Отдаём файл сами, а не ссылаемся на vdm.ru: с части сетей сайт заказчика
         не открывается, и виджет тогда показывает битую картинку вместо товара.
         """
-        product = engine.index.get(sku_1c)
+        product = engine.runtime.state.index.get(sku_1c)
         path = engine.photo_path(product) if product is not None else None
         if path is None:
             raise HTTPException(status_code=404, detail="Снимок не собран")

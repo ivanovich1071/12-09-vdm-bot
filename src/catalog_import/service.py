@@ -1,8 +1,8 @@
-"""Импорт выгрузки 1С: загрузка → контрольная сумма → разбор → проверка → предпросмотр.
+"""Импорт выгрузки 1С: загрузка → контрольная сумма → разбор → проверка → diff → предпросмотр.
 
-Загрузка каталог бота не меняет (D5): товары импорта лежат в своих таблицах,
-`products.jsonl` не трогается. Сопоставление с каталогом — `matching.py` (EPIC 3),
-изменения по позициям, утверждение и применение — EPIC 4.
+Загрузка каталог бота не меняет (D5): товары импорта и diff лежат в своих
+таблицах. Сопоставление с каталогом — `matching.py` (EPIC 3), изменения по
+позициям — `diff.py`, утверждение и применение — `catalog_versions` (EPIC 4).
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from xml.etree import ElementTree as ET
 
 from catalog.matcher import CatalogMatcher, MatchSettings
+from catalog_import.diff import CatalogDiff, DiffCounters, DiffRow, compute_diff
 from catalog_import.files import MB, MIME_TYPES, FileStore, check_upload, checksum, megabytes
 from catalog_import.matching import MATCH_STATUS_SHORT_LABELS, compare_with_catalog
 from catalog_import.models import (
@@ -35,9 +36,11 @@ from catalog_import.models import (
 from catalog_import.parser import ParsedSheet, parse_products, read_bitrix_ids
 from catalog_import.repository import ImportRepository, SqliteImportRepository
 from catalog_import.validator import ISSUE_LABELS, file_issues, row_issues
+from catalog_versions.cards import Record, load_registry
 from ingest.xlsx_reader import XlsxFile
 
 if TYPE_CHECKING:
+    from catalog.current import CatalogSnapshot
     from catalog.repository import CatalogRepository
     from core.config import Settings
 
@@ -62,6 +65,14 @@ class Inspection:
     codes: frozenset[str] = frozenset()
 
 
+class ImportStateError(RuntimeError):
+    """Действие с импортом невозможно в его нынешнем состоянии."""
+
+
+# Diff пересчитывается только до применения: применённый импорт уже стал версией.
+REDIFF_STATUSES = frozenset({ImportStatus.PARSED, ImportStatus.FAILED})
+
+
 class CatalogImportService:
     def __init__(
         self,
@@ -70,14 +81,22 @@ class CatalogImportService:
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
         catalog: Callable[[], CatalogRepository] | None = None,
+        current: Callable[[], CatalogSnapshot] | None = None,
+        registry_path: Path | None = None,
+        returning: Callable[[list[str]], set[str]] | None = None,
         match_settings: MatchSettings | None = None,
         clock: Callable[[], str] | None = None,
     ) -> None:
         self.repository = repository
         self.files = files
         self.max_bytes = max_bytes
-        # Каталог, с которым сейчас работает бот. `None` — сравнивать не с чем.
+        # Только сопоставление, без diff: так импорт работал до EPIC 4.
         self.catalog = catalog
+        # Текущий каталог по резолверу: против него считается и сохраняется diff.
+        self.current = current
+        self.registry_path = registry_path
+        # Какие из новых кодов уже были в каталоге раньше (история версий).
+        self.returning = returning
         self.match_settings = match_settings
         self._now = clock or _now
 
@@ -115,8 +134,16 @@ class CatalogImportService:
             raise
 
         summary = inspection.summary
+        diff = None
         if inspection.status is ImportStatus.PARSED:
-            summary = replace(summary, comparison=self._compare(inspection))
+            snapshot = self.current_snapshot()
+            if snapshot is not None:
+                diff = self._compute(inspection.items, inspection.codes, snapshot)
+                summary = replace(
+                    summary, comparison=diff.comparison, diff=diff.counters.to_dict()
+                )
+            else:
+                summary = replace(summary, comparison=self._compare(inspection))
         log.info(
             "Импорт %s: %s, товаров %s, принято %s, ошибок %s, предупреждений %s",
             record.id,
@@ -127,8 +154,58 @@ class CatalogImportService:
             summary.warnings,
         )
         return self.repository.finish(
-            record.id, inspection.status, summary, inspection.items, inspection.issues, now
+            record.id, inspection.status, summary, inspection.items, inspection.issues, now, diff
         )
+
+    def rediff(self, import_id: str) -> CatalogImport:
+        """Diff заново против текущего каталога: новая базовая версия и новый отпечаток."""
+        record = self.require(import_id)
+        if record.status not in REDIFF_STATUSES:
+            raise ImportStateError(
+                f"Импорт {import_id} в статусе {record.status}: diff пересчитывается только "
+                "у разобранного и ещё не применённого импорта (PARSED или FAILED)."
+            )
+        snapshot = self.current_snapshot()
+        if snapshot is None:
+            raise ImportStateError("Текущего каталога нет — сравнивать импорт не с чем.")
+        diff = self.diff_for(import_id, snapshot)
+        summary = replace(record.summary, comparison=diff.comparison, diff=diff.counters.to_dict())
+        log.info(
+            "Импорт %s: diff пересчитан против %s, отпечаток %s",
+            import_id,
+            diff.base_version,
+            diff.fingerprint[:12],
+        )
+        return self.repository.save_diff(import_id, diff, summary, self._now())
+
+    def diff_for(
+        self,
+        import_id: str,
+        snapshot: CatalogSnapshot,
+        current_records: list[Record] | None = None,
+    ) -> CatalogDiff:
+        """Diff сохранённого импорта против заданного снимка. Ничего не записывает."""
+        items = self.repository.items(import_id)
+        codes = {item.sku_1c for item in items} | self.repository.rejected_codes(import_id)
+        return self._compute(items, codes, snapshot, current_records)
+
+    def diff_rows(self, import_id: str) -> list[DiffRow]:
+        return self.repository.diff_rows(import_id)
+
+    def require(self, import_id: str) -> CatalogImport:
+        record = self.get(import_id)
+        if record is None:
+            raise ImportStateError(f"Импорта {import_id} нет.")
+        return record
+
+    def current_snapshot(self) -> CatalogSnapshot | None:
+        """Текущий каталог. `None` — ни указателя, ни собранной базы знаний."""
+        if self.current is None:
+            return None
+        try:
+            return self.current()
+        except FileNotFoundError:
+            return None
 
     def get(self, import_id: str) -> CatalogImport | None:
         return self.repository.get(import_id)
@@ -151,6 +228,25 @@ class CatalogImportService:
         matcher = CatalogMatcher(catalog, self.match_settings)
         matching = compare_with_catalog(inspection.items, inspection.codes, catalog, matcher)
         return matching.comparison
+
+    def _compute(
+        self,
+        items: list[ImportItem],
+        file_codes: set[str] | frozenset[str],
+        snapshot: CatalogSnapshot,
+        current_records: list[Record] | None = None,
+    ) -> CatalogDiff:
+        registry, registry_sha = load_registry(self.registry_path)
+        return compute_diff(
+            items,
+            file_codes,
+            snapshot,
+            registry=registry,
+            registry_sha256=registry_sha,
+            match_settings=self.match_settings,
+            returning=self.returning,
+            current_records=current_records,
+        )
 
 
 def inspect(path: Path, *, source_name: str, now: str) -> Inspection:
@@ -209,20 +305,28 @@ def inspect(path: Path, *, source_name: str, now: str) -> Inspection:
     )
 
 
-def build_service(settings: Settings) -> CatalogImportService:
+def build_service(
+    settings: Settings, returning: Callable[[list[str]], set[str]] | None = None
+) -> CatalogImportService:
     """Сервис по настройкам приложения — для командной строки, а позже для админки."""
-    from catalog.repository import InMemoryCatalogRepository
+    from catalog.current import resolve_catalog
+    from catalog_versions.repository import SqliteVersionRepository
+    from ingest.norm_registry import DEFAULT_REGISTRY
 
     kb_path = Path(settings.kb_path)
+    if returning is None:
+        returning = SqliteVersionRepository(settings.catalog_db_path).returning_codes
 
-    def catalog() -> CatalogRepository:
-        return InMemoryCatalogRepository.from_path(kb_path)
+    def current() -> CatalogSnapshot:
+        return resolve_catalog(kb_path)
 
     return CatalogImportService(
         SqliteImportRepository(settings.catalog_db_path),
         FileStore(settings.uploads_dir),
         max_bytes=settings.import_max_mb * MB,
-        catalog=catalog if kb_path.exists() else None,
+        current=current,
+        registry_path=kb_path.parent / DEFAULT_REGISTRY.name,
+        returning=returning,
         match_settings=MatchSettings.from_settings(settings),
     )
 
@@ -273,14 +377,42 @@ def format_preview(record: CatalogImport, issues: list[Issue]) -> str:
                 f"нет в файле {_n(comparison.missing_from_file)}"
             )
             lines += _matching_lines(comparison)
+        lines += _diff_lines(record)
         if issues:
             total = summary.errors + summary.warnings
             shown = f" (показано {len(issues)} из {_n(total)})" if total > len(issues) else ""
             lines.append(f"Проблемы строк{shown}:")
             lines += [f"  {_issue_line(issue)}" for issue in issues]
 
-    lines.append("Каталог бота не изменён: утверждение и применение импорта появятся в EPIC 4.")
+    if record.status is ImportStatus.APPLIED:
+        lines.append(f"Импорт применён: текущая версия каталога — {record.version}.")
+    elif record.status is ImportStatus.APPROVED:
+        lines.append(
+            f"Импорт утверждён, версия {record.version} ещё не стала текущей: "
+            "любая команда `run.py catalog` завершит применение."
+        )
+    else:
+        lines.append("Каталог бота не изменён.")
+        if record.status in REDIFF_STATUSES and record.diff_fingerprint:
+            lines.append(
+                f"Изменения по позициям: python run.py import-1c --diff {record.id}; "
+                f"утверждение: python run.py catalog approve {record.id}"
+            )
     return "\n".join(lines)
+
+
+def _diff_lines(record: CatalogImport) -> list[str]:
+    if record.summary.diff is None:
+        return []
+    counters = DiffCounters.from_dict(record.summary.diff)
+    return [
+        f"Diff против {record.base_version}: NEW {_n(counters.new)}, UPDATED {_n(counters.updated)}, "
+        f"UNCHANGED {_n(counters.unchanged)}, MISSING {_n(counters.missing)}, "
+        f"RECODING {_n(counters.recoding)}, AMBIGUOUS {_n(counters.ambiguous)}",
+        f"Цена изменилась у {_n(counters.price_changed)} ({counters.price_changed_share:.1%}), "
+        f"остаток — у {_n(counters.stock_changed)}; исчезает {counters.removed_share:.1%} каталога",
+        f"Отпечаток diff: {record.diff_fingerprint}",
+    ]
 
 
 def format_imports(records: list[CatalogImport]) -> str:

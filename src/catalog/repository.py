@@ -74,6 +74,38 @@ class InMemoryCatalogRepository:
         )
 
 
+class ProductListRepository:
+    """Репозиторий без поискового индекса — для сопоставления и diff.
+
+    `CatalogMatcher` нужны только товар по коду и список активных. Строить ради
+    этого `CatalogIndex` — лишние 2,7 с на каждый импорт (D10, ограничения).
+    """
+
+    def __init__(self, products: list[Product]) -> None:
+        self._products = list(products)
+        self._by_code = {product.sku_1c: product for product in self._products}
+
+    def get_product(self, product_id: str) -> Product | None:
+        return self._by_code.get(product_id)
+
+    def get_by_article(self, article: str) -> Product | None:
+        article = (article or "").strip()
+        return self._by_code.get(article) if article else None
+
+    def list_active(self) -> list[Product]:
+        return [product for product in self._products if product.is_active]
+
+    def search_text(
+        self,
+        text: str,
+        *,
+        limit: int,
+        audience: str | None = None,
+        norm_point: str | None = None,
+    ) -> list[SearchHit]:
+        raise NotImplementedError("Поиск по словам требует CatalogIndex: InMemoryCatalogRepository.")
+
+
 def load_products(path: str | Path = DEFAULT_KB) -> list[Product]:
     path = Path(path)
     if not path.exists():

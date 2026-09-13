@@ -19,6 +19,7 @@ import pytest
 from catalog.models import Product
 from catalog.repository import InMemoryCatalogRepository, load_products
 from catalog.search import CatalogIndex
+from catalog_import import repository as import_repository
 from catalog_import import service as import_service
 from catalog_import.files import FileStore, UploadRejected
 from catalog_import.models import CatalogComparison, ImportStatus, Severity
@@ -384,7 +385,9 @@ def test_migrations_apply_once(tmp_path):
         versions = [row[0] for row in db.execute("SELECT version FROM schema_migrations")]
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
-    assert versions == ["0001_catalog_import"]
+    # Каждая миграция каталога применена ровно один раз и по порядку; EPIC 4 добавил свои.
+    assert versions == sorted(path.stem for path in import_repository.MIGRATIONS.glob("*.sql"))
+    assert versions[0] == "0001_catalog_import"
     assert {"files", "catalog_imports", "catalog_import_items", "catalog_import_issues"} <= tables
 
 

@@ -17,6 +17,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
+# Имена фильтров diff — для подсказки argparse без импорта модулей каталога.
+DIFF_FILTER_NAMES = (
+    "price-up", "price-down", "new", "removed", "updated", "stock", "review", "recoding", "errors",
+)
+
 
 def _utf8_output() -> None:
     """Вывод в UTF-8 при любом перенаправлении.
@@ -41,6 +46,9 @@ def main() -> None:
     ingest = sub.add_parser("ingest", help="собрать базу знаний из выгрузки 1С")
     ingest.add_argument("--source", default="data/raw/Pricelist20260826.xlsx")
     ingest.add_argument("--out", default="data/kb")
+    ingest.add_argument("--legacy", action="store_true",
+                        help="для разработки: пересобрать legacy products.jsonl, даже если "
+                             "каталог ведётся версиями (бот этот файл тогда не читает)")
 
     import_1c = sub.add_parser(
         "import-1c",
@@ -50,8 +58,35 @@ def main() -> None:
     what.add_argument("--file", help="выгрузка .xlsx")
     what.add_argument("--list", action="store_true", help="последние импорты")
     what.add_argument("--show", metavar="ID", help="предпросмотр импорта по номеру")
+    what.add_argument("--diff", metavar="ID", help="изменения импорта по позициям")
+    what.add_argument("--rediff", metavar="ID",
+                      help="пересчитать diff против текущего каталога")
     import_1c.add_argument("--issues", type=int, default=10,
                            help="сколько проблем строк показать")
+    import_1c.add_argument("--filter", choices=sorted(DIFF_FILTER_NAMES),
+                           help="какие позиции diff показать")
+    import_1c.add_argument("--limit", type=int, default=30,
+                           help="сколько позиций diff показать")
+
+    catalog = sub.add_parser("catalog", help="версии каталога: baseline, утверждение, откат")
+    catalog_sub = catalog.add_subparsers(dest="catalog_command", required=True)
+    catalog_sub.add_parser("init", help="создать baseline из текущего products.jsonl")
+    approve = catalog_sub.add_parser("approve", help="утвердить импорт 1С и применить версию")
+    approve.add_argument("import_id")
+    approve.add_argument("--force", action="store_true",
+                         help="разрешить превышение порогов исчезновения и смены цен")
+    approve.add_argument("--by", help="кто утверждает (по умолчанию — пользователь ОС)")
+    versions = catalog_sub.add_parser("versions", help="версии каталога")
+    versions.add_argument("--limit", type=int, default=20)
+    rollback = catalog_sub.add_parser("rollback", help="откат: новая версия — копия выбранной")
+    rollback.add_argument("version")
+    rollback.add_argument("--force", action="store_true",
+                          help="разрешить превышение порогов безопасности")
+    rollback.add_argument("--by")
+    catalog_sub.add_parser("check", help="диагностика указателя, базы и снимков без изменений")
+    catalog_sub.add_parser("recover", help="завершить или отменить прерванное применение")
+    history = catalog_sub.add_parser("history", help="история товара по версиям")
+    history.add_argument("sku")
 
     norms = sub.add_parser("norms", help="разобрать реестр «пункт приказа 1057 → код 1С»")
     norms.add_argument("--source", default="Baza-Ivan-25-11-25.pdf")
@@ -93,23 +128,24 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "ingest":
-        import json
-        from dataclasses import asdict
-
-        from ingest.build_kb import build
-
-        report = build(Path(args.source), Path(args.out))
-        print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+        _ingest(args)
 
     elif args.command == "import-1c":
         _import_1c(args)
 
+    elif args.command == "catalog":
+        _catalog(args)
+
     elif args.command == "norms":
-        from catalog.repository import load_products
+        from catalog.current import read_pointer, resolve_catalog
+        from core.config import Settings
         from ingest.norm_registry import DEFAULT_REGISTRY, build
 
-        known = {p.sku_1c for p in load_products()}
-        report = build(Path(args.source), known)
+        settings = Settings.from_env()
+        kb_path = Path(settings.kb_path)
+        registry_path = kb_path.parent / DEFAULT_REGISTRY.name
+        known = {record["sku_1c"] for record in resolve_catalog(kb_path).records()}
+        report = build(Path(args.source), known, registry_path)
         print(
             f"строк с кодом 1С: {report.lines_with_code}\n"
             f"пунктов приказа:  {report.item_codes}\n"
@@ -123,8 +159,19 @@ def main() -> None:
                 print("   ", line)
             if len(report.unmatched) > args.show_unmatched:
                 print(f"    … ещё {len(report.unmatched) - args.show_unmatched}")
-        print(f"\nреестр сохранён: {DEFAULT_REGISTRY}")
-        print("Дальше: python run.py ingest --source <выгрузка>.xlsx")
+        print(f"\nреестр сохранён: {registry_path}")
+        if read_pointer(kb_path.parent) is None:
+            print("Дальше: python run.py ingest --source <выгрузка>.xlsx")
+        else:
+            # Каталог ведётся версиями: реестр применяется к текущему снимку версией
+            # `registry`, без новой выгрузки 1С (D11, J).
+            from catalog_versions.service import CatalogVersionError, build_version_service
+
+            try:
+                result = build_version_service(settings).publish_registry(_user())
+            except CatalogVersionError as exc:
+                sys.exit(str(exc))
+            print(result.message)
 
     elif args.command == "acts":
         _parse_acts(args)
@@ -175,12 +222,14 @@ def main() -> None:
             print(text)
 
     elif args.command == "search":
-        from catalog.repository import load_index
+        from catalog.runtime import CatalogRuntime
         from catalog.search import SearchQuery
+        from core.config import Settings
         from core.ui import price_text, stock_text
 
-        index = load_index()
-        for hit in index.search(SearchQuery(text=args.query, limit=args.limit)):
+        state = CatalogRuntime.open(Settings.from_env().kb_path).state
+        print(f"каталог: версия {state.version or 'legacy'}, товаров {len(state.index.products)}")
+        for hit in state.index.search(SearchQuery(text=args.query, limit=args.limit)):
             product = hit.product
             print(f"[{hit.reason}] {product.name}")
             print(f"    {price_text(product.price)} · {stock_text(product)}")
@@ -189,16 +238,28 @@ def main() -> None:
 
 
 def _import_1c(args) -> None:  # noqa: ANN001 — argparse.Namespace
-    """Импорт выгрузки на проверку (EPIC 2). Базу знаний бота не трогает."""
-    import getpass
-
+    """Импорт выгрузки на проверку (EPIC 2) и diff (EPIC 4). Базу знаний бота не трогает."""
+    from catalog_import.diff import format_diff
     from catalog_import.files import UploadRejected
-    from catalog_import.service import build_service, format_imports, format_preview
+    from catalog_import.service import (
+        ImportStateError,
+        build_service,
+        format_imports,
+        format_preview,
+    )
     from core.config import Settings
 
     service = build_service(Settings.from_env())
     if args.list:
         print(format_imports(service.list_imports()))
+        return
+    if args.diff or args.rediff:
+        import_id = args.diff or args.rediff
+        try:
+            record = service.rediff(import_id) if args.rediff else service.require(import_id)
+        except ImportStateError as exc:
+            sys.exit(str(exc))
+        print(format_diff(record, service.diff_rows(import_id), args.filter, args.limit))
         return
     if args.show:
         record = service.get(args.show)
@@ -206,14 +267,71 @@ def _import_1c(args) -> None:  # noqa: ANN001 — argparse.Namespace
             sys.exit(f"Импорта {args.show} нет.")
     else:
         try:
-            user = getpass.getuser()
-        except OSError:
-            user = "cli"
-        try:
-            record = service.upload(Path(args.file), uploaded_by=user)
+            record = service.upload(Path(args.file), uploaded_by=_user())
         except UploadRejected as exc:
             sys.exit(f"Файл не принят: {exc}")
     print(format_preview(record, service.issues(record.id, limit=args.issues)))
+
+
+def _user() -> str:
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except OSError:
+        return "cli"
+
+
+def _catalog(args) -> None:  # noqa: ANN001 — argparse.Namespace
+    """Версии каталога (EPIC 4): init, approve, versions, rollback, check, recover, history."""
+    from catalog.current import CatalogPointerError
+    from catalog_import.service import ImportStateError
+    from catalog_versions.lock import CatalogLockTimeout
+    from catalog_versions.service import (
+        CatalogVersionError,
+        build_version_service,
+        format_version,
+    )
+    from core.config import Settings
+
+    service = build_version_service(Settings.from_env())
+    command = args.catalog_command
+    by = getattr(args, "by", None) or _user()
+    try:
+        if command == "init":
+            version = service.init(by)
+            print(f"Baseline создан, указатель {service.kb_dir / 'current'} → {version.version}.")
+            print(format_version(version, version.version))
+        elif command == "approve":
+            version = service.approve(args.import_id, by, force=args.force)
+            print(f"Импорт {args.import_id} утверждён и применён: версия {version.version}.")
+            print(format_version(version, version.version))
+        elif command == "rollback":
+            version = service.rollback(args.version, by, force=args.force)
+            print(f"Откат выполнен новой версией {version.version} (копия {args.version}).")
+            print(format_version(version, version.version))
+        elif command == "versions":
+            current = service.current_version()
+            listed = service.list_versions(args.limit)
+            print("\n".join(format_version(v, current) for v in listed) or "Версий пока нет.")
+        elif command == "check":
+            print("\n".join(service.check()))
+        elif command == "recover":
+            messages = service.recover()
+            print("\n".join(messages) if messages else "Восстанавливать нечего: каталог согласован.")
+        elif command == "history":
+            rows = service.versions.product_history(args.sku)
+            if not rows:
+                print(f"Истории товара {args.sku} нет.")
+            for row in rows:
+                fields = ", ".join(row["changed_fields"])
+                print(
+                    f"{row['version']:<15} {row['change_status']:<8} {row['valid_from']} → "
+                    f"{row['valid_to'] or 'сейчас'} · {row['name']} · цена {row['price']} · "
+                    f"остаток {row['in_stock']}" + (f" · поля: {fields}" if fields else "")
+                )
+    except (CatalogVersionError, CatalogPointerError, CatalogLockTimeout, ImportStateError) as exc:
+        sys.exit(str(exc))
 
 
 def _parse_acts(args) -> None:  # noqa: ANN001 — argparse.Namespace
@@ -223,7 +341,9 @@ def _parse_acts(args) -> None:  # noqa: ANN001 — argparse.Namespace
     команду запускает тот, у кого файлы рядом с проектом. Без справочника бот
     работает по-прежнему, называя номер пункта без формулировки.
     """
-    from catalog.repository import load_products
+    from catalog.current import resolve_catalog
+    from catalog.models import Product
+    from core.config import Settings
     from norms import documents as docs
     from norms import items as norm_items
 
@@ -250,7 +370,8 @@ def _parse_acts(args) -> None:  # noqa: ANN001 — argparse.Namespace
 
     known = norm_items.load()
     ours: dict[tuple[str, str], str] = {}
-    for product in load_products():
+    for record in resolve_catalog(Settings.from_env().kb_path).records():
+        product = Product.from_dict(record)
         for ref in product.norms:
             if ref.item_code:
                 ours.setdefault((ref.doc_id, ref.item_code), product.name)
@@ -275,7 +396,6 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     """
     from core.app import build_engine
     from core.config import Settings
-    from media.sync import sync_to_kb
 
     settings = Settings.from_env()
     engine = build_engine(settings)
@@ -287,11 +407,11 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
         print(f"удалено одинаковых снимков внутри папок товаров: {len(removed)}")
         for name in removed[:20]:
             print("   ", name)
-        print("перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))
+        print(_sync_media(engine, settings))
         return
 
     if args.sync:
-        print("Перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))
+        print(_sync_media(engine, settings))
         return
 
     engine.media.download_files = not args.no_files
@@ -312,7 +432,58 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     print("в кэше:", engine.storage.media_stats())
     if engine.media.photos is not None:
         print("файлы снимков:", engine.media.photos.stats())
-    print("перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))
+    print(_sync_media(engine, settings))
+
+
+def _sync_media(engine, settings) -> str:  # noqa: ANN001 — DialogEngine, Settings
+    """Собранные фото и характеристики — в каталог.
+
+    Без указателя — прежняя переливка в `products.jsonl`. С указателем — версия
+    `media` от текущей: меняются только фото и характеристики, без изменений
+    версия не создаётся (D11, J).
+    """
+    from catalog.current import read_pointer
+    from media.sync import sync_to_kb
+
+    kb_path = Path(settings.kb_path)
+    if read_pointer(kb_path.parent) is None:
+        return f"перелито в базу знаний: {sync_to_kb(engine.storage, kb_path)}"
+
+    from catalog_versions.service import CatalogVersionError, build_version_service
+
+    try:
+        result = build_version_service(settings).publish_media(
+            engine.storage.all_media(), engine.storage.all_attributes(), _user()
+        )
+    except CatalogVersionError as exc:
+        sys.exit(str(exc))
+    return result.message
+
+
+def _ingest(args) -> None:  # noqa: ANN001 — argparse.Namespace
+    """Legacy-сборка базы знаний. При версиях каталога бот её не видит (D11, J)."""
+    import json
+    from dataclasses import asdict
+
+    from catalog.current import read_pointer, resolve_catalog
+    from ingest.build_kb import build
+
+    out = Path(args.out)
+    kb = out / "products.jsonl"
+    pointer = read_pointer(out)
+    if pointer is not None and not args.legacy:
+        sys.exit(
+            f"Каталог ведётся версиями (текущая {pointer.version}): ingest каталог бота не меняет.\n"
+            "Новая выгрузка: python run.py import-1c --file <выгрузка>.xlsx → "
+            "python run.py import-1c --diff ID → python run.py catalog approve ID.\n"
+            "Для разработки: ingest --legacy пересоберёт только legacy products.jsonl."
+        )
+    # Фото и характеристики переносятся из текущего каталога — по указателю, если он есть.
+    previous = resolve_catalog(kb).path if pointer is not None or kb.exists() else None
+    report = build(Path(args.source), out, previous=previous)
+    print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+    if pointer is not None:
+        print(f"Пересобран legacy-файл {kb}; бот продолжает работать с версией {pointer.version}.")
 
 
 def _walk_cards(media, queue: list) -> None:  # noqa: ANN001 — media/service.py

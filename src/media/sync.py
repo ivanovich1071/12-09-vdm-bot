@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,17 +87,15 @@ def collected_in_kb(kb_path: str | Path = DEFAULT_KB) -> dict[str, dict]:
     if not kb_path.exists():
         return {}
 
-    found: dict[str, dict] = {}
     with kb_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            product = json.loads(line)
-            kept = {
-                key: product[key]
-                for key in ("images", "attributes")
-                if product.get(key)
-            }
-            if kept:
-                found[product["sku_1c"]] = kept
+        return collected(json.loads(line) for line in fh if line.strip())
+
+
+def collected(records: Iterable[dict]) -> dict[str, dict]:
+    """Фото и характеристики из готовых записей карточек: код 1С → то, что собрано."""
+    found: dict[str, dict] = {}
+    for product in records:
+        kept = {key: product[key] for key in ("images", "attributes") if product.get(key)}
+        if kept:
+            found[product["sku_1c"]] = kept
     return found

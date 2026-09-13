@@ -14,6 +14,12 @@ class ImportStatus(StrEnum):
     PARSED = "PARSED"
     # Файл целиком непригоден: не читается, не те колонки, нет ни одного товара.
     INVALID = "INVALID"
+    # Утверждён, версия каталога собрана, но ещё не стала текущей (EPIC 4).
+    APPROVED = "APPROVED"
+    # Версия каталога из этого импорта стала текущей.
+    APPLIED = "APPLIED"
+    # Применение сорвалось. Утверждение можно повторить, при необходимости после --rediff.
+    FAILED = "FAILED"
 
 
 class Severity(StrEnum):
@@ -66,8 +72,8 @@ class CatalogComparison:
 
     Новый, существующий и исчезнувший товар определяются по точному коду 1С (D9,
     решение A). Сопоставление (EPIC 3, `matching.py`) проверяет существующие коды и
-    ищет новым кодам пару только среди исчезнувших. Изменения цены и остатка по
-    позициям — EPIC 4.
+    ищет новым кодам пару только среди исчезнувших. Изменения по позициям — diff
+    (EPIC 4, `diff.py`).
     """
 
     in_catalog: int
@@ -100,6 +106,8 @@ class ImportSummary:
     issues_by_code: dict[str, int] = field(default_factory=dict)
     # `None` — база знаний бота не собрана, сравнивать не с чем.
     comparison: CatalogComparison | None = None
+    # Счётчики diff (`DiffCounters.to_dict`). `None` — diff не считался.
+    diff: dict[str, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,3 +135,11 @@ class CatalogImport:
     error: str | None = None
     # Этот же файл уже загружали: возвращён прежний импорт, новых записей нет.
     duplicate: bool = False
+    # Против какой версии каталога посчитан diff и его отпечаток (EPIC 4).
+    base_version: str | None = None
+    diff_fingerprint: str | None = None
+    diffed_at: str | None = None
+    approved_by: str | None = None
+    approved_at: str | None = None
+    # Версия каталога, созданная этим импортом.
+    version: str | None = None

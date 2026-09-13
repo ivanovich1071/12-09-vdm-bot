@@ -11,7 +11,7 @@ from pathlib import Path
 
 from agent.agent import SalesAgent
 from agent.providers import build_router, warm_up
-from catalog.repository import load_index
+from catalog.runtime import CatalogRuntime
 from core.config import Settings
 from core.dialog import DialogEngine
 from core.storage import Storage
@@ -24,14 +24,24 @@ from orders.service import OrderService, build_sink
 log = logging.getLogger(__name__)
 
 
-def build_engine(settings: Settings | None = None, warm_llm: bool = False) -> DialogEngine:
+def build_engine(
+    settings: Settings | None = None,
+    warm_llm: bool = False,
+    watch_catalog: bool | None = None,
+) -> DialogEngine:
     """Готовый движок диалога.
 
     `warm_llm` включают долгоживущие каналы — Telegram и виджет. Разовым
     командам (`run.py search`) прогрев ни к чему: они и так живут секунду.
+
+    Каталог — текущая версия по указателю (`catalog/current.py`); повреждённый
+    указатель останавливает старт. Долгоживущие каналы (`watch_catalog`, по
+    умолчанию как `warm_llm`) сверяют указатель в фоне и меняют версию без
+    перезапуска.
     """
     settings = settings or Settings.from_env()
-    index = load_index(settings.kb_path)
+    runtime = CatalogRuntime.open(settings.kb_path)
+    index = runtime.state.index
     storage = Storage(settings.storage_path)
     # Срок хранения переписки соблюдается при каждом старте, а не только при
     # чтении: тот, кто перестал писать, сам за собой не почистит.
@@ -65,12 +75,15 @@ def build_engine(settings: Settings | None = None, warm_llm: bool = False) -> Di
         photos=PhotoStore(fetcher=fetcher, root=Path(settings.media_dir)),
     )
     engine = DialogEngine(
-        index, storage, orders, settings, agent=agent, dialog_log=dialog_log, media=media
+        runtime, storage, orders, settings, agent=agent, dialog_log=dialog_log, media=media
     )
     if agent is not None:
         agent.engine = engine
+    if warm_llm if watch_catalog is None else watch_catalog:
+        runtime.start_watching(settings.catalog_reload_seconds)
     log.info(
-        "Каталог загружен: %s позиций, приёмник заказов — %s, журнал диалогов — %s",
+        "Каталог загружен: версия %s, %s позиций, приёмник заказов — %s, журнал диалогов — %s",
+        runtime.state.version or "legacy",
         len(index.products),
         getattr(orders.sink, "name", "?"),
         settings.dialog_log_path if settings.dialog_log_enabled else "выключен",

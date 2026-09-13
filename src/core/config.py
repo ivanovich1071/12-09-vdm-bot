@@ -43,6 +43,13 @@ class Settings:
     match_auto_threshold: float = 0.85
     match_review_threshold: float = 0.60
     match_ambiguity_margin: float = 0.05
+    # Версии каталога (EPIC 4, D11). Без --force утверждение и откат останавливаются,
+    # если исчезает больше доли товаров или цена меняется у большей доли: так ловится
+    # обрезанный файл или сдвиг колонок. Процессы бота сверяют указатель раз в
+    # CATALOG_RELOAD_SECONDS и перед каждым ходом.
+    catalog_max_removed_share: float = 0.10
+    catalog_max_price_changed_share: float = 0.30
+    catalog_reload_seconds: float = 30.0
 
     # Модель. Провайдеров два: Cloud.ru — то, где всё будет работать у заказчика,
     # OpenRouter — то, где диалог можно проверить с машины разработки, когда
@@ -124,6 +131,15 @@ class Settings:
             ),
             match_ambiguity_margin=float(
                 env.get("MATCH_AMBIGUITY_MARGIN", cls.match_ambiguity_margin)
+            ),
+            catalog_max_removed_share=float(
+                env.get("CATALOG_MAX_REMOVED_SHARE", cls.catalog_max_removed_share)
+            ),
+            catalog_max_price_changed_share=float(
+                env.get("CATALOG_MAX_PRICE_CHANGED_SHARE", cls.catalog_max_price_changed_share)
+            ),
+            catalog_reload_seconds=float(
+                env.get("CATALOG_RELOAD_SECONDS", cls.catalog_reload_seconds)
             ),
             llm_provider=env.get("LLM_PROVIDER", cls.llm_provider).strip().lower(),
             cloudru_api_key=env.get("CLOUDRU_API_KEY", ""),
