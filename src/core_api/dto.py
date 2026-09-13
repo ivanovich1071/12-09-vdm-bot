@@ -144,6 +144,8 @@ class NoticeOut(Out):
 class ConsentOut(Out):
     version: str
     active: bool
+    # Текст согласия той редакции, на которую соглашаются: клиент его показывает, а не пишет свой.
+    text: str
 
 
 class SessionOut(Out):
@@ -335,3 +337,8 @@ class CountOut(Out):
 
 class DecisionOut(Out):
     id: str
+
+
+class DownloadOut(Out):
+    url: str
+    expires_in: int

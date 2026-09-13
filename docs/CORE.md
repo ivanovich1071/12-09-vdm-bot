@@ -274,3 +274,56 @@ Telegram · MAX · Web Widget · Mini Apps  →  Core API  →  Dialogue · Proc
 - **Регрессия прежних контрактов:** `/widget/*`, `/health`, `/media`, Telegram-рендер,
   диалог, корзина, заказ, 838 / 1057 — прежние тесты зелёные без изменений.
 - **gitleaks** по коммитам NEXT-1…3 — утечек нет.
+
+## NEXT-4. Telegram и Mini App на Core API
+
+### Telegram-бот
+
+```text
+Telegram Update → adapters/telegram/bot.py → TelegramGateway → CoreApi → ядро
+                                   ↑ рендер ← примитивы ответа / FileReply / ContactRequest
+```
+
+- **`TelegramGateway` (`adapters/telegram/gateway.py`)** — тонкий слой. Сессия канала
+  открывается как у серверного адаптера (`channel = telegram`, `user_ref` = id
+  пользователя Telegram), все операции — вызовы `CoreApi`.
+  - Каталога, базы, норм и правил продажи в нём нет: список импортов проверяет
+    `test_gateway_has_no_business_logic_dependencies`.
+- **Что делает бот через ядро:**
+
+  | Возможность | Как |
+  |---|---|
+  | Сообщения, кнопки, карточки, корзина | `CoreApi.message_primitives` / `action_primitives` — тот же диалог |
+  | Файл заказа | Документ в чат → `upload_order` → `evaluate_order` → итог проверки с кнопкой «Оформить предзаказ» |
+  | Спецификация | `/spec` — из корзины: Excel в чат, кнопки «Word» и «Оформить предзаказ» |
+  | Предзаказ | Согласие (текст `privacy.consent`) → «Отправить контакт» кнопкой Telegram или имя и телефон сообщением → менеджер |
+  | История | `/preorders` |
+
+- **Постепенный перевод.** Рендер карточек, корзины и выдачи не переписан:
+  `CoreApi` отдаёт адаптеру в том же процессе примитивы `core.ui`, HTTP — их JSON.
+  `build_dispatcher(engine)` без шлюза работает как прежде.
+- **Что осталось у адаптера** — только своё для Telegram: скачать вложение, кнопка
+  контакта, ожидание контакта между сообщениями. Ожидание — в памяти процесса:
+  контакт нигде не хранится до передачи менеджеру. Чужая визитка не принимается.
+- `TELEGRAM_MINIAPP_URL` задан — бот ставит кнопку меню «Приложение».
+
+### Mini App
+
+- **`/miniapp`** — один HTML без сборки (`web/static/miniapp.html`), отдаётся тем же
+  приложением, что `/api`.
+  - В странице нет бизнес-логики: только вызовы `/api/*` и отрисовка ответов.
+  - Тест проверяет, что все пути в странице начинаются с `/api/`.
+- **Вход.** `Telegram.WebApp.initData` → `POST /api/sessions` с
+  `credentials.type = telegram_init_data`.
+  - Подпись проверяет `TelegramInitDataVerifier` (`adapters/telegram/miniapp_auth.py`,
+    без aiogram): HMAC по токену бота, срок — сутки.
+  - `user_ref` — id пользователя Telegram: Mini App и бот видят одну корзину и одно
+    согласие.
+  - Верификатор подключает `web/app.py`, если задан `TELEGRAM_TOKEN`.
+- **Экраны:** Главная, AI-подбор, Норматив, Результаты, Карточка товара,
+  Спецификация, Корзина, Загрузка заказа, Проверка, Ошибки, Предзаказ, История.
+- **Файлы спецификации** — одноразовой ссылкой
+  `POST /api/procurement/specifications/{id}/export-link` → `GET /api/downloads/{token}`:
+  живёт 5 минут, срабатывает один раз. Секрет сессии в адрес не попадает.
+- **Согласие** Mini App показывает тем текстом, что отдаёт ядро
+  (`session.consent.text`), своего текста не пишет.

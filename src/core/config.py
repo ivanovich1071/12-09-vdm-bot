@@ -85,6 +85,8 @@ class Settings:
 
     # Каналы
     telegram_token: str = ""
+    # Публичный HTTPS-адрес Mini App (…/miniapp). Задан — бот ставит кнопку меню «Приложение».
+    telegram_miniapp_url: str = ""
     max_token: str = ""
     site_url: str = "https://vdm.ru"
     manager_contact: str = "+7 (495) 646-01-40, elti@vdm.ru"
@@ -172,6 +174,7 @@ class Settings:
             openrouter_price_in=float(env.get("OPENROUTER_PRICE_IN", cls.openrouter_price_in)),
             openrouter_price_out=float(env.get("OPENROUTER_PRICE_OUT", cls.openrouter_price_out)),
             telegram_token=env.get("TELEGRAM_TOKEN", ""),
+            telegram_miniapp_url=env.get("TELEGRAM_MINIAPP_URL", ""),
             max_token=env.get("MAX_TOKEN", ""),
             site_url=env.get("SITE_URL", cls.site_url),
             manager_contact=env.get("MANAGER_CONTACT", cls.manager_contact),

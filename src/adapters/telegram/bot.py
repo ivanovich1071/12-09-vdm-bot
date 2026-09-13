@@ -27,6 +27,7 @@ from aiogram.types import (
     Message as TgMessage,
 )
 
+from adapters.telegram.gateway import ContactRequest, FileReply, TelegramGateway
 from core.app import build_engine
 from core.config import Settings
 from core.dialog import DialogEngine
@@ -40,6 +41,8 @@ from core.ui import (
     price_text,
     stock_text,
 )
+from core_api.composition import build_core
+from core_api.facade import CoreApi
 
 log = logging.getLogger(__name__)
 CHANNEL = "telegram"
@@ -124,6 +127,8 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("start", "начать заново"),
     ("help", "что я умею"),
     ("cart", "корзина"),
+    ("spec", "спецификация из корзины"),
+    ("preorders", "мои предзаказы"),
     ("order", "оформить заказ"),
     ("manager", "связаться с менеджером"),
 )
@@ -141,6 +146,15 @@ def persistent_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Напишите, что нужно подобрать",
+    )
+
+
+def contact_keyboard() -> ReplyKeyboardMarkup:
+    """Кнопка «Отправить контакт»: имя и телефон приходят от Telegram, их не нужно набирать."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отправить контакт", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
 
@@ -267,6 +281,17 @@ async def send(
                 await bot.send_message(chat_id, "Что дальше?", reply_markup=markup)
         elif isinstance(response, OrderSummary):
             await bot.send_message(chat_id, fit(render_order(response)), reply_markup=markup)
+        elif isinstance(response, FileReply):
+            from aiogram.types import BufferedInputFile
+
+            await bot.send_document(
+                chat_id,
+                BufferedInputFile(response.content, filename=response.filename),
+                caption=_escape(response.caption)[:CAPTION_LIMIT] or None,
+                reply_markup=markup,
+            )
+        elif isinstance(response, ContactRequest):
+            await bot.send_message(chat_id, _escape(response.text), reply_markup=contact_keyboard())
 
 
 def _replacement_text(response: Response) -> str | None:
@@ -375,19 +400,31 @@ def _remember_photo(storage, card: ProductCard, sent) -> None:  # noqa: ANN001
     storage.save_telegram_photo(card.image_path, card.product.sku_1c, sizes[-1].file_id)
 
 
-def build_dispatcher(engine: DialogEngine) -> Dispatcher:
+def build_dispatcher(engine: DialogEngine, gateway: TelegramGateway | None = None) -> Dispatcher:
+    """Обработчики Telegram.
+
+    С `gateway` бот работает через Core API (NEXT-4): диалог, файл заказа, спецификация,
+    предзаказ. Без него — прежний путь напрямую в движок диалога; он остаётся, пока
+    Telegram переводится на Core API постепенно.
+    """
     dispatcher = Dispatcher()
+    target = gateway or engine
 
     @dispatcher.message(F.text)
     async def on_text(message: TgMessage, bot: Bot) -> None:
         # Команды разбирает ядро: /start одинаково начинает разговор заново и в
         # Telegram, и в виджете, и правило это должно жить в одном месте.
         user, chat, text = str(message.from_user.id), message.chat.id, message.text
+        work = (
+            (lambda: gateway.text(user, text))
+            if gateway is not None
+            else (lambda: engine.handle_text(user, CHANNEL, text))
+        )
         await _reply(
             bot,
             chat,
-            engine,
-            lambda: engine.handle_text(user, CHANNEL, text),
+            target,
+            work,
             # Строка кнопок ставится на приветствие: /start человек зовёт и в
             # начале разговора, и когда хочет начать заново.
             persistent=text.strip().lower().startswith("/start"),
@@ -397,15 +434,49 @@ def build_dispatcher(engine: DialogEngine) -> Dispatcher:
     async def on_callback(query: CallbackQuery, bot: Bot) -> None:
         user, chat, data = str(query.from_user.id), query.message.chat.id, query.data
         await _quietly(query.answer())
+        work = (
+            (lambda: gateway.action(user, data))
+            if gateway is not None
+            else (lambda: engine.handle_action(user, CHANNEL, data))
+        )
         await _reply(
             bot,
             chat,
-            engine,
-            lambda: engine.handle_action(user, CHANNEL, data),
+            target,
+            work,
             origin=query.message,
             # «Начать заново» кнопкой возвращает то же приветствие, что и /start,
             # — и строку кнопок вместе с ним.
             persistent=data == "restart_yes",
+        )
+
+    if gateway is None:
+        return dispatcher
+
+    @dispatcher.message(F.document)
+    async def on_document(message: TgMessage, bot: Bot) -> None:
+        """Готовый заказ файлом: проверку делает ядро, адаптер только скачивает файл."""
+        user, chat, document = str(message.from_user.id), message.chat.id, message.document
+        if document.file_size and document.file_size > gateway.max_upload_bytes:
+            limit = gateway.max_upload_bytes // (1024 * 1024)
+            await _reply(bot, chat, gateway, lambda: [Message(f"Файл больше {limit} МБ — пришлите поменьше.")])
+            return
+        buffer = await bot.download(document)
+        content = buffer.read() if buffer is not None else b""
+        name = document.file_name or "order"
+        await _reply(bot, chat, gateway, lambda: gateway.upload(user, name, content))
+
+    @dispatcher.message(F.contact)
+    async def on_contact(message: TgMessage, bot: Bot) -> None:
+        contact = message.contact
+        user, chat = str(message.from_user.id), message.chat.id
+        # Контакт принимаем только свой: чужую визитку менеджеру не передаём.
+        if contact.user_id is not None and contact.user_id != message.from_user.id:
+            await _reply(bot, chat, gateway, lambda: [Message("Пришлите, пожалуйста, свой контакт.")])
+            return
+        name = " ".join(filter(None, (contact.first_name, contact.last_name)))
+        await _reply(
+            bot, chat, gateway, lambda: gateway.contact(user, name, contact.phone_number), persistent=True
         )
 
     return dispatcher
@@ -531,8 +602,13 @@ async def main() -> None:
 
     bot = Bot(settings.telegram_token, default=_default_properties(), session=_session())
     bot.session.middleware(RetryOnNetworkError())
-    dispatcher = build_dispatcher(build_engine(settings, warm_llm=True))
+    engine = build_engine(settings, warm_llm=True)
+    gateway = TelegramGateway(
+        CoreApi(build_core(settings, engine)), settings.order_upload_max_mb * 1024 * 1024
+    )
+    dispatcher = build_dispatcher(engine, gateway)
     await _publish_commands(bot)
+    await _publish_miniapp(bot, settings.telegram_miniapp_url)
     log.info("Telegram-бот запущен")
     await _poll_forever(dispatcher, bot)
 
@@ -552,6 +628,18 @@ async def _publish_commands(bot: Bot) -> None:
         # Меню — украшение; бот без него работает, а падать на старте из-за
         # оборвавшейся сети он не должен.
         log.warning("Меню команд не опубликовано: %s", exc)
+
+
+async def _publish_miniapp(bot: Bot, url: str) -> None:
+    """Кнопка меню «Приложение» — открывает Mini App поверх того же Core API."""
+    if not url:
+        return
+    from aiogram.types import MenuButtonWebApp, WebAppInfo
+
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=url)))
+    except (TelegramNetworkError, TelegramBadRequest) as exc:
+        log.warning("Кнопка Mini App не опубликована: %s", exc)
 
 
 async def _poll_forever(dispatcher: Dispatcher, bot: Bot) -> None:

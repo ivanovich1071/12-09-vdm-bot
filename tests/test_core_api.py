@@ -72,7 +72,7 @@ def build(tmp_path: Path, **overrides) -> SimpleNamespace:
         {"test_signature": SignedData()},
     )
     client = TestClient(web_app.create_app(settings, engine=engine, core=core), raise_server_exceptions=False)
-    return SimpleNamespace(client=client, engine=engine, storage=storage, runtime=engine.runtime, notifier=notifier, settings=settings)
+    return SimpleNamespace(client=client, core=core, engine=engine, storage=storage, runtime=engine.runtime, notifier=notifier, settings=settings)
 
 
 @pytest.fixture
@@ -147,7 +147,7 @@ def test_existing_endpoints_keep_their_contract(api):
 def test_sessions(api):
     anonymous = ok(api.client.post("/api/sessions"), 201)["data"]
     assert anonymous["origin"] == "anonymous" and anonymous["user_ref"] == anonymous["id"]
-    assert anonymous["consent"] == {"version": anonymous["consent"]["version"], "active": False}
+    assert anonymous["consent"]["active"] is False and "Редакция" in anonymous["consent"]["text"]
 
     error(api.client.post("/api/sessions", json={"channel": "bot", "user_ref": "777"}), 401, "API_KEY_REQUIRED")
     error(api.client.post("/api/sessions", json={"channel": "bot", "user_ref": "777"}, headers={"X-Core-Api-Key": "wrong"}), 401, "INVALID_API_KEY")

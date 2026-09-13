@@ -271,16 +271,21 @@ def create_router(get_core: Callable[[], CoreApi], settings: Settings) -> APIRou
         current: CoreSession = Depends(session),
         api: CoreApi = Depends(core),
     ) -> Response:
-        document, catalog_version, norm_version = api.export_specification(current, spec_id, format)
-        return Response(
-            document.content,
-            media_type=document.media_type,
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(document.filename)}",
-                "X-Catalog-Version": catalog_version,
-                "X-Norm-Version": norm_version,
-            },
-        )
+        return file_response(*api.export_specification(current, spec_id, format))
+
+    @router.post("/procurement/specifications/{spec_id}/export-link")
+    def export_link(
+        request: Request,
+        spec_id: str,
+        format: str = Query(default="xlsx", pattern=r"^[a-z]{3,5}$"),  # noqa: A002 — имя параметра запроса
+        current: CoreSession = Depends(session),
+        api: CoreApi = Depends(core),
+    ) -> JSONResponse:
+        return ok(request, api.export_link(current, spec_id, format), 201)
+
+    @router.get("/downloads/{token}")
+    def download(token: str, api: CoreApi = Depends(core)) -> Response:
+        return file_response(*api.download(token))
 
     # --- Товар и корзина -------------------------------------------------------------------
 
@@ -409,6 +414,18 @@ def create_router(get_core: Callable[[], CoreApi], settings: Settings) -> APIRou
         return ok(request, api.manager_retry_notifications())
 
     return router
+
+
+def file_response(document, catalog_version: str, norm_version: str) -> Response:  # noqa: ANN001 — ExportedDocument
+    return Response(
+        document.content,
+        media_type=document.media_type,
+        headers={
+            "Content-Disposition": "attachment; filename*=UTF-8''" + quote(document.filename),
+            "X-Catalog-Version": catalog_version,
+            "X-Norm-Version": norm_version,
+        },
+    )
 
 
 def _request_id(request: Request) -> str:

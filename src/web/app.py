@@ -138,6 +138,11 @@ def create_app(
             headers={"Cache-Control": "no-cache"},
         )
 
+    @app.get("/miniapp", response_class=HTMLResponse)
+    def miniapp() -> FileResponse:
+        """Telegram Mini App: интерфейс поверх `/api`, бизнес-логики в нём нет."""
+        return FileResponse(STATIC / "miniapp.html", media_type="text/html", headers={"Cache-Control": "no-cache"})
+
     @app.get("/demo", response_class=HTMLResponse)
     def demo(request: Request) -> HTMLResponse:
         html = (STATIC / "demo.html").read_text(encoding="utf-8")
@@ -160,6 +165,14 @@ def _install_core_api(app: FastAPI, settings: Settings, engine, core, verifiers)
 
     holder: dict[str, CoreApi] = {"core": core} if core is not None else {}
     lock = threading.Lock()
+    verifiers = dict(verifiers or {})
+    if settings.telegram_token:
+        # Mini App входит подписанными данными Telegram: пользователь тот же, что у бота.
+        from adapters.telegram.miniapp_auth import CREDENTIALS_TYPE, TelegramInitDataVerifier
+
+        verifiers.setdefault(CREDENTIALS_TYPE, TelegramInitDataVerifier(settings.telegram_token))
+        if core is not None:
+            core.verifiers.setdefault(CREDENTIALS_TYPE, verifiers[CREDENTIALS_TYPE])
 
     def get_core() -> CoreApi:
         if "core" not in holder:

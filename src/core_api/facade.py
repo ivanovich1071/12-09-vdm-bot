@@ -9,6 +9,9 @@ HTTP (`core_api/http.py`) и Telegram вызывают одни и те же м�
 
 from __future__ import annotations
 
+import secrets
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,14 +20,17 @@ from pydantic import BaseModel
 
 from core.errors import InvalidRequest, NotFound, Unauthorized
 from core.models import CartItem, Customer
+from core.ui import Response
 from core_api import dto, render
 from core_api.composition import CoreServices
 from core_api.sessions import ADAPTER, ANONYMOUS, CoreSession, IdentityVerifier
 from documents.exporters import ExportedDocument
 from order_import.models import OrderContext
 from preorder.models import PreorderStatus
-from privacy.consent import CONSENT_VERSION
+from privacy.consent import CONSENT_TEXT, CONSENT_VERSION
 from procurement.specification import SpecificationLine
+
+DOWNLOAD_TTL = 300
 
 
 @dataclass
@@ -41,6 +47,8 @@ class CoreApi:
     def __init__(self, services: CoreServices, verifiers: Mapping[str, IdentityVerifier] | None = None) -> None:
         self.services = services
         self.verifiers = dict(verifiers or {})
+        self._downloads: dict[str, tuple[float, str, str, str]] = {}
+        self._downloads_lock = threading.Lock()
 
     @property
     def runtime(self):  # noqa: ANN201 — catalog.runtime.CatalogRuntime
@@ -117,13 +125,32 @@ class CoreApi:
 
     def message(self, session: CoreSession, text: str) -> Result:
         with self.runtime.turn() as state:
-            replies = self.services.engine.handle_text(session.user_ref, session.channel, text)
+            replies = self.message_primitives(session, text)
             return Result(dto.DialogueOut(responses=render.responses(replies)), session.id, catalog_version=state.label)
 
     def action(self, session: CoreSession, action: str) -> Result:
         with self.runtime.turn() as state:
-            replies = self.services.engine.handle_action(session.user_ref, session.channel, action)
+            replies = self.action_primitives(session, action)
             return Result(dto.DialogueOut(responses=render.responses(replies)), session.id, catalog_version=state.label)
+
+    def message_primitives(self, session: CoreSession, text: str) -> list[Response]:
+        """Ответ диалога примитивами `core.ui` — для адаптеров в том же процессе.
+
+        HTTP отдаёт те же ответы в JSON (`render.responses`). Примитивы не знают канала:
+        Telegram рисует их карточками, виджет — строками.
+        """
+        return self.services.engine.handle_text(session.user_ref, session.channel, text)
+
+    def action_primitives(self, session: CoreSession, action: str) -> list[Response]:
+        return self.services.engine.handle_action(session.user_ref, session.channel, action)
+
+    def order_context(self, session: CoreSession) -> OrderContext:
+        """Что диалог уже знает о закупке — учреждение и документ — для проверки загруженного заказа."""
+        profile = self.services.engine.session(session.user_ref, session.channel).profile
+        return OrderContext(
+            institution_type=profile.institution,
+            norm_document=profile.norm_doc_ids[0] if profile.norm_doc_ids else None,
+        )
 
     # --- Закупка -------------------------------------------------------------------------
 
@@ -180,6 +207,30 @@ class CoreApi:
     def export_specification(self, session: CoreSession, spec_id: str, fmt: str) -> tuple[ExportedDocument, str, str]:
         spec = self.services.procurement.get_specification(spec_id, session.user_ref)
         document = self.services.procurement.export_specification(spec_id, session.user_ref, fmt)
+        return document, spec.catalog_version, spec.norm_version
+
+    def export_link(self, session: CoreSession, spec_id: str, fmt: str) -> Result:
+        """Одноразовая ссылка на файл — для клиентов, которые не могут скачать с заголовком.
+
+        Mini App открывает файл ссылкой: секрет сессии в адрес не кладём, ссылка живёт
+        `DOWNLOAD_TTL` секунд и срабатывает один раз.
+        """
+        self.services.procurement.export_specification(spec_id, session.user_ref, fmt)  # права и формат — сразу
+        token = secrets.token_urlsafe(24)
+        with self._downloads_lock:
+            now = time.monotonic()
+            self._downloads = {key: entry for key, entry in self._downloads.items() if entry[0] > now}
+            self._downloads[token] = (now + DOWNLOAD_TTL, session.user_ref, spec_id, fmt)
+        return Result(dto.DownloadOut(url=f"/api/downloads/{token}", expires_in=DOWNLOAD_TTL), session.id)
+
+    def download(self, token: str) -> tuple[ExportedDocument, str, str]:
+        with self._downloads_lock:
+            entry = self._downloads.pop(token, None)
+        if entry is None or entry[0] < time.monotonic():
+            raise NotFound("Ссылка недействительна или истекла.", code="DOWNLOAD_NOT_FOUND")
+        _, owner, spec_id, fmt = entry
+        spec = self.services.procurement.get_specification(spec_id, owner)
+        document = self.services.procurement.export_specification(spec_id, owner, fmt)
         return document, spec.catalog_version, spec.norm_version
 
     # --- Товар и корзина --------------------------------------------------------------------
@@ -366,7 +417,7 @@ class CoreApi:
 
     def _session_out(self, session: CoreSession) -> dto.SessionOut:
         active = self.storage.active_consent(session.user_ref) is not None
-        return dto.SessionOut(**session.to_dict(), consent=dto.ConsentOut(version=CONSENT_VERSION, active=active))
+        return dto.SessionOut(**session.to_dict(), consent=dto.ConsentOut(version=CONSENT_VERSION, active=active, text=CONSENT_TEXT))
 
     def _task(self, session: CoreSession, task) -> Result:  # noqa: ANN001 — procurement.models.ProcurementTask
         data = task.to_dict()

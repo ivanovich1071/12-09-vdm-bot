@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ЭЛТИ-КУДИЦ · закупка</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<!--
+  Telegram Mini App поверх Core API (NEXT-4).
+
+  Бизнес-логики здесь нет: подбор, цены, нормативы, сопоставление, спецификацию и
+  предзаказ считает ядро. Страница только вызывает /api и показывает ответ.
+  Вход — подписанные данные Telegram (initData), пользователь тот же, что у бота.
+-->
+<style>
+  :root { --bg: var(--tg-theme-bg-color, #fff); --text: var(--tg-theme-text-color, #1c2430);
+          --hint: var(--tg-theme-hint-color, #6b7a8c); --accent: var(--tg-theme-button-color, #0b6ab0);
+          --accent-text: var(--tg-theme-button-text-color, #fff); --card: var(--tg-theme-secondary-bg-color, #f3f6f9); }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  header { padding: 10px 14px; display: flex; justify-content: space-between; align-items: baseline; }
+  header small { color: var(--hint); font-size: 12px; }
+  nav { display: flex; gap: 6px; overflow-x: auto; padding: 0 10px 8px; }
+  nav button { flex: 0 0 auto; }
+  main { padding: 0 12px 24px; }
+  h2 { font-size: 18px; margin: 6px 0 10px; }
+  button { border: 0; border-radius: 10px; padding: 8px 12px; background: var(--card); color: var(--text); font: inherit; cursor: pointer; }
+  button.primary, nav button.active { background: var(--accent); color: var(--accent-text); }
+  input, select, textarea { width: 100%; padding: 9px; border: 1px solid #cfd8e3; border-radius: 10px; font: inherit; margin: 4px 0 10px; background: var(--bg); color: var(--text); }
+  label { font-size: 13px; color: var(--hint); }
+  .card { background: var(--card); border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .meta { color: var(--hint); font-size: 13px; }
+  .chip { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #e3ebf3; color: #294a6b; margin: 2px 4px 0 0; }
+  .chip.bad { background: #fbe3e3; color: #8a2020; } .chip.warn { background: #fdf1d8; color: #7a5510; } .chip.good { background: #def3e3; color: #1d6a33; }
+  .notice { border-left: 3px solid #e0a21b; padding-left: 8px; margin: 6px 0; font-size: 13px; }
+  .error { border-left: 3px solid #c0392b; padding: 8px; background: #fbe3e3; border-radius: 8px; margin: 8px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { padding: 6px 4px; border-bottom: 1px solid #dde4ec; text-align: left; vertical-align: top; }
+  .total { font-weight: 600; margin-top: 8px; }
+  pre { white-space: pre-wrap; font: inherit; margin: 0; }
+</style>
+</head>
+<body>
+<header><b>ЭЛТИ-КУДИЦ</b><small id="version"></small></header>
+<nav id="nav"></nav>
+<main id="screen"><p class="meta">Загрузка…</p></main>
+<script>
+(function () {
+  "use strict";
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var state = { session: null, task: null, selection: [], spec: null, order: null, evaluation: null, preorder: null, product: null };
+  // Экраны: карточка товара открывается из выдачи, отдельной вкладки у неё нет.
+  var TABS = [["home", "Главная"], ["pick", "AI-подбор"], ["norm", "Норматив"], ["results", "Результаты"],
+              ["cart", "Корзина"], ["spec", "Спецификация"], ["upload", "Загрузка заказа"], ["check", "Проверка"],
+              ["errors", "Ошибки"], ["preorder", "Предзаказ"], ["history", "История"]];
+  var LABELS = { AVAILABLE: "в наличии", NOT_AVAILABLE: "нет в наличии", UNKNOWN: "наличие неизвестно",
+    NORM_OK: "норматив подтверждён", NORM_MISMATCH: "другой пункт перечня", NORM_UNKNOWN: "нет данных о нормативе",
+    REVIEW_REQUIRED: "нужна проверка", READY: "готово", READY_WITH_WARNINGS: "есть предупреждения", REJECTED: "не принято",
+    MATCHED_EXACT: "точно", MATCHED_HIGH: "уверенно", MATCHED_REVIEW: "проверит менеджер", AMBIGUOUS: "неоднозначно",
+    NOT_FOUND: "не найдено", PRICE_OK: "цена та же", PRICE_CHANGED: "цена изменилась", PRICE_NOT_FOUND: "нет цены",
+    norm: "по нормативу", user: "указано вами", calculated: "рассчитано", default: "по умолчанию", manager: "менеджер",
+    READY_FOR_MANAGER: "готов к передаче", SENT_TO_MANAGER: "у менеджера", MANAGER_REVIEW: "менеджер проверяет",
+    CONFIRMED: "подтверждён", DRAFT: "черновик", FINAL: "передана в предзаказ", SUPERSEDED: "заменена" };
+  var screen = document.getElementById("screen");
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function money(value) { return value == null ? "цена по запросу" : String(value).replace(/\B(?=(\d{3})+(?!\d))/g, " ") + " ₽"; }
+  function label(code) { return LABELS[code] || code; }
+  function chip(code) {
+    var kind = /OK|EXACT|HIGH|^AVAILABLE|READY$|CONFIRMED/.test(code) ? "good" : /NOT_FOUND|MISMATCH|REJECTED|AMBIGUOUS/.test(code) ? "bad" : "warn";
+    return '<span class="chip ' + kind + '">' + esc(label(code)) + "</span>";
+  }
+  function notices(list) { return (list || []).map(function (n) { return '<div class="notice">' + esc(n.message) + "</div>"; }).join(""); }
+
+  async function api(method, path, body, raw) {
+    var headers = {};
+    if (state.session) headers["X-Session-Id"] = state.session.id;
+    var init = { method: method, headers: headers };
+    if (raw) { init.body = raw; headers["Content-Type"] = "application/octet-stream"; }
+    else if (body !== undefined) { init.body = JSON.stringify(body); headers["Content-Type"] = "application/json"; }
+    var response = await fetch(path, init);
+    var data = await response.json();
+    if (data.status !== "ok") { var error = new Error(data.error.message); error.code = data.error.code; throw error; }
+    if (data.catalog_version) document.getElementById("version").textContent = "каталог " + data.catalog_version;
+    return data;
+  }
+
+  function nav(active) {
+    document.getElementById("nav").innerHTML = TABS.map(function (tab) {
+      return '<button data-tab="' + tab[0] + '" class="' + (tab[0] === active ? "active" : "") + '">' + tab[1] + "</button>";
+    }).join("");
+  }
+  document.getElementById("nav").addEventListener("click", function (event) {
+    var tab = event.target.getAttribute("data-tab");
+    if (tab) show(tab);
+  });
+
+  async function show(name, argument) {
+    nav(name);
+    try { await SCREENS[name](argument); }
+    catch (error) { screen.insertAdjacentHTML("afterbegin", '<div class="error">' + esc(error.message) + " <small>(" + esc(error.code || "") + ")</small></div>"); }
+  }
+  function on(selector, handler) {
+    screen.querySelectorAll(selector).forEach(function (node) {
+      node.addEventListener("click", function () { handler(node.dataset, node); });
+    });
+  }
+  async function guard(work) {
+    try { await work(); } catch (error) { screen.insertAdjacentHTML("afterbegin", '<div class="error">' + esc(error.message) + "</div>"); }
+  }
+
+  function productRow(item) {
+    return '<div class="card"><b>' + esc(item.name) + "</b><div class=\"meta\">" + esc(item.article) + " · " + money(item.price) + "</div>" +
+      (item.availability ? chip(item.availability) : "") + (item.norm_status ? chip(item.norm_status) : "") +
+      (item.quantity ? '<div class="meta">' + item.quantity + " шт. — " + esc(label(item.quantity_source)) + (item.quantity_note ? ": " + esc(item.quantity_note) : "") + "</div>" : "") +
+      (item.reason ? '<div class="meta">' + esc(item.reason) + "</div>" : "") +
+      '<div class="row"><button data-card="' + esc(item.product_id || item.id) + '">Подробнее</button>' +
+      '<button data-add="' + esc(item.product_id || item.id) + '">В корзину</button>' +
+      (state.task ? '<button data-choose="' + esc(item.product_id) + '">Выбрать</button><button data-reject="' + esc(item.product_id) + '">Не подходит</button>' : "") +
+      "</div></div>";
+  }
+  function bindProducts() {
+    on("[data-card]", function (d) { show("card", d.card); });
+    on("[data-add]", function (d) { guard(async function () { await api("POST", "/api/cart/items", { product_id: d.add, quantity: 1 }); tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success"); }); });
+    on("[data-choose]", function (d, node) { guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/choose", { product_ids: [d.choose] }); node.textContent = "Выбрано"; }); });
+    on("[data-reject]", function (d, node) { guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/reject", { product_ids: [d.reject] }); node.closest(".card").remove(); }); });
+  }
+
+  var SCREENS = {
+    home: async function () {
+      screen.innerHTML = "<h2>Оснащение сада и школы</h2>" +
+        '<div class="card">Опишите задачу — подберу оборудование, соберу спецификацию и передам предзаказ менеджеру. ' +
+        "Цены, наличие и нормативы — из данных каталога.</div>" +
+        '<div class="row"><button class="primary" data-go="pick">Подобрать</button><button data-go="norm">По нормативу</button>' +
+        '<button data-go="upload">Проверить готовый заказ</button><button data-go="cart">Корзина</button></div>';
+      on("[data-go]", function (d) { show(d.go); });
+    },
+
+    pick: async function () {
+      screen.innerHTML = "<h2>AI-подбор</h2><label>Что нужно</label><textarea id=\"ask\" rows=\"3\" placeholder=\"Школа, кабинет информатики\"></textarea>" +
+        '<button class="primary" id="send">Отправить</button><div id="answer"></div>';
+      document.getElementById("send").addEventListener("click", function () {
+        guard(async function () {
+          var text = document.getElementById("ask").value.trim();
+          if (!text) return;
+          var reply = await api("POST", "/api/dialogue/message", { text: text });
+          var html = "";
+          reply.data.responses.forEach(function (r) {
+            if (r.type === "text") html += '<div class="card"><pre>' + esc(r.text) + "</pre></div>";
+            if (r.type === "product_list") {
+              html += "<h2>" + esc(r.title) + "</h2>";
+              r.items.forEach(function (i) { html += productRow(Object.assign({ product_id: i.product.id }, i.product)); });
+            }
+            if (r.type === "product") html += productRow(Object.assign({ product_id: r.product.id }, r.product));
+          });
+          document.getElementById("answer").innerHTML = html;
+          bindProducts();
+        });
+      });
+    },
+
+    norm: async function () {
+      screen.innerHTML = "<h2>Подбор по нормативу</h2>" +
+        '<label>Учреждение</label><select id="inst"><option value="preschool">Детский сад</option><option value="school">Школа</option></select>' +
+        '<label>Документ</label><select id="doc"><option value="">по типу учреждения</option><option value="order_1057">приказ № 1057</option><option value="order_838">приказ № 838</option></select>' +
+        '<label>Пункт перечня (если известен)</label><input id="point" placeholder="1.5.1">' +
+        '<label>Помещение</label><input id="room" placeholder="спортивный зал">' +
+        '<label>Возраст</label><input id="age" placeholder="3–4 лет">' +
+        '<label>Бюджет, ₽</label><input id="budget" inputmode="numeric">' +
+        '<button class="primary" id="go">Подобрать</button>';
+      document.getElementById("go").addEventListener("click", function () {
+        guard(async function () {
+          var value = function (id) { return document.getElementById(id).value.trim() || null; };
+          var fields = { institution_type: value("inst"), norm_document: value("doc"), norm_item: value("point"), room: value("room"), age_group: value("age") };
+          if (value("budget")) fields.budget = parseInt(value("budget").replace(/\D/g, ""), 10);
+          if (fields.norm_document || fields.norm_item) fields.norm_required = true;
+          var task = await api("POST", "/api/procurement/tasks", { fields: fields });
+          state.task = task.task_id; state.selection = [];
+          await select(false);
+          show("results");
+        });
+      });
+    },
+
+    results: async function () {
+      if (!state.task) { screen.innerHTML = '<h2>Результаты</h2><div class="card">Сначала опишите задачу во вкладке «Норматив».</div>'; return; }
+      var last = state.lastSelection || {};
+      screen.innerHTML = "<h2>Результаты</h2>" + (last.norm ? '<div class="meta">' + esc((last.norm.reason_labels || []).join("; ")) + "</div>" : "") +
+        notices(last.warnings) + (last.questions && last.questions.length ? '<div class="card">Уточните: ' + esc(last.questions.join(", ")) + "</div>" : "") +
+        state.selection.map(productRow).join("") +
+        '<div class="row">' + (last.has_more ? '<button id="more">Показать ещё</button>' : "") + '<button class="primary" id="spec">Спецификация из выбранного</button></div>';
+      bindProducts();
+      var more = document.getElementById("more");
+      if (more) more.addEventListener("click", function () { guard(async function () { await select(true); show("results"); }); });
+      document.getElementById("spec").addEventListener("click", function () {
+        guard(async function () { state.spec = (await api("POST", "/api/procurement/specification", { task_id: state.task })).data; show("spec"); });
+      });
+    },
+
+    card: async function (productId) {
+      var query = state.task ? "?task_id=" + state.task : "";
+      var p = (await api("GET", "/api/products/" + encodeURIComponent(productId) + query)).data;
+      screen.innerHTML = "<h2>" + esc(p.name) + "</h2>" +
+        (p.photos.length ? '<img src="' + esc(p.photos[0]) + '" style="max-width:100%;border-radius:12px">' : "") +
+        '<div class="card">Код 1С: ' + esc(p.article) + "<br>" + money(p.price) + " · " + chip(p.availability) +
+        (p.url ? '<br><a href="' + esc(p.url) + '" target="_blank">на сайте</a>' : "") + "</div>" +
+        (p.norm_mappings.length ? '<div class="card"><b>Основание</b>' + p.norm_mappings.map(function (m) {
+          return '<div class="meta">' + esc(m.citation) + (m.item_title ? " — " + esc(m.item_title) : "") + " " + chip(m.status === "APPROVED" ? "NORM_OK" : "REVIEW_REQUIRED") + "</div>";
+        }).join("") + "</div>" : "") +
+        (Object.keys(p.characteristics).length ? '<div class="card">' + Object.keys(p.characteristics).map(function (k) { return esc(k) + ": " + esc(p.characteristics[k]); }).join("<br>") + "</div>" : "") +
+        (p.description ? '<div class="card"><pre>' + esc(p.description) + "</pre></div>" : "") +
+        '<button class="primary" data-add="' + esc(p.id) + '">В корзину</button>';
+      bindProducts();
+    },
+
+    cart: async function () {
+      var cart = (await api("GET", "/api/cart")).data;
+      screen.innerHTML = "<h2>Корзина</h2>" + (cart.items.length ? cart.items.map(function (i) {
+        return '<div class="card"><b>' + esc(i.name) + '</b><div class="meta">' + i.quantity + " × " + money(i.price) + "</div>" +
+          '<div class="row"><button data-qty="' + esc(i.product_id) + '" data-n="' + (i.quantity - 1) + '">−</button>' +
+          '<button data-qty="' + esc(i.product_id) + '" data-n="' + (i.quantity + 1) + '">+</button></div></div>';
+      }).join("") + '<div class="total">Итого: ' + money(cart.total) + "</div>" +
+        '<div class="row"><button class="primary" id="spec">Спецификация из корзины</button></div>' : '<div class="card">Корзина пуста.</div>');
+      on("[data-qty]", function (d) { guard(async function () { await api("POST", "/api/cart/items", { product_id: d.qty, quantity: parseInt(d.n, 10) }); show("cart"); }); });
+      var spec = document.getElementById("spec");
+      if (spec) spec.addEventListener("click", function () { guard(async function () { state.spec = (await api("POST", "/api/cart/specification")).data; show("spec"); }); });
+    },
+
+    spec: async function () {
+      var s = state.spec;
+      if (!s) { screen.innerHTML = '<h2>Спецификация</h2><div class="card">Соберите спецификацию из подбора или корзины.</div>'; return; }
+      screen.innerHTML = "<h2>Спецификация " + esc(s.id) + '</h2><div class="meta">каталог ' + esc(s.catalog_version) + " · " + esc(label(s.status)) + "</div>" + notices(s.warnings) +
+        "<table><tr><th>Позиция</th><th>Кол-во</th><th>Сумма</th></tr>" + s.items.map(function (i) {
+          return "<tr><td>" + esc(i.name) + '<div class="meta">' + esc(i.article) + (i.norm_item ? " · п. " + esc(i.norm_item) : "") + "</div></td><td>" + i.quantity +
+            '<div class="meta">' + esc(label(i.quantity_source)) + "</div></td><td>" + money(i.total_price) + "</td></tr>";
+        }).join("") + '</table><div class="total">Итого: ' + money(s.totals.amount) + (s.totals.complete ? "" : " (без цены: " + s.totals.missing_prices + ")") + "</div>" +
+        '<div class="row"><button data-file="xlsx">Excel</button><button data-file="docx">Word</button><button id="check">Проверить цены</button>' +
+        '<button class="primary" id="order">Оформить предзаказ</button></div><div id="fresh"></div>';
+      on("[data-file]", function (d) { guard(async function () {
+        var link = (await api("POST", "/api/procurement/specifications/" + s.id + "/export-link?format=" + d.file)).data;
+        var url = location.origin + link.url;
+        if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank");
+      }); });
+      document.getElementById("check").addEventListener("click", function () { guard(async function () {
+        var fresh = (await api("GET", "/api/procurement/specifications/" + s.id + "/check")).data;
+        document.getElementById("fresh").innerHTML = '<div class="card">' + (fresh.status === "CURRENT" ? "Каталог не менялся." :
+          "Каталог обновился: " + fresh.changes.map(function (c) { return esc(c.product_id) + " " + esc(c.field) + ": " + esc(c.old) + " → " + esc(c.new); }).join("; ")) + "</div>";
+      }); });
+      document.getElementById("order").addEventListener("click", function () { guard(async function () {
+        state.preorder = (await api("POST", "/api/preorders", { source: "specification", source_id: s.id })).data;
+        show("preorder");
+      }); });
+    },
+
+    upload: async function () {
+      screen.innerHTML = "<h2>Загрузка готового заказа</h2><div class=\"card\">Excel, Word, PDF или CSV — проверю позиции по текущему каталогу.</div>" +
+        '<input type="file" id="file" accept=".xlsx,.docx,.pdf,.csv"><button class="primary" id="go">Проверить</button>';
+      document.getElementById("go").addEventListener("click", function () { guard(async function () {
+        var file = document.getElementById("file").files[0];
+        if (!file) return;
+        var content = await file.arrayBuffer();
+        state.order = (await api("POST", "/api/orders/upload?filename=" + encodeURIComponent(file.name), undefined, content)).data;
+        if (state.order.status === "FAILED") throw new Error(state.order.error);
+        state.evaluation = (await api("POST", "/api/orders/" + state.order.id + "/evaluate")).data;
+        show("check");
+      }); });
+    },
+
+    check: async function () {
+      var e = state.evaluation;
+      if (!e) { screen.innerHTML = '<h2>Проверка заказа</h2><div class="card">Загрузите файл заказа.</div>'; return; }
+      var sum = e.summary;
+      screen.innerHTML = "<h2>Проверка заказа</h2>" + chip(e.status) +
+        '<div class="card">Позиций ' + sum.checked + ", найдено " + sum.matched + ", цена изменилась " + sum.price_changed + ", нет в наличии " + sum.not_available +
+        ", требуют проверки " + sum.review_required + '<div class="total">По текущим ценам: ' + money(sum.current_amount) + " (в файле " + money(sum.document_amount) + ")</div></div>" +
+        "<table><tr><th>Строка</th><th>Каталог</th><th>Статусы</th></tr>" + e.items.map(function (i) {
+          return "<tr><td>" + esc(i.source_name || i.source_article) + '<div class="meta">стр. ' + i.source_line + ", " + (i.quantity == null ? "кол-во ?" : i.quantity + " шт.") + "</div></td><td>" +
+            esc(i.name || "—") + '<div class="meta">' + money(i.current_price) + "</div></td><td>" + chip(i.match_status) + chip(i.price_status) + chip(i.availability) + chip(i.norm_status) + "</td></tr>";
+        }).join("") + "</table>" +
+        '<div class="row"><button data-go="errors">Ошибки и предупреждения</button>' + (e.status !== "REJECTED" ? '<button class="primary" id="order">Оформить предзаказ</button>' : "") + "</div>";
+      on("[data-go]", function (d) { show(d.go); });
+      var order = document.getElementById("order");
+      if (order) order.addEventListener("click", function () { guard(async function () {
+        state.preorder = (await api("POST", "/api/preorders", { source: "uploaded_order", source_id: state.order.id })).data;
+        show("preorder");
+      }); });
+    },
+
+    errors: async function () {
+      var e = state.evaluation;
+      var rows = e ? e.items.filter(function (i) { return i.errors.length || i.warnings.length; }) : [];
+      screen.innerHTML = "<h2>Ошибки и предупреждения</h2>" + (rows.length ? rows.map(function (i) {
+        return '<div class="card"><b>Строка ' + i.source_line + ": " + esc(i.source_name || i.source_article) + "</b>" +
+          i.errors.map(function (n) { return '<div class="error">' + esc(n.message) + "</div>"; }).join("") + notices(i.warnings) +
+          (i.candidates.length ? '<div class="meta">Кандидаты: ' + i.candidates.map(function (c) { return esc(c.name) + " (" + esc(c.article) + ")"; }).join("; ") + "</div>" : "") + "</div>";
+      }).join("") : '<div class="card">Ошибок нет.</div>');
+    },
+
+    preorder: async function () {
+      var p = state.preorder;
+      if (!p) { screen.innerHTML = '<h2>Предзаказ</h2><div class="card">Оформите предзаказ из спецификации или проверенного заказа.</div>'; return; }
+      state.session = (await api("GET", "/api/sessions/" + state.session.id)).data;
+      var consent = state.session.consent;
+      var html = "<h2>Предзаказ " + esc(p.id) + "</h2>" + chip(p.status) + notices(p.warnings) +
+        '<div class="card">Позиций ' + p.totals.positions + " на " + money(p.totals.amount) + " по текущим ценам. " +
+        "Это ещё не заказ: наличие, срок и окончательную цену подтвердит менеджер.</div>";
+      if (p.status === "READY_FOR_MANAGER") {
+        html += (consent.active ? "" : '<div class="card"><pre>' + esc(consent.text) + '</pre><label><input type="checkbox" id="agree" style="width:auto"> Согласен</label></div>') +
+          '<label>Контактное лицо</label><input id="name"><label>Телефон</label><input id="phone" inputmode="tel">' +
+          '<label>E-mail</label><input id="email"><label>Организация</label><input id="organization"><label>Регион доставки</label><input id="region">' +
+          '<label>Комментарий</label><textarea id="comment" rows="2"></textarea><button class="primary" id="send">Передать менеджеру</button>';
+      }
+      screen.innerHTML = html;
+      var send = document.getElementById("send");
+      if (send) send.addEventListener("click", function () { guard(async function () {
+        if (!consent.active) {
+          if (!document.getElementById("agree").checked) throw new Error("Без согласия на обработку персональных данных передать менеджеру нельзя.");
+          await api("POST", "/api/sessions/" + state.session.id + "/consent", { granted: true });
+        }
+        var customer = {};
+        ["name", "phone", "email", "organization", "region", "comment"].forEach(function (f) { customer[f] = document.getElementById(f).value.trim(); });
+        state.preorder = (await api("POST", "/api/preorders/" + p.id + "/send", { customer: customer })).data;
+        show("preorder");
+      }); });
+    },
+
+    history: async function () {
+      var h = (await api("GET", "/api/history")).data;
+      screen.innerHTML = "<h2>История</h2><h2>Предзаказы</h2>" + (h.preorders.map(function (p) {
+        return '<div class="card"><b>' + esc(p.id) + "</b> " + chip(p.status) + '<div class="meta">' + money(p.amount) + "</div><button data-preorder=\"" + esc(p.id) + '">Открыть</button></div>';
+      }).join("") || '<div class="meta">нет</div>') + "<h2>Спецификации</h2>" + (h.specifications.map(function (s) {
+        return '<div class="card"><b>' + esc(s.id) + "</b> " + chip(s.status) + '<div class="meta">' + money(s.amount) + " · каталог " + esc(s.catalog_version) + "</div><button data-spec=\"" + esc(s.id) + '">Открыть</button></div>';
+      }).join("") || '<div class="meta">нет</div>') + "<h2>Загруженные заказы</h2>" + (h.orders.map(function (o) {
+        return '<div class="card">' + esc(o.filename) + ' <span class="meta">' + esc(o.id) + "</span></div>";
+      }).join("") || '<div class="meta">нет</div>');
+      on("[data-preorder]", function (d) { guard(async function () { state.preorder = (await api("GET", "/api/preorders/" + d.preorder)).data; show("preorder"); }); });
+      on("[data-spec]", function (d) { guard(async function () { state.spec = (await api("GET", "/api/procurement/specifications/" + d.spec)).data; show("spec"); }); });
+    }
+  };
+
+  async function select(more) {
+    var result = (await api("POST", "/api/procurement/select", { task_id: state.task, restart: false })).data;
+    state.lastSelection = result;
+    state.selection = more ? state.selection.concat(result.items) : result.items;
+  }
+
+  async function start() {
+    var body = tg && tg.initData ? { credentials: { type: "telegram_init_data", value: tg.initData } } : undefined;
+    state.session = (await api("POST", "/api/sessions", body)).data;
+    if (tg) { tg.ready(); tg.expand(); }
+    show("home");
+  }
+  start().catch(function (error) { screen.innerHTML = '<div class="error">' + esc(error.message) + "</div>"; });
+})();
+</script>
+</body>
+</html>
