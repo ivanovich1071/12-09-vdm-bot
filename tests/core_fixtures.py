@@ -102,10 +102,10 @@ def product_records() -> list[dict]:
     ]
 
 
-def products(**changes: dict) -> list[Product]:
-    """Каталог; `changes` — поля отдельных товаров: `B2={"price": 9000}`."""
+def products(extra: list[dict] | None = None, **changes: dict) -> list[Product]:
+    """Каталог; `changes` — поля отдельных товаров: `B2={"price": 9000}`, `extra` — новые товары."""
     records = []
-    for record in product_records():
+    for record in [*product_records(), *(extra or [])]:
         record.update(changes.get(record["sku_1c"], {}))
         records.append(record)
     return [Product.from_dict(record) for record in records]
@@ -137,9 +137,9 @@ def norm_items() -> dict[str, dict[str, NormItem]]:
     return result
 
 
-def state(version: str = VERSION, **changes: dict) -> CatalogRuntimeState:
+def state(version: str = VERSION, extra: list[dict] | None = None, **changes: dict) -> CatalogRuntimeState:
     return CatalogRuntimeState.from_index(
-        CatalogIndex(products(**changes)), version=version, sha256=version.replace("-", "").ljust(64, "0")
+        CatalogIndex(products(extra, **changes)), version=version, sha256=version.replace("-", "").ljust(64, "0")
     )
 
 

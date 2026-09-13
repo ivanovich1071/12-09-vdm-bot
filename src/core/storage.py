@@ -18,6 +18,7 @@ import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Protocol
 
 from core.models import Cart, CartItem, Customer, Order
 
@@ -84,6 +85,18 @@ CREATE TABLE IF NOT EXISTS dialog_state (
 DIALOG_TTL_DAYS = 30
 
 
+class UserDataHook(Protocol):
+    """Данные субъекта в других модулях: закупки, заказы клиентов, предзаказы.
+
+    Выгрузка и удаление по требованию субъекта остаются одной операцией хранилища —
+    модули ядра подключаются к ней, а не заводят свой механизм.
+    """
+
+    def export(self, user_id: str) -> dict[str, object]: ...
+
+    def delete(self, user_id: str) -> None: ...
+
+
 class Storage:
     def __init__(self, path: str | Path = "data/vdm.sqlite3") -> None:
         self.path = Path(path)
@@ -92,6 +105,10 @@ class Storage:
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
         self._db.commit()
+        self._user_data_hooks: list[UserDataHook] = []
+
+    def add_user_data_hook(self, hook: UserDataHook) -> None:
+        self._user_data_hooks.append(hook)
 
     def close(self) -> None:
         self._db.close()
@@ -362,6 +379,12 @@ class Storage:
     # --- Права субъекта ПДн --------------------------------------------------
 
     def export_user_data(self, user_id: str) -> dict[str, object]:
+        data = self._own_user_data(user_id)
+        for hook in self._user_data_hooks:
+            data.update(hook.export(user_id))
+        return data
+
+    def _own_user_data(self, user_id: str) -> dict[str, object]:
         return {
             "user_id": user_id,
             "cart": [asdict(item) for item in self.load_cart(user_id).items],
@@ -396,6 +419,8 @@ class Storage:
         self._db.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
         self._db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))
         self._db.commit()
+        for hook in self._user_data_hooks:
+            hook.delete(user_id)
         self.record_consent(user_id, channel, "n/a", "revoked")
 
 

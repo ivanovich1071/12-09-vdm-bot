@@ -115,6 +115,15 @@ class ProcurementService:
         self._save(task)
         return task
 
+    def enter_order(self, task_id: str, owner: str) -> ProcurementTask:
+        """Спецификация ушла в предзаказ: задача на этапе ORDER."""
+        task = self.get_task(task_id, owner)
+        if task.is_closed or task.stage is Stage.ORDER:
+            return task
+        self._advance(task, Stage.ORDER)
+        self._save(task)
+        return task
+
     def requirement(self, task_id: str, owner: str) -> ProcurementRequirement:
         task = self.get_task(task_id, owner)
         with self.runtime.turn() as state:

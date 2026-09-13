@@ -426,7 +426,7 @@ FORBIDDEN = ("aiogram", "adapters", "web", "fastapi", "core.dialog", "core.app",
 
 def test_procurement_core_does_not_know_channels():
     root = Path(__file__).parents[1] / "src"
-    for package in ("procurement", "norms", "documents"):
+    for package in ("procurement", "norms", "documents", "order_import", "preorder"):
         for path in (root / package).rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
