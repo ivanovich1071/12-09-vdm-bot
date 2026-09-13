@@ -49,6 +49,7 @@
 | NEXT-2 | Order Core | `c535097` | `next-2/order-core` | нет |
 | NEXT-3 | Core API, проверка ядра | `2b17ac6`, `be83702` | `next-3/core-api` | нет |
 | NEXT-4 | Telegram и Mini App | `bd24708` | `next-4/telegram-miniapp` | нет |
+| NEXT-4.1 | подготовка живого Telegram: токен, журнал, сессия, граница, `--check`, прогон на реальной модели | `c460afb` | `next-4-1/telegram-live` (от NEXT-4) | нет |
 
 `main` = `bc8b7ba`: EPIC 0, 0.5 и документы v2. EPIC 1–3 в `main` не влиты.
 
