@@ -1,0 +1,31 @@
+{
+  "title": "Предварительная спецификация",
+  "sheet": "Спецификация",
+  "notice": "Предварительная спецификация: цены и наличие — по версии каталога на дату формирования. Окончательные условия подтверждает менеджер.",
+  "meta": [
+    ["institution", "Учреждение"],
+    ["institution_name", "Организация"],
+    ["room", "Помещение"],
+    ["age_group", "Возраст"],
+    ["grade", "Класс"],
+    ["norm", "Нормативный документ"],
+    ["budget", "Бюджет, ₽"],
+    ["catalog_version", "Версия каталога"],
+    ["norm_version", "Версия нормативной базы"],
+    ["created_at", "Сформирована"]
+  ],
+  "columns": [
+    {"key": "line_no", "title": "№", "width": 5},
+    {"key": "article", "title": "Код 1С", "width": 15},
+    {"key": "name", "title": "Наименование", "width": 50},
+    {"key": "quantity", "title": "Кол-во", "width": 8},
+    {"key": "unit", "title": "Ед.", "width": 6},
+    {"key": "unit_price", "title": "Цена, ₽", "width": 12},
+    {"key": "total_price", "title": "Сумма, ₽", "width": 13},
+    {"key": "availability", "title": "Наличие", "width": 14},
+    {"key": "quantity_source", "title": "Источник количества", "width": 18},
+    {"key": "norm_document", "title": "Документ", "width": 16},
+    {"key": "norm_item", "title": "Пункт", "width": 12},
+    {"key": "selection_reason", "title": "Основание подбора", "width": 45}
+  ]
+}

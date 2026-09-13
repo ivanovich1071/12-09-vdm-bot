@@ -50,6 +50,16 @@ class Settings:
     catalog_max_removed_share: float = 0.10
     catalog_max_price_changed_share: float = 0.30
     catalog_reload_seconds: float = 30.0
+    # База ядра (NEXT-1…3): задачи закупки, спецификации, заказы клиентов, предзаказы,
+    # сессии Core API. Пусто — файл хранилища бота: предзаказ несёт контакты, и
+    # удаляются они там же, где корзина и согласия.
+    core_db_path: str = ""
+    # Загрузка готового заказа клиента (Excel, Word, PDF, CSV).
+    order_upload_max_mb: int = 20
+    # Ключ адаптеров к Core API (серверные каналы) и ключ ручных операций менеджера.
+    # Пусто — соответствующие ручки отвечают 503: без ключа API не открывается.
+    core_api_key: str = ""
+    core_manager_key: str = ""
 
     # Модель. Провайдеров два: Cloud.ru — то, где всё будет работать у заказчика,
     # OpenRouter — то, где диалог можно проверить с машины разработки, когда
@@ -141,6 +151,10 @@ class Settings:
             catalog_reload_seconds=float(
                 env.get("CATALOG_RELOAD_SECONDS", cls.catalog_reload_seconds)
             ),
+            core_db_path=env.get("CORE_DB_PATH", cls.core_db_path),
+            order_upload_max_mb=int(env.get("ORDER_UPLOAD_MAX_MB", cls.order_upload_max_mb)),
+            core_api_key=env.get("CORE_API_KEY", ""),
+            core_manager_key=env.get("CORE_MANAGER_KEY", ""),
             llm_provider=env.get("LLM_PROVIDER", cls.llm_provider).strip().lower(),
             cloudru_api_key=env.get("CLOUDRU_API_KEY", ""),
             cloudru_base_url=env.get("CLOUDRU_BASE_URL", cls.cloudru_base_url),
@@ -178,6 +192,15 @@ class Settings:
             widget_host=env.get("WIDGET_HOST", cls.widget_host),
             widget_port=int(env.get("WIDGET_PORT", cls.widget_port)),
         )
+
+    @property
+    def core_database_path(self) -> str:
+        return self.core_db_path or self.storage_path
+
+    @property
+    def norm_items_path(self) -> Path:
+        """Справочник пунктов приказов лежит рядом с каталогом."""
+        return Path(self.kb_path).parent / "norm_items.json"
 
     @property
     def llm_enabled(self) -> bool:

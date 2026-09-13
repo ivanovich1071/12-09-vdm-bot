@@ -59,6 +59,18 @@ class CatalogRuntimeState:
     def key(self) -> tuple[str | None, str | None]:
         return self.version, self.sha256
 
+    @property
+    def label(self) -> str:
+        """Версия для записи в подбор, спецификацию, оценку заказа и предзаказ.
+
+        Без указателя версии нет — тогда отпечаток файла; у индекса из тестов нет и его.
+        """
+        if self.version:
+            return self.version
+        if self.sha256:
+            return f"legacy:{self.sha256[:12]}"
+        return "unversioned"
+
     @classmethod
     def from_index(
         cls,
