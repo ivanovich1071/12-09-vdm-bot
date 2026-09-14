@@ -23,6 +23,8 @@ from core.config import Settings
 from core.dialog import DialogEngine
 from core.storage import Storage
 from core.ui import Message, ProductCard, ProductList
+from core_api.composition import build_core
+from norms.repository import FileNormRepository
 from orders.service import OrderService
 from orders.sinks import JsonlSink
 
@@ -132,7 +134,14 @@ def engine(tmp_path):
                     "price": 253000,
                     "currency": "RUB",
                     "in_stock": 1,
-                    "category_paths": [["ОБОРУДОВАНИЕ ДЛЯ ШКОЛЫ ПО ПРИКАЗУ № 838"]],
+                    # Раздел кабинета нужен ядру подбора: фильтр помещения без него товар отсекает.
+                    "category_paths": [
+                        [
+                            "ОБОРУДОВАНИЕ ДЛЯ ШКОЛЫ ПО ПРИКАЗУ № 838",
+                            "Раздел 2. Комплекс оснащения предметных кабинетов",
+                            "Подраздел 20. Кабинет технологии",
+                        ]
+                    ],
                     "description": "",
                     "kit_contents": [],
                     "norms": [
@@ -153,10 +162,17 @@ def engine(tmp_path):
         ]
     )
     storage = Storage(tmp_path / "t.sqlite3")
-    settings = Settings(orders_jsonl_path=str(tmp_path / "orders.jsonl"))
-    return DialogEngine(
+    settings = Settings(
+        orders_jsonl_path=str(tmp_path / "orders.jsonl"),
+        preorders_dir=str(tmp_path / "preorders"),
+        uploads_dir=str(tmp_path / "uploads"),
+    )
+    engine = DialogEngine(
         index, storage, OrderService(storage, JsonlSink(tmp_path / "o.jsonl")), settings
     )
+    # Подбор агента идёт через Procurement Core (NEXT-4.1): без ядра у продавца нет товаров.
+    build_core(settings, engine, norms=FileNormRepository())
+    return engine
 
 
 def client(base_url: str, name: str = "cloudru", timeout: float = 10.0) -> ChatClient:
@@ -250,6 +266,7 @@ def test_personal_data_never_leaves_for_the_model(engine):
 
 def test_agent_can_add_to_cart_through_tool(engine):
     script = [
+        tool_call("search_products", {"query": "станок"}),
         tool_call("add_to_cart", {"sku_1c": "S1", "quantity": 2}),
         answer("Добавил две штуки."),
     ]
@@ -258,6 +275,21 @@ def test_agent_can_add_to_cart_through_tool(engine):
         engine.handle_text(USER, CHANNEL, "добавь два станка")
 
     assert engine.storage.load_cart(USER).count == 2
+
+
+def test_agent_cannot_put_into_the_cart_what_the_core_did_not_select(engine):
+    """NEXT-4.1: товар в корзину — только из подбора ядра, а не из памяти модели."""
+    script = [
+        tool_call("add_to_cart", {"sku_1c": "S1", "quantity": 2}),
+        answer("Не получилось добавить."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        engine.handle_text(USER, CHANNEL, "добавь два станка")
+        refusal = [m for m in cloud.requests[-1]["messages"] if m.get("role") == "tool"][0]
+
+    assert engine.storage.load_cart(USER).count == 0
+    assert "не было в подборе" in json.loads(refusal["content"])["error"]
 
 
 def test_unknown_tool_does_not_break_the_dialog(engine):
@@ -305,10 +337,10 @@ def test_prompts_are_sent_as_system_message(engine):
 
     assert system["role"] == "system"
     assert "ЭЛТИ-КУДИЦ" in system["content"]
-    # Служебные названия этапов продажи должны быть в промпте, но с запретом
-    # показывать их пользователю.
-    assert "служебные" in system["content"].lower()
-    assert "не объявляй" in system["content"].lower()
+    # Промпт продавца от заказчика (14.09) и приложение с инструментами этого бота.
+    assert "AI-ПРОДАВЕЦ" in system["content"]
+    assert "Нельзя имитировать выполнение поиска текстом" in system["content"]
+    assert "(код 1С 12345)" in system["content"]
 
 
 def test_question_gets_the_consultant_not_the_salesman(engine):
@@ -323,8 +355,8 @@ def test_question_gets_the_consultant_not_the_salesman(engine):
         engine.handle_text(USER, CHANNEL, "здравствуйте")
         system = cloud.requests[0]["messages"][0]["content"]
 
-    assert "роль в этом ходе: консультант" in system.lower()
-    assert "роль в этом ходе: продавец" not in system.lower()
+    assert "AI-КОНСУЛЬТАНТ" in system
+    assert "AI-ПРОДАВЕЦ" not in system
 
 
 def test_tools_are_declared_to_the_model(engine):
@@ -433,7 +465,9 @@ def test_invented_price_is_sent_back_for_a_rewrite(engine):
     ]
     with FakeCloudRu(script) as cloud:
         attach(engine, client(cloud.base_url))
-        responses = engine.handle_text(USER, CHANNEL, "что нужно в спортзал")
+        # «Что нужно в спортзал» с NEXT-4.1 — описание задачи и ход консультанта; здесь
+        # проверяется переписывание ответа продавца, поэтому реплика называет товар.
+        responses = engine.handle_text(USER, CHANNEL, "нужен станок")
 
     assert "190" not in responses[0].text
     assert "253 000" in responses[0].text

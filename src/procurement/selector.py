@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from catalog.models import Availability, Product
@@ -182,6 +182,28 @@ class ProcurementSelector:
             for position, hit in enumerate(found.hits)
             if hit.product.id not in requirement.exclude
         ]
+        if requirement.user.text:
+            # Названы слова запроса — показываем то, что им отвечает. Раздел помещения
+            # сужает найденное, но не подменяет запрос: на «мячи» в спортзале не должны
+            # приходить маты и доски только потому, что они лежат в том же разделе (NEXT-4.1).
+            matched = [candidate for candidate in candidates if candidate.by_query]
+            if not matched and requirement.catalog_room is not None:
+                found = state.catalog.search(replace(query, room=None))
+                filters = tuple(_report(report) for report in found.filters)
+                matched = [
+                    self._candidate(requirement, hit.product, position, True)
+                    for position, hit in enumerate(found.hits)
+                    if hit.product.id not in requirement.exclude and hit.reason in _RELEVANCE
+                ]
+                if matched:
+                    warnings.append(
+                        Notice(
+                            "ROOM_WIDENED",
+                            f"В разделе «{requirement.user.room}» по запросу «{requirement.user.text}» "
+                            "ничего нет — показаны позиции по запросу из всего каталога.",
+                        )
+                    )
+            candidates = matched
         ranked = self.ranker.rank(requirement, candidates)
         picked, rest = ranked[:limit], ranked[limit:]
         items = tuple(self._item(task, requirement, candidate, rest) for candidate in picked)

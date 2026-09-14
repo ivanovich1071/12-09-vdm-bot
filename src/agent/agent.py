@@ -1,6 +1,6 @@
 """Два агента в одном диалоге: консультант и продавец.
 
-Роль на каждый ход выбирает маршрутизатор (`agent/routing.py`), и промпт
+Роль на каждый ход выбирает оркестратор (`agent/routing.py`), и промпт
 собирается под неё. Раньше все четыре файла промптов склеивались в одну простыню
 на четыре с лишним тысячи токенов и уходили одному вызову — агенту приходилось
 быть сразу справочной, продавцом и охраной, и он выбирал самое простое: показать
@@ -25,10 +25,11 @@
 каталога. Выдуманная цена дороже молчания, а выдуманное основание — дороже цены:
 по нему принимают закупку.
 
-**Дописывает каталог, когда модель обошлась без него.** Ответ списком общих слов —
-«мячи, обручи, скакалки» — промптом не лечится: проверено на живых прогонах.
-Поэтому к такому ответу молча добавляется настоящая выдача поиска, с ценами и
-пунктами перечня.
+**Не верит обещанию подбора.** «Сейчас подберу» без вызова подбора — ложное
+обещание. Модель один раз просят подобрать в этом же ходе; не подобрала — ответ
+заменяется подбором Procurement Core по реплике человека или одним вопросом о том,
+чего не хватает. Прежняя страховка дописывала к обещанию выдачу по помещению из
+профиля — и на «массажные мячи» приходили тележка и ребристая доска (13.09).
 """
 
 from __future__ import annotations
@@ -40,16 +41,18 @@ from pathlib import Path
 
 from agent.client import ChatClient, LLMError
 from agent.providers import LLMRouter
-from agent.routing import CONSULT, GUARD, SELL, Decision, Router
+from agent.routing import CONSULT, GUARD, INTENT_TITLES, SELL, Decision, Orchestrator
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from agent.verify import (
     describe_refs,
     invented_norm_refs,
     invented_prices,
     prices_in,
-    talks_about_goods,
+    promises_goods,
+    without_promises,
 )
-from core.ui import Button, Keyboard, Message, ProductCard, ProductList, Response
+from core import intent, selection
+from core.ui import Button, Keyboard, Message, ProductCard, Response
 
 log = logging.getLogger(__name__)
 
@@ -69,12 +72,39 @@ _REWRITE_HINT = (
     "а чего в каталоге нет — так и скажи."
 )
 
+# Короче этого остаток ответа после вырезания обещания — вежливость, а не ответ.
+MIN_KEPT = 40
+# Один вопрос по неснятому возражению, когда от ответа модели ничего не осталось. Порядок —
+# первый шаг работы с возражением из промпта продавца: понять, что именно мешает.
+_OBJECTION_QUESTIONS = {
+    "price": (
+        "Понимаю, бюджет важен. Что для вас главное — уложиться в лимит или понять, из чего "
+        "складывается цена? От этого зависит, что предложить."
+    ),
+    "norm": "Понимаю сомнение. По какому пункту перечня нужно подтверждение? Сверю с текстом приказа.",
+    "logistics": (
+        "Сроки и доставку подтверждает менеджер. Что важнее — успеть к дате или взять всё одной поставкой?"
+    ),
+    "none": "Подскажите, что именно смущает — цена, соответствие перечню или сроки?",
+}
+
+# Просьба к продавцу, который пообещал подбор и не вызвал его.
+_INSIST = (
+    "Ты пообещал подобрать товары, но не вызвал подбор. Не обещай: вызови "
+    "search_products (для пункта перечня — find_by_norm_code) сейчас и назови только "
+    "то, что он вернёт, либо задай клиенту один уточняющий вопрос. Не извиняйся и не "
+    "упоминай эту просьбу: клиент её не видел. Цену уже показанного товара можно назвать "
+    "из переписки."
+)
+
 # Код 1С в ответе модели: она обязана его называть, чтобы карточки сошлись с
 # текстом, а перед показом человеку код вырезается — он служебный.
 _CODE_MENTION = re.compile(
-    r"\s*[(\[]?\s*(?:код\s*1\s*[СCc]|артикул)\s*:?\s*[A-Za-z0-9А-ЯЁа-яё\-]+\s*[)\]]?",
+    r"[ \t]*[(\[]?[ \t]*(?:\*\*)?(?:код\s*1\s*[СCc]|артикул)[\s*:]*[A-Za-z0-9А-ЯЁа-яё\-]+[ \t]*[)\]]?",
     re.IGNORECASE,
 )
+# Пункт списка, от которого после вырезания кода ничего не осталось: «- **Код 1С:** 42639» → «-».
+_EMPTY_BULLET = re.compile(r"^[ \t]*[-•][ \t]*[*:]*[ \t]*(?:\n|$)", re.MULTILINE)
 
 # Из чего собирается промпт роли. Границы идут первыми, чтобы не тонуть в
 # середине длинного текста, дальше общая часть, дальше сама роль.
@@ -146,10 +176,10 @@ def may_show_cards(
 
 
 class SalesAgent:
-    def __init__(self, engine, router: LLMRouter, routing: Router | None = None) -> None:  # noqa: ANN001
+    def __init__(self, engine, router: LLMRouter, routing: Orchestrator | None = None) -> None:  # noqa: ANN001
         self.engine = engine
         self.router = router
-        self.routing = routing if routing is not None else Router(router)
+        self.routing = routing if routing is not None else Orchestrator(router)
         self.prompts = {
             branch: "\n\n".join(
                 part for part in (load_prompt(name) for name in names) if part
@@ -169,6 +199,9 @@ class SalesAgent:
         show_cards, reason = may_show_cards(session.profile, decision)
         session.route = {
             "role": decision.branch,
+            "intent": decision.intent,
+            "previous_agent": decision.previous,
+            "reason": decision.reason,
             "stage": decision.stage,
             "objection": session.profile.objection,
             "objection_handled": session.profile.objection_handled,
@@ -184,12 +217,25 @@ class SalesAgent:
 
         try:
             answer = self._ask(messages, tools, tools_for(decision.branch))
-            session.prices |= tools.prices
-            session.norm_refs |= tools.norm_refs
         except LLMError:
             # Провайдеры уже помечены нерабочими и записаны в лог — здесь остаётся
             # только доиграть ход предложением из каталога.
             return self.engine.offer(session, text)
+
+        # Продавец пообещал подбор и не сделал его: просим один раз, в этом же ходе.
+        if decision.sells and not tools.selected and promises_goods(answer, show_cards):
+            answer = self._insist(messages, tools, answer)
+        session.prices |= tools.prices
+        session.norm_refs |= tools.norm_refs
+        if decision.sells and not tools.selected and promises_goods(answer, show_cards):
+            session.route["false_promise"] = True
+            return self._instead_of_promise(session, tools, text, decision, answer)
+        if decision.branch == CONSULT and promises_goods(answer):
+            # Подбора у консультанта нет, а на OpenRouter 14.09 он его обещал: «сейчас
+            # проверю, какие позиции есть… одну минуту». Обещание убираем, ведём вопросом.
+            session.route["false_promise"] = True
+            session.route["fallback"] = "consult_question"
+            answer = self._without_selection_promise(session, answer)
 
         # Гейт пересчитываем, когда ход уже сыгран: до вызова модели неизвестно,
         # назовёт ли она конкретные позиции, а от этого зависит, будет ли человеку
@@ -199,7 +245,7 @@ class SalesAgent:
         if tools.norm_lookups:
             session.route["norm_lookups"] = tools.norm_lookups
 
-        answer = self._verified(answer, messages, tools, text, session)
+        answer = self._verified(answer, messages, tools, text, session, tools_for(decision.branch))
         if not answer:
             session.route["discarded_answer"] = True
             return self.engine.offer(session, text)
@@ -207,6 +253,8 @@ class SalesAgent:
         answer = session.masker.unmask(answer)
         session.remember("assistant", answer)
         session.profile.remember_offered(_unique(tools.shown_skus))
+        # Продавцу по фразе консультанта ход не передаётся: переход решает новое намерение
+        # человека (ORCHESTRATOR.md, разделы 14 и 17).
         return self._render(session, tools, answer, text, decision, show_cards)
 
     # --- Сведение текста ответа с карточками ---------------------------------
@@ -302,10 +350,91 @@ class SalesAgent:
         account_usage(tools.session, client, final)
         return (final.get("content") or "").strip()
 
+    # --- Обещание вместо подбора ---------------------------------------------------
+
+    def _insist(self, messages: list[dict], tools: ToolBox, answer: str) -> str:
+        log.warning("Продавец пообещал подбор, не вызвав его, — просим подобрать в этом ходе.")
+        messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
+        messages.append({"role": "user", "content": _INSIST})
+        try:
+            return self._ask(messages, tools, tools_for(SELL))
+        except LLMError:
+            return answer
+
+    def _instead_of_promise(  # noqa: ANN001
+        self, session, tools: ToolBox, question: str, decision: Decision, answer: str
+    ) -> list[Response]:
+        """Подбора так и не было — текст с обещанием человеку не уходит.
+
+        Можно показывать — подбирает Procurement Core по реплике человека. Нельзя —
+        остаётся то, что в ответе было кроме обещания, или один вопрос о недостающем.
+        Выдачи «по помещению из профиля» здесь нет и быть не должно: на «массажные мячи»
+        она приносила тележку и ребристую доску.
+        """
+        log.warning("Подбор так и не выполнен — ответ модели заменён.")
+        profile = session.profile
+        # Вопрос о показанном — «чем эти мячи полезны?», «сколько стоит первый?» — это
+        # презентация, а не новый подбор: слова вопроса ядро приняло бы за товар.
+        about_shown = bool(profile.offered) and "?" in question and not intent.asks_to_show(question)
+        allowed, _ = may_show_cards(profile, decision)
+        if allowed and not about_shown:
+            session.route["fallback"] = "procurement_select"
+            return self.engine.select_offer(session, question, "Подобрал в каталоге")
+
+        kept = self._kept(session, question, answer)
+        if about_shown:
+            text = kept or (
+                "Расскажу по конкретной позиции: нажмите «Подробнее» на её карточке или "
+                "назовите её — характеристики, цену и наличие возьму из каталога."
+            )
+        elif profile.objection != "none" and not profile.objection_handled:
+            text = kept or _OBJECTION_QUESTIONS.get(profile.objection, _OBJECTION_QUESTIONS["none"])
+        elif not profile.task_known and not decision.precise:
+            text = selection.question(_missing(profile))
+        else:
+            text = kept or "Показать подходящие варианты из каталога?"
+        session.route["fallback"] = "question"
+        session.remember("assistant", text)
+        return [Message(text, keyboard=self._keyboard(session, tools, decision))]
+
+    def _kept(self, session, question: str, answer: str) -> str:  # noqa: ANN001
+        """Что из ответа модели можно показать без обещания.
+
+        Остаток проходит ту же проверку цен и оснований, что и обычный ответ: обходить её
+        он не должен. Пустая вежливость — «извините за задержку» — ответом не считается.
+        """
+        kept = without_promises(answer)
+        prices = session.prices | prices_in(question) | prices_in(session.profile.budget or "")
+        if len(kept) < MIN_KEPT or self._complaint(kept, prices, session.norm_refs):
+            return ""
+        return kept
+
+    def _without_selection_promise(self, session, answer: str) -> str:  # noqa: ANN001
+        """Ответ консультанта без обещания подбора — и с одним вопросом, ведущим дальше.
+
+        Задача ясна — предлагаем перейти к подбору: на согласие ответит продавец настоящими
+        позициями. Не ясна — спрашиваем недостающее. Вопрос в ответе уже есть — второй не
+        добавляем: консультант задаёт один вопрос за сообщение.
+        """
+        kept = without_promises(answer)
+        if len(kept) < MIN_KEPT:
+            kept = ""
+        if "?" in kept:
+            return kept
+        profile = session.profile
+        ask = "Подобрать варианты из каталога?" if profile.task_known else selection.question(_missing(profile))
+        return f"{kept}\n\n{ask}" if kept else ask
+
     # --- Проверка ответа -------------------------------------------------------
 
     def _verified(  # noqa: ANN001
-        self, answer: str, messages: list[dict], tools: ToolBox, question: str, session
+        self,
+        answer: str,
+        messages: list[dict],
+        tools: ToolBox,
+        question: str,
+        session,
+        schemas: list[dict] | None = None,
     ) -> str:
         """Ответ, в котором каждая сумма и каждый пункт приказа подтверждены данными.
 
@@ -332,7 +461,9 @@ class SalesAgent:
         messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
         messages.append({"role": "user", "content": complaint + _REWRITE_HINT})
         try:
-            second = self._ask(messages, tools, TOOL_SCHEMAS)
+            # Переписывает та же роль и с теми же инструментами: консультанту на переписывании
+            # раньше выдавался весь набор продавца, и он отвечал «уточним через инструменты».
+            second = self._ask(messages, tools, schemas if schemas is not None else TOOL_SCHEMAS)
         except LLMError:
             return ""
 
@@ -381,7 +512,7 @@ class SalesAgent:
         if answer:
             # Коды 1С нужны нам для сведения текста с карточками, но человеку в
             # ответе они ни к чему — это внутренний артикул, а не характеристика.
-            responses.append(Message(_without_codes(answer), keyboard=self._keyboard(tools)))
+            responses.append(Message(_without_codes(answer), keyboard=self._keyboard(session, tools, decision)))
 
         for sku in mentioned[:CARDS_SHOWN]:
             product = self.engine.index.get(sku)
@@ -390,7 +521,7 @@ class SalesAgent:
             responses.append(
                 ProductCard(
                     product=product,
-                    citation=self._citation(session, product),
+                    citation=self._citation(session, tools, product),
                     keyboard=Keyboard().row(
                         Button("В корзину", f"add:{sku}"),
                         Button("Подробнее", f"card:{sku}"),
@@ -406,67 +537,55 @@ class SalesAgent:
             # Модель промолчала — отвечаем предложением по исходному вопросу.
             return self.engine.offer(session, question)
 
-        # Модель перечислила оборудование словами, не заглянув в каталог. Спорить
-        # с ней дорого — целое обращение, — поэтому просто дописываем настоящие
-        # позиции: с ценой, наличием и пунктом перечня.
-        #
-        # Только у продавца. У консультанта эта страховка срабатывала на любом
-        # ответе с двумя пунктами списком: человек спрашивал про приказ, получал
-        # объяснение — и под ним выдачу каталога. Именно так «пропадал диалог».
-        if show_cards and not tools.shown_skus and talks_about_goods(answer):
-            found = self.engine.search(
-                session,
-                self._catalog_query(session, question),
-                # Заголовок «Нашлось более 50 позиций по запросу…» здесь не к
-                # месту: человек не искал, он получил ответ, к которому мы сами
-                # дописываем настоящие позиции.
-                title="Вот эти позиции есть в каталоге",
-            )
-            # Пустая выдача сюда не идёт: «ничего не нашёл» сразу после связного
-            # ответа модели выглядит поломкой, а не помощью.
-            if any(isinstance(item, ProductList) for item in found):
-                log.warning("Ответ без обращения к каталогу — дописываем выдачу поиска.")
-                responses += found
+        # Страховки, которая дописывала к ответу выдачу поиска по помещению из профиля,
+        # здесь больше нет (NEXT-4.1): товары в ответе — только из подбора ядра, а
+        # обещание подбора без самого подбора разбирается до сборки ответа.
         return responses
 
-    def _citation(self, session, product) -> str | None:  # noqa: ANN001
+    def _citation(self, session, tools: ToolBox, product) -> str | None:  # noqa: ANN001
         """Основание для карточки — то же, что бот назвал в тексте.
 
         Раньше текст брал основание из результата поиска, а карточка считала его
         заново по аудитории профиля, и в одном сообщении оказывались два разных
         приказа: «привязана к приказу 838» в тексте и «позиция 1.13.4.3.1.6 —
-        приказ 1057» на карточке под ним.
+        приказ 1057» на карточке под ним. Теперь основание — из подбора ядра.
         """
-        for hit in session.last_hits or ():
-            if hit.product.sku_1c == product.sku_1c:
-                return hit.citation()
+        if product.sku_1c in tools.citations:
+            return tools.citations[product.sku_1c]
         norm = product.norm_for(session.profile.audience, session.profile.room or "")
         return norm.citation if norm else None
 
-    def _catalog_query(self, session, question: str) -> str:  # noqa: ANN001
-        """Чем искать, когда искать приходится за модель.
+    def _keyboard(self, session, tools: ToolBox, decision: Decision) -> Keyboard | None:  # noqa: ANN001
+        """Кнопки под ответом модели.
 
-        Реплика пользователя для поиска годится не всегда: «сейчас зал пустой,
-        только ремонт сделали» — это про обстоятельства, а не про товар. Профиль
-        разговора описывает задачу точнее, и он уже разобран.
+        «Корзина» и «Оформить» — этап продавца и только при непустой корзине. 14.09 они
+        стояли под ответом консультанта на «предложи по 1057 указу»: человек ещё выясняет
+        задачу, а ему предлагают оформить пустую корзину.
         """
-        profile = session.profile
-        words = [profile.room or "", profile.institution or ""]
-        query = " ".join(word for word in words if word).strip()
-        return query or question
-
-    def _keyboard(self, tools: ToolBox) -> Keyboard:
         keyboard = Keyboard()
         if tools.handoff_reason:
             keyboard.row(Button("Связаться с менеджером", "menu"))
-        keyboard.row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
-        return keyboard
+        if decision.sells and self.engine.storage.load_cart(session.user_id).count:
+            keyboard.row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
+        return keyboard if keyboard.rows else None
 
     def _system_prompt(self, session, decision: Decision) -> str:  # noqa: ANN001
-        """Промпт выбранной роли плюс то, что уже известно об этом разговоре."""
-        base = self.prompts.get(decision.branch) or self.prompts[SELL]
+        """Промпт выбранной роли, текущий запрос и то, что уже известно об этом разговоре.
+
+        Строка о запросе — контекст перехода (ORCHESTRATOR.md, раздел 18): консультант видит,
+        что комплектацию надо довести до списка, продавец — что консультация уже была.
+        """
+        parts = [self.prompts.get(decision.branch) or self.prompts[SELL]]
+        title = INTENT_TITLES.get(decision.intent)
+        if title and decision.branch in (CONSULT, SELL):
+            line = f"## Текущий запрос\n\n{title[0].upper()}{title[1:]}."
+            if decision.branch == SELL and decision.previous == CONSULT:
+                line += " До этого разговор вёл консультант: задача и комплектация — в переписке, заново не расспрашивай."
+            parts.append(line)
         profile = session.profile.as_prompt()
-        return f"{base}\n\n{profile}" if profile else base
+        if profile:
+            parts.append(profile)
+        return "\n\n".join(parts)
 
     def _history(self, session) -> list[dict]:  # noqa: ANN001
         """Переписка для модели.
@@ -506,6 +625,15 @@ def account_usage(session, client: ChatClient, message: dict) -> None:  # noqa: 
     box["tokens_in"] = int(box.get("tokens_in", 0)) + tokens_in
     box["tokens_out"] = int(box.get("tokens_out", 0)) + tokens_out
     box["cost_rub"] = round(float(box.get("cost_rub", 0.0)) + cost, 4)
+
+
+def _missing(profile) -> list[str]:  # noqa: ANN001 — core.profile.DialogProfile
+    """Чего не хватает для подбора: учреждение и помещение."""
+    return [
+        name
+        for name, known in (("institution_type", profile.institution), ("room", profile.room))
+        if not known
+    ]
 
 
 def _assistant_message(message: dict) -> dict:
@@ -598,4 +726,4 @@ def _named_in(name: str, words: list[str], pairs: set[tuple[str, str]]) -> bool:
 
 
 def _without_codes(answer: str) -> str:
-    return _CODE_MENTION.sub("", answer)
+    return _EMPTY_BULLET.sub("", _CODE_MENTION.sub("", answer))

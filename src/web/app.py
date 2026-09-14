@@ -181,6 +181,10 @@ def _install_core_api(app: FastAPI, settings: Settings, engine, core, verifiers)
                     holder["core"] = CoreApi(build_core(settings, engine), verifiers)
         return holder["core"]
 
+    if getattr(engine, "procurement", None) is None:
+        # Подбор в диалоге идёт через Procurement Core: ядро соберётся при первом подборе.
+        engine.procurement_provider = get_core
+
     install(app, get_core, settings)
 
 

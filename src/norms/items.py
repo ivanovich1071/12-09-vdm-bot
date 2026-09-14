@@ -233,6 +233,23 @@ class ItemIndex:
     def count(self, doc_id: str) -> int:
         return len(self.items.get(doc_id, {}))
 
+    def parents(self, doc_id: str, code: str) -> list[NormItem]:
+        """Разделы, в которых стоит пункт, — от верхнего к ближайшему.
+
+        Без них «1.14.2.7.2 Спортивный инвентарь» выглядит как пункт про спортзал, хотя
+        это групповые помещения для детей до года. 14.09 консультант выдал такие пункты
+        на «оснастить спортзал», и подбор по ним в спортзале ничего не нашёл.
+        """
+        parts = code.split(".")
+        found = (self.get(doc_id, ".".join(parts[:size])) for size in range(1, len(parts)))
+        return [item for item in found if item is not None]
+
+    def children(self, doc_id: str, code: str) -> list[NormItem]:
+        """Пункты раздела в порядке номеров, со вложенными подразделами."""
+        prefix = f"{code}."
+        found = [item for key, item in self.items.get(doc_id, {}).items() if key.startswith(prefix)]
+        return sorted(found, key=lambda item: [int(part) for part in item.code.split(".") if part.isdigit()])
+
     def search(self, text: str, doc_id: str | None = None, limit: int = 5) -> list[NormItem]:
         from catalog.text import expand
 

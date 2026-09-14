@@ -199,8 +199,13 @@ def test_consultant():
     assert not allowed
 
 
+def test_equipping_a_room_is_a_consultation():
+    """ORCHESTRATOR.md (14.09): подбор оборудования для помещения — задача консультанта."""
+    assert by_rules("подбери оборудование для кабинета химии в школе", DialogProfile()).branch == CONSULT
+
+
 def test_salesman():
-    decision = by_rules("подбери оборудование для кабинета химии в школе", DialogProfile())
+    decision = by_rules("покажите микроскопы для кабинета химии в школе", DialogProfile())
 
     assert decision.branch == SELL
     assert decision.ready_to_see

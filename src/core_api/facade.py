@@ -295,24 +295,49 @@ class CoreApi:
         return self.cart(session)
 
     def cart_specification(self, session: CoreSession) -> Result:
-        """Спецификация из корзины: задача собирается из того, что диалог уже знает."""
+        """Спецификация из корзины — в задаче закупки, которую вёл диалог.
+
+        Продавец подбирает через эту же задачу (`core/selection.py`), и причины подбора
+        доходят до строк спецификации. Задачи нет — собираем её из того, что диалог знает.
+        """
         cart = self.storage.load_cart(session.user_ref)
         if cart.is_empty:
-            raise InvalidRequest("Корзина пуста.", code="EMPTY_CART")
+            raise InvalidRequest("Корзина пуста — сначала добавьте товары из подбора.", code="EMPTY_CART")
         profile = self.services.engine.session(session.user_ref, session.channel).profile
-        fields: dict[str, Any] = {
-            "institution_type": profile.institution,
-            "room": profile.room,
-            "age_group": profile.age,
-            "deadline": profile.deadline,
-            "norm_document": profile.norm_doc_ids[0] if profile.norm_doc_ids else None,
-        }
         procurement = self.services.procurement
-        task = procurement.create_task(session.user_ref, session.channel, fields={k: v for k, v in fields.items() if v})
+        task = self._dialog_task(session, profile.procurement_task_id)
+        if task is None:
+            fields: dict[str, Any] = {
+                "institution_type": profile.institution,
+                "room": profile.room,
+                "age_group": profile.age,
+                "deadline": profile.deadline,
+                "norm_document": profile.norm_doc_ids[0] if profile.norm_doc_ids else None,
+            }
+            task = procurement.create_task(session.user_ref, session.channel, fields={k: v for k, v in fields.items() if v})
         spec = procurement.build_specification(
             task.id, session.user_ref, [SpecificationLine(item.sku_1c, item.quantity) for item in cart.items]
         )
         return self._specification(session, spec)
+
+    def checkout(self, session: CoreSession) -> tuple[Result, Result]:
+        """«Оформить»: корзина → спецификация → предзаказ. Одна цепочка для любого канала.
+
+        Прежняя анкета из шести шагов в этой цепочке не участвует: согласие и контакт канал
+        собирает поверх предзаказа — так же, как для загруженного файла заказа.
+        """
+        spec = self.cart_specification(session)
+        assert isinstance(spec.data, dto.SpecificationOut)
+        return spec, self.create_preorder(session, "specification", spec.data.id, None)
+
+    def _dialog_task(self, session: CoreSession, task_id: str | None):  # noqa: ANN202
+        if not task_id:
+            return None
+        try:
+            task = self.services.procurement.get_task(task_id, session.user_ref)
+        except NotFound:
+            return None
+        return None if task.is_closed else task
 
     # --- Заказ клиента и предзаказ ------------------------------------------------------------
 

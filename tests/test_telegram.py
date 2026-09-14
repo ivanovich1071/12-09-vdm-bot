@@ -14,6 +14,8 @@ from adapters.telegram.bot import (  # noqa: E402
     fit,
     render_card,
     render_list_item,
+    render_text,
+    split_text,
     to_markup,
 )
 from catalog.models import Product  # noqa: E402
@@ -60,6 +62,32 @@ def test_truncation_never_leaves_half_a_tag():
     result = fit(text)
     assert "<" not in result[result.rfind(">") + 1 :]
     assert len(result) <= MESSAGE_LIMIT
+
+
+def test_model_markdown_becomes_telegram_html():
+    """Живой прогон 14.09: «### Предварительная комплектация» и «**Мат**» пришли бы звёздочками."""
+    text = "### Предварительная комплектация\n1. **Мат гимнастический** — 2 шт. <для кувырков> & прыжков"
+    assert render_text(text) == (
+        "<b>Предварительная комплектация</b>\n"
+        "1. <b>Мат гимнастический</b> — 2 шт. &lt;для кувырков&gt; &amp; прыжков"
+    )
+    assert render_text("5 * 3 ** 2") == "5 * 3 ** 2"
+    link = "1. **[Шведская стенка](https://vdm.ru/catalog/a.html?x=1&y=2)** — 19 141 ₽"
+    assert render_text(link) == (
+        '1. <b><a href="https://vdm.ru/catalog/a.html?x=1&amp;y=2">Шведская стенка</a></b> — 19 141 ₽'
+    )
+
+
+def test_long_answer_is_split_by_lines_not_cut():
+    """Предварительная комплектация консультанта длиннее 4096 знаков — ни одна строка не теряется."""
+    lines = [f"{number}. 1.5.1.{number} Мат гимнастический — 2 шт., для кувырков" for number in range(1, 160)]
+    text = "\n".join(lines)
+    parts = split_text(text)
+
+    assert len(parts) > 1 and all(len(part) <= MESSAGE_LIMIT for part in parts)
+    assert "\n".join(parts) == text
+    assert split_text("коротко") == ["коротко"]
+    assert all(len(part) <= MESSAGE_LIMIT for part in split_text("слово " * 2000))
 
 
 def test_special_characters_are_escaped_in_card():

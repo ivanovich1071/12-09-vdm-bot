@@ -97,6 +97,8 @@ class TelegramGateway:
         command = stripped.split()[0].lower() if stripped.startswith("/") else ""
         if user_id in self._awaiting_contact and not command:
             return self._guard(lambda: self._contact_from_text(user_id, stripped))
+        if command == "/order":
+            return self._guard(lambda: self._checkout(user_id))
         if command == "/spec":
             return self._guard(lambda: self._cart_specification(user_id))
         if command == "/preorders":
@@ -111,6 +113,8 @@ class TelegramGateway:
     def action(self, user_id: str, data: str) -> list[TelegramReply]:
         verb, _, arg = data.partition(":")
         handlers: dict[str, Callable[[], list[TelegramReply]]] = {
+            # «Оформить» под ответами ядра — в предзаказ, а не в прежнюю анкету из шести шагов.
+            "checkout": lambda: self._checkout(user_id),
             "po_order": lambda: self._preorder(user_id, "uploaded_order", arg),
             "po_spec": lambda: self._preorder(user_id, "specification", arg),
             "po_consent": lambda: self._consent(user_id, arg),
@@ -149,13 +153,23 @@ class TelegramGateway:
         assert isinstance(spec, dto.SpecificationOut)
         return [self._file(session, spec, "xlsx")]
 
+    def _checkout(self, user_id: str) -> list[TelegramReply]:
+        """«Оформить» и /order: спецификацию и предзаказ собирает ядро, канал просит согласие и контакт."""
+        session = self.session(user_id)
+        spec_result, preorder_result = self.core.checkout(session)
+        spec, preorder = spec_result.data, preorder_result.data
+        assert isinstance(spec, dto.SpecificationOut) and isinstance(preorder, dto.PreorderOut)
+        return [self._file(session, spec, "xlsx", preorder_button=False), *self._offer_preorder(user_id, preorder)]
+
     def _spec_file(self, user_id: str, spec_id: str, fmt: str) -> list[TelegramReply]:
         session = self.session(user_id)
         spec = self.core.get_specification(session, spec_id).data
         assert isinstance(spec, dto.SpecificationOut)
         return [self._file(session, spec, fmt)]
 
-    def _file(self, session: CoreSession, spec: dto.SpecificationOut, fmt: str) -> FileReply:
+    def _file(
+        self, session: CoreSession, spec: dto.SpecificationOut, fmt: str, preorder_button: bool = True
+    ) -> FileReply:
         document, _, _ = self.core.export_specification(session, spec.id, fmt)
         totals = spec.totals
         caption = (
@@ -163,7 +177,9 @@ class TelegramGateway:
             + ("" if totals["complete"] else f" (без цены: {totals['missing_prices']})")
             + f". Цены — по версии каталога {spec.catalog_version}."
         )
-        keyboard = Keyboard().row(Button("Оформить предзаказ", f"po_spec:{spec.id}"))
+        keyboard = Keyboard()
+        if preorder_button:
+            keyboard.row(Button("Оформить предзаказ", f"po_spec:{spec.id}"))
         keyboard.row(Button("Excel", f"spec_xlsx:{spec.id}"), Button("Word", f"spec_docx:{spec.id}"))
         return FileReply(document.filename, document.content, caption, keyboard)
 
@@ -171,6 +187,10 @@ class TelegramGateway:
         session = self.session(user_id)
         preorder = self.core.create_preorder(session, source, source_id, None).data
         assert isinstance(preorder, dto.PreorderOut)
+        return self._offer_preorder(user_id, preorder)
+
+    def _offer_preorder(self, user_id: str, preorder: dto.PreorderOut) -> list[TelegramReply]:
+        session = self.session(user_id)
         summary = (
             f"Предварительный заказ {preorder.id}: позиций {preorder.totals['positions']} "
             f"на {price_text(preorder.totals['amount'])} по текущим ценам. Это ещё не заказ: "
@@ -199,7 +219,7 @@ class TelegramGateway:
     def _send_preorder(self, user_id: str, name: str, phone: str) -> list[TelegramReply]:
         preorder_id = self._awaiting_contact.pop(user_id, None)
         if preorder_id is None:
-            return [Message("Контакт получен, но предзаказ не выбран. Соберите его заново: /spec или файлом заказа.")]
+            return [Message("Контакт получен, но предзаказ не выбран. Соберите его заново: /order или файлом заказа.")]
         customer = dto.CustomerIn(name=name[:200], phone=phone[:50])
         sent = self.core.send_preorder(self.session(user_id), preorder_id, customer).data
         assert isinstance(sent, dto.PreorderOut)
@@ -216,7 +236,7 @@ class TelegramGateway:
         data = self.core.history(self.session(user_id)).data
         assert isinstance(data, dto.HistoryOut)
         if not data.preorders and not data.specifications:
-            return [Message("Предзаказов и спецификаций пока нет. Соберите корзину и нажмите /spec.")]
+            return [Message("Предзаказов и спецификаций пока нет. Соберите корзину и нажмите /order.")]
         lines = ["Ваши предзаказы:"] if data.preorders else []
         lines += [f"• {p['id']} — {_status(p['status'])}, {price_text(p['amount'])}" for p in data.preorders[:10]]
         if data.specifications:

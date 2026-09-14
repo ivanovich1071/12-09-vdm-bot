@@ -50,6 +50,8 @@ def build_core(
     runtime = engine.runtime
     procurement_repository = SqliteProcurementRepository(db)
     procurement = ProcurementService(procurement_repository, runtime, norms)
+    # Подбор в диалоге — продавец, ответ без модели — идёт через этот же сервис.
+    engine.procurement = procurement
     orders = OrderCoreService(
         SqliteOrderRepository(db),
         runtime,

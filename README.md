@@ -82,7 +82,8 @@ python run.py search "мячи для спортивного зала в нал�
 # там же Core API (http://localhost:8000/api/health) и Mini App (/miniapp)
 python run.py widget
 
-# Telegram-бот через Core API: диалог, файл заказа, /spec, предзаказ (нужен TELEGRAM_BOT_TOKEN)
+# Telegram-бот через Core API: консультант и продавец, подбор ядра, «Оформить» → предзаказ (нужен TELEGRAM_BOT_TOKEN)
+# пошагово для Windows и VS Code — ЗАПУСК_VSCODE.md
 python run.py telegram --check   # токен, webhook, модель, Mini App — без запуска
 python run.py telegram
 
@@ -192,10 +193,14 @@ agent · catalog · norms · orders · privacy · media
   - Mini App не передаёт идентификатор сессии в адресе;
   - бот работает только через Core API;
   - разговор, который ведут бот и Mini App, не теряется;
-  - проверка перед запуском — `python run.py telegram --check`.
+  - проверка перед запуском — `python run.py telegram --check`;
+  - 14.09: подбор продавца — только через Procurement Core, «Оформить» и `/order` —
+    предзаказ ядра, описание задачи — ход консультанта, ложное обещание подбора
+    перехватывается.
 
-  Живой запуск ждёт токена нового бота и публичного HTTPS-адреса; инструкция и
-  чек-лист — docs/CORE.md, раздел NEXT-4.1.
+  Новый бот создан и проверен `--check`. Mini App в клиенте Telegram ждёт публичного
+  HTTPS, модель заказчика — проверки на Cloud.ru под VPN. Запуск —
+  ЗАПУСК_VSCODE.md, чек-лист — docs/CORE.md, раздел NEXT-4.1.
 - **Дальше (D12):** после живой проверки Telegram — NEXT-5 MAX + Mini App (ждёт токена),
   NEXT-6 Web Widget, NEXT-7 Admin / CRM.
 - **Тесты:** 741 passed, ruff чистый.

@@ -191,12 +191,15 @@ def test_catalog_sections_fit_the_telegram_button_limit(engine):
         assert len(button.action.encode("utf-8")) <= 64, button.action
 
 
-def test_section_opens_by_number(engine):
+def test_section_starts_a_consultation_not_a_listing(engine):
+    """14.09, заказчик: раздел «Оборудование для детского сада» сначала выясняет задачу, карточки — потом."""
     engine.handle_action(USER, CHANNEL, "catalog")
 
     responses = engine.handle_action(USER, CHANNEL, "root:0")
 
-    assert responses[0].cards, "раздел открылся пустым"
+    assert len(responses) == 1 and not getattr(responses[0], "cards", None)
+    assert responses[0].text.rstrip().endswith("?")
+    assert engine.session(USER, CHANNEL).history[-1]["content"] == responses[0].text
 
 
 def test_old_buttons_with_section_names_still_work(engine):
@@ -205,7 +208,7 @@ def test_old_buttons_with_section_names_still_work(engine):
 
     responses = engine.handle_action(USER, CHANNEL, f"root:{root}")
 
-    assert responses[0].cards
+    assert root.title() in responses[0].text
 
 
 def test_unknown_section_says_so(engine):

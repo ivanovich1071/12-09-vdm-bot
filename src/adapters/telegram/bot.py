@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 
 from aiogram import Bot, Dispatcher, F
@@ -82,6 +83,37 @@ def fit(text: str) -> str:
     return _trim_partial_tag(text[:budget]) + TRUNCATED_TAIL
 
 
+def split_text(text: str) -> list[str]:
+    """Длинный ответ — несколькими сообщениями по границам строк, а не обрезкой.
+
+    Предварительная комплектация консультанта бывает длиннее 4096 знаков, и обрезка
+    с хвостом «полное описание на сайте» теряла половину списка. Текст ответа уже
+    экранирован и тегов не содержит, поэтому резать по строкам безопасно.
+    """
+    if len(text) <= MESSAGE_LIMIT:
+        return [text]
+    parts: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > MESSAGE_LIMIT:
+            if current:
+                parts.append(current)
+                current = ""
+            cut = line.rfind(" ", 0, MESSAGE_LIMIT)
+            cut = cut if cut > 0 else MESSAGE_LIMIT
+            parts.append(line[:cut])
+            line = line[cut:].lstrip()
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > MESSAGE_LIMIT:
+            parts.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
 def _trim_partial_tag(text: str) -> str:
     """Убирает обрывок тега в конце: `…<b` или `…</`."""
     last_open = text.rfind("<")
@@ -129,7 +161,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("cart", "корзина"),
     ("spec", "спецификация из корзины"),
     ("preorders", "мои предзаказы"),
-    ("order", "оформить заказ"),
+    ("order", "оформить предзаказ"),
     ("manager", "связаться с менеджером"),
 )
 
@@ -269,7 +301,10 @@ async def send(
                 continue
 
         if isinstance(response, Message):
-            await bot.send_message(chat_id, fit(_escape(response.text)), reply_markup=markup)
+            parts = split_text(render_text(response.text))
+            for part in parts[:-1]:
+                await bot.send_message(chat_id, part)
+            await bot.send_message(chat_id, parts[-1], reply_markup=markup)
         elif isinstance(response, ProductCard):
             await _send_card(bot, chat_id, response, markup, storage)
         elif isinstance(response, ProductList):
@@ -296,7 +331,7 @@ async def send(
 
 def _replacement_text(response: Response) -> str | None:
     if isinstance(response, Message):
-        return fit(_escape(response.text))
+        return fit(render_text(response.text))
     if isinstance(response, ProductCard):
         return fit(render_card(response))
     if isinstance(response, OrderSummary):
@@ -569,6 +604,23 @@ def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_MD_BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)\"<>]+)\)")
+
+
+def render_text(text: str) -> str:
+    """Ответ модели для Telegram: экранирование и простая разметка в HTML.
+
+    Живой прогон 14.09: консультант писал комплектацию с `###` и `**` вопреки промпту, и
+    Telegram показал бы звёздочки и решётки как есть. Заголовок и жирный переводятся в
+    `<b>` в пределах строки — поэтому разбивка ответа по строкам тег не разрывает.
+    """
+    html = _MD_HEADING.sub(r"<b>\1</b>", _escape(text))
+    html = _MD_LINK.sub(r'<a href="\2">\1</a>', html)
+    return _MD_BOLD.sub(r"<b>\1</b>", html)
+
+
 def use_compatible_event_loop() -> None:
     """На Windows aiohttp не работает с циклом событий по умолчанию.
 
@@ -628,6 +680,11 @@ async def _publish_commands(bot: Bot) -> None:
 async def _publish_miniapp(bot: Bot, url: str) -> None:
     """Кнопка меню «Приложение» — открывает Mini App поверх того же Core API."""
     if not url:
+        return
+    if not url.startswith("https://"):
+        # Telegram открывает Mini App только по HTTPS. http://127.0.0.1:8000/miniapp годится
+        # для проверки страницы в браузере разработчика, но не для кнопки в клиенте.
+        log.warning("TELEGRAM_MINIAPP_URL не HTTPS — кнопка «Приложение» не публикуется.")
         return
     from aiogram.types import MenuButtonWebApp, WebAppInfo
 

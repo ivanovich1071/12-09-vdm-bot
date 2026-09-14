@@ -140,6 +140,10 @@ class DialogProfile:
     # бот не предлагал по кругу одно и то же.
     offered: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+    # Задача закупки этого разговора в Procurement Core (`core/selection.py`): подбор в
+    # диалоге идёт через неё, и показанное не повторяется между ходами. Служебное поле,
+    # в промпт модели не попадает.
+    procurement_task_id: str | None = None
 
     # --- Ход разговора ---------------------------------------------------------
     #
@@ -153,6 +157,11 @@ class DialogProfile:
     # Клиент готов смотреть позиции: прямо попросил показать либо согласился
     # после снятия возражения.
     ready_to_see: bool = False
+    # Кто отвечал прошлым ходом и с каким намерением — состояние оркестратора
+    # (`agent/routing.py`, ORCHESTRATOR.md, раздел 12). Прежний агент — только контекст:
+    # маршрут решает намерение новой реплики.
+    last_agent: str | None = None  # consult | sell
+    intent: str | None = None
 
     @property
     def audience(self) -> str | None:
@@ -336,10 +345,13 @@ class DialogProfile:
             "region": self.region,
             "offered": self.offered,
             "rejected": self.rejected,
+            "procurement_task_id": self.procurement_task_id,
             "stage": self.stage,
             "objection": self.objection,
             "objection_handled": self.objection_handled,
             "ready_to_see": self.ready_to_see,
+            "last_agent": self.last_agent,
+            "intent": self.intent,
         }
 
     @classmethod

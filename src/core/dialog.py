@@ -16,7 +16,7 @@ from catalog.models import Product
 from catalog.runtime import CatalogRuntime, CatalogRuntimeState
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
 from catalog.service import CatalogService
-from core import intent
+from core import intent, selection
 from core.config import Settings
 from core.models import CartItem, Customer
 from core.profile import DialogProfile
@@ -40,6 +40,7 @@ from norms import reference as norm_reference
 from orders.service import OrderService
 from privacy.consent import CONSENT_TEXT, CONSENT_VERSION
 from privacy.masking import Masker
+from procurement.models import SelectionResult, SelectionStatus
 
 log = logging.getLogger(__name__)
 
@@ -212,6 +213,11 @@ class DialogEngine:
         self.agent = agent
         self.dialog_log = dialog_log
         self.media = media
+        # Procurement Core ставит сборка ядра (`core_api/composition.py`): подбор товаров в
+        # диалоге идёт только через него. Процесс виджета собирает ядро лениво —
+        # `procurement_provider` соберёт его при первом подборе.
+        self.procurement = None
+        self.procurement_provider = None
         self._sessions: dict[str, Session] = {}
         # Пункты приказов с формулировками и поиском по словам. Файла может не
         # быть — тогда бот называет номер пункта без текста, как и раньше.
@@ -238,6 +244,11 @@ class DialogEngine:
     @property
     def catalog_version(self) -> str | None:
         return self.runtime.state.version
+
+    def procurement_service(self):  # noqa: ANN201 — procurement.service.ProcurementService | None
+        if self.procurement is None and self.procurement_provider is not None:
+            self.procurement_provider()
+        return self.procurement
 
     def session(self, user_id: str, channel: str) -> Session:
         key = f"{channel}:{user_id}"
@@ -471,6 +482,11 @@ class DialogEngine:
                 return [Message("Оформление отменено, корзина сохранена.", keyboard=self._main_menu())]
             case "more":
                 return self._more(session, int(arg or 0))
+            case "select_more":
+                result = selection.more(self, session)
+                if result is None:
+                    return [Message("Больше ничего нет.", keyboard=self._main_menu())]
+                return self._selection_reply(session, result, "Ещё варианты из каталога")
         return [Message("Не понял действие.", keyboard=self._main_menu())]
 
     # --- Команды -------------------------------------------------------------
@@ -554,6 +570,10 @@ class DialogEngine:
                 )
             ]
 
+        # Описание задачи без товара — тоже повод для подбора: консультанта нет, а ядро либо
+        # подберёт по учреждению и помещению, либо спросит одно недостающее.
+        if kind is intent.TASK and self.procurement_service() is not None:
+            return self.select_offer(session, text, "Могу предложить товары из каталога")
         if kind not in (intent.PRODUCT, intent.NORM_CODE):
             return [
                 Message(
@@ -565,6 +585,10 @@ class DialogEngine:
                 )
             ]
 
+        if self.procurement_service() is not None:
+            return self.select_offer(session, text, "Могу предложить товары из каталога")
+
+        # Без Procurement Core движок живёт только в тестах диалога: там — поиск по индексу.
         hits = self.index.search(
             SearchQuery(text=text, limit=SEARCH_CAP, audience=session.profile.audience)
         )
@@ -588,6 +612,71 @@ class DialogEngine:
             Message(f"{header}:\n\n{names}", keyboard=self._offer_menu()),
             self._list(hits[:PAGE_SIZE], "Первые три — подробнее", len(hits), offset=0),
         ]
+
+    def select_offer(self, session: Session, text: str, header: str = "Подобрал в каталоге") -> list[Response]:
+        """Подбор по реплике через Procurement Core.
+
+        Нужен, когда модели нет или когда она пообещала подбор и не сделала его. Слова
+        запроса — из самой реплики, остальное ядро берёт из задачи разговора. Реплика не о
+        товаре («хорошо, что дальше?») прежний запрос не сбивает.
+        """
+        about = selection.about_task(text)
+        code = intent.norm_code(text) if intent.classify(text) is intent.NORM_CODE else None
+        result = selection.select(
+            self,
+            session,
+            text=text if about else None,
+            # Названный пункт перечня — отдельный подбор: прежние слова запроса его не сужают.
+            query="" if code else None,
+        )
+        return self._selection_reply(session, result, header)
+
+    def _selection_reply(
+        self, session: Session, result: SelectionResult | None, header: str
+    ) -> list[Response]:
+        if result is None:
+            text = f"Подбор сейчас недоступен. Поможет менеджер: {self.settings.manager_contact}."
+        elif result.status is SelectionStatus.NEEDS_DETAILS:
+            text = selection.question(result.questions)
+        elif not result.items:
+            text = (
+                "По этой задаче в каталоге ничего не нашлось. Назовите товар иначе или пункт "
+                "перечня — например, «1.5.1».\n"
+                f"Если нужно, подключим менеджера: {self.settings.manager_contact}."
+            )
+        else:
+            lines = [f"• {item.name} — {item.reason}" for item in result.items]
+            text = "\n".join([f"{header}:", "", *lines, *(["", *selection.notes(result)] if selection.notes(result) else [])])
+            session.remember("assistant", text)
+            session.profile.remember_offered([item.product_id for item in result.items])
+            return [Message(text, keyboard=self._offer_menu()), self._selection_list(session, result)]
+        session.remember("assistant", text)
+        return [Message(text, keyboard=self._offer_menu())]
+
+    def _selection_list(self, session: Session, result: SelectionResult) -> ProductList:
+        """Карточки ровно тех позиций, которые вернул Procurement Core."""
+        cards = []
+        for item in result.items:
+            product = self.index.get(item.product_id)
+            if product is None:
+                continue
+            cards.append(
+                ProductCard(
+                    product=product,
+                    citation=selection.citation(item) or _not_listed(session.profile.audience),
+                    keyboard=Keyboard().row(
+                        Button("В корзину", f"add:{product.sku_1c}"),
+                        Button("Подробнее", f"card:{product.sku_1c}"),
+                    ),
+                    image=self._image(product),
+                    image_path=self.photo_path(product),
+                )
+            )
+        keyboard = Keyboard()
+        if result.has_more:
+            keyboard.row(Button("Показать ещё", "select_more"))
+        keyboard.row(Button("Моя корзина", "cart"), Button("Меню", "menu"))
+        return ProductList(title="Подбор из каталога", cards=cards, total_found=result.matched, keyboard=keyboard)
 
     def _offer_menu(self) -> Keyboard:
         return Keyboard().row(
@@ -764,7 +853,29 @@ class DialogEngine:
         root = self._root_by(arg)
         if root is None:
             return [Message("Такого раздела нет.", keyboard=self._main_menu())]
-        return self._list_root(session, root)
+        return self._consult_root(session, root)
+
+    def _consult_root(self, session: Session, root: str) -> list[Response]:
+        """Раздел каталога — начало консультации, а не выдача.
+
+        14.09 на «Оборудование для детского сада» бот сразу выложил первые позиции раздела:
+        игру «Мирознайка» и настольные игры — не спросив, что за группа и зачем. Заказчик:
+        при выборе раздела сначала выяснить задачу, карточки — после. Дальше разговор ведут
+        консультант и продавец, подбор — через Procurement Core.
+        """
+        profile = session.profile
+        profile.update_from_text(root)
+        # Раздел каталога начинает консультацию: следующий ответ человека продолжает её.
+        profile.last_agent = "consult"
+        if not profile.institution:
+            ask = "Для детского сада или для школы подбираете?"
+        elif not profile.room:
+            ask = "Для какого помещения или зоны — группа, спортивный или музыкальный зал, кабинет специалиста?"
+        else:
+            ask = "Для какого возраста или класса?"
+        text = f"Раздел «{root.title()}». Помогу выбрать из него то, что нужно под вашу задачу. {ask}"
+        session.remember("assistant", text)
+        return [Message(text, keyboard=Keyboard().row(Button("Меню", "menu")))]
 
     def _root_by(self, arg: str) -> str | None:
         """Номер раздела или его название.
@@ -776,18 +887,6 @@ class DialogEngine:
             number = int(arg)
             return self.roots[number] if number < len(self.roots) else None
         return arg if arg in self.roots else None
-
-    def _list_root(self, session: Session, root: str) -> list[Response]:
-        audience = session.profile.audience
-        hits = self.index.search(
-            SearchQuery(text="", root=root, limit=SEARCH_CAP, audience=audience)
-        )
-        if not hits:
-            # Пустой текст не даёт ранжирования — берём раздел напрямую.
-            products = [p for p in self.index.products if root in p.roots][:SEARCH_CAP]
-            hits = [SearchHit(p, 0.0, "text", None, audience) for p in products]
-        session.last_hits = hits
-        return [self._list(hits[:PAGE_SIZE], root.title(), len(hits), offset=0)]
 
     def _norm_help(self) -> list[Response]:
         keyboard = Keyboard()

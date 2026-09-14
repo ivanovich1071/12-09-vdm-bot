@@ -1,8 +1,9 @@
 """Инструменты агента.
 
 Агент не выдумывает товары, цены и нормативные основания — он получает их только
-через эти вызовы. Всё, что вернулось из инструмента, взято из выгрузки 1С, поэтому
-любую цифру в ответе можно проследить до источника.
+через эти вызовы. Товары приходят из Procurement Core (`core/selection.py`): подбор,
+цена, наличие, количество и причина — из `SelectionResult`, и назвать, показать
+карточкой или положить в корзину можно только то, что ядро вернуло в этом разговоре.
 
 Действия, меняющие состояние (корзина, оформление), тоже идут через инструменты,
 но оформление заказа агент только начинает: подтверждает его пользователь кнопкой.
@@ -11,29 +12,24 @@
 from __future__ import annotations
 
 import json
-from typing import Any, NamedTuple
+from typing import Any
 
-from catalog.search import SearchQuery
+from core import selection
 from core.ui import price_text, stock_text
 from norms import documents as norm_docs
 from norms import extract as norm_extract
 from norms import reference
 from norms.extract import document_ids_in_text
-
-MAX_RESULTS = 8
+from procurement.models import SelectionResult, SelectionStatus
 
 # Инструменты, чьи вызовы попадают в журнал хода: по ним разбирают сбои
 # «нашёл, но не то».
 _NORM_TOOLS = frozenset({"find_by_norm_code", "find_norm_item", "explain_norm"})
-
-
-class _PlainItem(NamedTuple):
-    """Пункт, о котором известно только из привязки каталога, без текста приказа."""
-
-    doc_id: str
-    code: str
-    title: str
-    section: str | None = None
+# Инструменты подбора: вызов любого из них — это подбор, а не обещание подбора.
+SELECTION_TOOLS = frozenset({"search_products", "find_by_norm_code"})
+# Сколько пунктов раздела отдаёт find_norm_item: в «1.5 Спортивный зал» приказа 1057 их 99, и
+# консультант составляет по ним полную предварительную комплектацию — обрезать раздел нельзя.
+MAX_POSITIONS = 100
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -42,16 +38,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "search_products",
             "description": (
-                "Поиск товаров в каталоге по словам. Возвращает название, цену, наличие "
-                "и нормативное основание. Используй для любого предметного запроса."
+                "Подбор товаров ядром закупки под задачу разговора: учреждение, помещение и "
+                "возраст подставляются сами. Возвращает до трёх позиций с ценой, наличием, "
+                "количеством, причиной подбора и нормативным основанием. Называть можно "
+                "только эти позиции. Повторный вызов с тем же запросом — следующие позиции. "
+                "Используй для любого предметного запроса."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Что ищем, своими словами"},
+                    "query": {"type": "string", "description": "Какой товар, своими словами"},
                     "in_stock_only": {"type": "boolean"},
                     "price_max": {"type": "integer", "description": "Верхняя граница цены, ₽"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_RESULTS},
                 },
                 "required": ["query"],
             },
@@ -62,7 +60,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "find_by_norm_code",
             "description": (
-                "Товары по номеру пункта нормативного перечня: «2.1.14», «2.20.63». "
+                "Подбор ядром закупки по номеру пункта нормативного перечня: «2.1.14», «2.20.63». "
                 "Можно указать подраздел целиком — «2.4», тогда вернутся все его позиции. "
                 "Документ указывай всегда, когда он известен: один и тот же номер есть "
                 "в разных приказах и означает в них разное."
@@ -92,7 +90,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "Вызывай, прежде чем называть номер пункта: «какой пункт про спортивное "
                 "оборудование в приказе 1057» вернёт 1.5.1, а «2.1.14 в 1057» честно "
                 "ответит, что такого пункта в этом приказе нет. Формулировку пункта "
-                "бери отсюда, а не по памяти."
+                "бери отсюда, а не по памяти. `path` — разделы, в которых стоит пункт "
+                "(помещение, возраст): по нему видно, к чему пункт относится. По номеру "
+                "раздела («1.5») возвращает его состав — `positions` с количеством по перечню."
             ),
             "parameters": {
                 "type": "object",
@@ -140,7 +140,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_product",
-            "description": "Полная карточка товара по коду 1С, включая состав комплекта.",
+            "description": (
+                "Полная карточка товара по коду 1С, включая состав комплекта. Только для "
+                "позиций, которые вернул подбор, или для товаров из корзины."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"sku_1c": {"type": "string"}},
@@ -152,7 +155,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "add_to_cart",
-            "description": "Добавить товар в корзину. Только после согласия пользователя.",
+            "description": (
+                "Добавить в корзину позицию из подбора. Только после согласия пользователя."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -209,6 +214,10 @@ class ToolBox:
         # отличить от нормального ответа: в записи видно только текст, а по нему
         # не понять, какой приказ спрашивали и что вернул поиск.
         self.norm_lookups: list[dict[str, Any]] = []
+        # Был ли в этом ходе подбор ядром. Ответ «сейчас подберу» без него — ложное обещание.
+        self.selected = False
+        # Основание каждой подобранной позиции — как его вернуло ядро. Из него карточка.
+        self.citations: dict[str, str] = {}
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
         handler = getattr(self, f"_{name}", None)
@@ -241,21 +250,20 @@ class ToolBox:
         query: str,
         in_stock_only: bool = False,
         price_max: int | None = None,
-        limit: int = 5,
+        limit: int | None = None,  # прежний параметр: ядро само отдаёт до трёх позиций
     ) -> dict[str, Any]:
-        # Аудиторию берём из профиля разговора: без неё поиск для детского сада
-        # поднимал школьные позиции и обосновывал их школьным приказом.
-        hits = self.engine.index.search(
-            SearchQuery(
-                text=query,
-                in_stock_only=in_stock_only,
-                price_max=price_max,
-                limit=min(limit, MAX_RESULTS),
-                audience=self.session.profile.audience,
-            )
+        # Учреждение, помещение и возраст ядро берёт из задачи разговора: без них подбор
+        # для детского сада поднимал школьные позиции и обосновывал их школьным приказом.
+        result = selection.select(
+            self.engine,
+            self.session,
+            query=str(query or ""),
+            # Поиск по словам — не по пункту перечня: прежний пункт выдачу не сужает.
+            norm_item="",
+            available_only=bool(in_stock_only),
+            budget=_whole(price_max),
         )
-        self.session.last_hits = hits
-        return {"found": len(hits), "products": [self._brief(hit) for hit in hits]}
+        return self._selection(result)
 
     def _find_by_norm_code(self, code: str, document: str | None = None) -> dict[str, Any]:
         code = norm_extract.normalize_code(code)
@@ -268,33 +276,74 @@ class ToolBox:
         if doc_id and elsewhere and doc_id not in elsewhere:
             return self._code_not_in_document(code, doc_id, elsewhere)
 
-        hits = self.engine.index.search(
-            SearchQuery(
-                text=code,
-                norm_code=code,
-                norm_doc_id=doc_id,
-                limit=MAX_RESULTS,
-                audience=self.session.profile.audience,
-            )
+        result = selection.select(
+            self.engine, self.session, query="", norm_item=code, norm_document=doc_id
         )
-        self.session.last_hits = hits
-        if not hits:
-            note = f"В каталоге нет товаров, привязанных к пункту {code}"
-            note += f" — {norm_docs.get(doc_id).short_name}." if doc_id else "."
-            return {"found": 0, "note": note}
+        answer = self._selection(result)
+        norm = result.norm if result is not None else None
+        # Как пункт называется в самом перечне — и в каком именно перечне. Голая
+        # формулировка без имени документа однажды уже привела к тому, что текст из
+        # приказа 838 был выдан пользователю за пункт 1057.
+        if norm is not None and norm.point and norm.document in norm_docs.DOCUMENTS:
+            answer["norm_item_document"] = norm_docs.get(norm.document).short_name
+            if norm.point_title:
+                answer["norm_item_title"] = norm.point_title
+                self.norm_refs.add((norm.document, norm.point))
+        return answer
 
-        result: dict[str, Any] = {
-            "found": len(hits),
-            "products": [self._brief(hit) for hit in hits],
+    def _selection(self, result: SelectionResult | None) -> dict[str, Any]:
+        """Результат ядра для модели. Других товаров у модели нет."""
+        if result is None:
+            return {"found": 0, "error": "подбор недоступен — предложи связаться с менеджером"}
+        self.selected = True
+        if result.status is SelectionStatus.NEEDS_DETAILS:
+            return {
+                "found": 0,
+                "needs_details": [selection.QUESTIONS.get(name, name) for name in result.questions],
+                "note": "Для подбора не хватает данных — задай клиенту один вопрос, товары не называй.",
+            }
+        if not result.items:
+            return {
+                "found": 0,
+                "note": "Ядро подбора ничего не нашло по этой задаче. Скажи это честно, товары не называй.",
+            }
+        answer: dict[str, Any] = {
+            "found": len(result.items),
+            "more_available": result.has_more,
+            "products": [self._item(item) for item in result.items],
         }
-        # Как пункт называется в самом перечне — и в каком именно перечне.
-        # Голая формулировка без имени документа однажды уже привела к тому,
-        # что текст из приказа 838 был выдан пользователю за пункт 1057.
-        item = self._norm_item(hits, code, doc_id)
-        if item is not None:
-            result["norm_item_title"] = item.title
-            result["norm_item_document"] = norm_docs.get(item.doc_id).short_name
-        return result
+        spoken = selection.notes(result)
+        if spoken:
+            answer["notes"] = spoken
+        return answer
+
+    def _item(self, item) -> dict[str, Any]:  # noqa: ANN001 — procurement.models.SelectionItem
+        product = self.engine.index.get(item.product_id)
+        self.shown_skus.append(item.product_id)
+        self._remember_price(item.price)
+        self._remember_price(item.total_price)
+        for mapping in item.norm_mappings:
+            if mapping.item_code:
+                self.norm_refs.add((mapping.doc_id, mapping.item_code))
+        cited = selection.citation(item)
+        if cited:
+            self.citations[item.product_id] = cited
+        return {
+            "sku_1c": item.product_id,
+            "name": item.name,
+            "price": price_text(item.price),
+            "stock": stock_text(product) if product is not None else str(item.availability),
+            "quantity": item.quantity,
+            "quantity_note": item.quantity_note,
+            "reason": item.reason,
+            "norm": cited,
+            "url": item.url,
+        }
+
+    def _offered(self) -> set[str]:
+        """Товары, о которых модели позволено говорить: подобранные ядром в разговоре и из корзины."""
+        cart = self.engine.storage.load_cart(self.session.user_id)
+        return {*self.shown_skus, *self.session.profile.offered, *(item.sku_1c for item in cart.items)}
 
     def _find_norm_item(self, query: str, document: str | None = None) -> dict[str, Any]:
         index = self.engine.norm_texts
@@ -328,10 +377,16 @@ class ToolBox:
         for home in [doc_id] if doc_id else homes:
             item = index.get(home, code) if home else None
             if item is not None:
-                return {"found": 1, "items": [self._item_brief(item)]}
+                return {"found": 1, "items": [self._item_brief(item, with_positions=True)]}
         return {"found": 0, "note": f"Пункта {code} нет ни в одном из разобранных приказов."}
 
-    def _item_brief(self, item) -> dict[str, Any]:  # noqa: ANN001 — norms.items.NormItem
+    def _item_brief(self, item, with_positions: bool = False) -> dict[str, Any]:  # noqa: ANN001 — norms.items.NormItem
+        """Пункт с разделами, в которых он стоит, а по номеру — и с составом раздела.
+
+        14.09 на «оснастить спортзал по 1057» консультант перечислил «1.14.2.7.2 Спортивный
+        инвентарь»: без пути не видно, что это групповые помещения для детей до года, а не
+        спортзал. Состав раздела нужен на «приведи списком оборудование по приказу».
+        """
         self.norm_refs.add((item.doc_id, item.code))
         brief = {
             "code": item.code,
@@ -341,33 +396,23 @@ class ToolBox:
         }
         if item.section:
             brief["section"] = item.section
+        index = self.engine.norm_texts
+        path = index.parents(item.doc_id, item.code)
+        if path:
+            brief["path"] = " → ".join(f"{parent.code} {parent.title}" for parent in path)
+        if with_positions:
+            positions = index.children(item.doc_id, item.code)
+            if positions:
+                brief["positions_total"] = len(positions)
+                brief["positions"] = [self._position(child) for child in positions[:MAX_POSITIONS]]
         return brief
 
-    def _norm_item(self, hits, code: str, doc_id: str | None):  # noqa: ANN001, ANN201
-        """Пункт, по которому нашлись товары, — из текста приказа или из привязки.
-
-        Документ определяется по самой находке, а не по догадке: иначе
-        формулировка одного приказа снова уедет в ответ про другой.
-        """
-        home = doc_id
-        if home is None:
-            home = next(
-                (hit.matched_doc_id for hit in hits if hit.matched_doc_id and hit.matched_code == code),
-                None,
-            )
-        if home is None:
-            return None
-        item = self.engine.norm_texts.get(home, code)
-        if item is not None:
-            self.norm_refs.add((home, code))
-            return item
-        # Текста приказа нет — берём формулировку из привязки каталога.
-        for hit in hits:
-            for ref in hit.product.norms:
-                if ref.doc_id == home and ref.item_code == code and ref.item_title:
-                    self.norm_refs.add((home, code))
-                    return _PlainItem(home, code, ref.item_title)
-        return None
+    def _position(self, item) -> dict[str, Any]:  # noqa: ANN001 — norms.items.NormItem
+        self.norm_refs.add((item.doc_id, item.code))
+        position = {"code": item.code, "title": item.title}
+        if item.quantity:
+            position["norm_quantity"] = f"{item.quantity} {item.unit or ''}".strip()
+        return position
 
     def _where_code_lives(self, code: str) -> list[str]:
         """Приказы, в которых такой пункт есть, — по текстам и по каталогу."""
@@ -415,6 +460,8 @@ class ToolBox:
         }
 
     def _get_product(self, sku_1c: str) -> dict[str, Any]:
+        if sku_1c not in self._offered():
+            return {"error": f"товара {sku_1c} не было в подборе — сначала подбери через search_products"}
         product = self.engine.index.get(sku_1c)
         if product is None:
             return {"error": f"товара с кодом {sku_1c} нет в каталоге"}
@@ -435,6 +482,8 @@ class ToolBox:
         }
 
     def _add_to_cart(self, sku_1c: str, quantity: int = 1) -> dict[str, Any]:
+        if sku_1c not in self._offered():
+            return {"error": f"товара {sku_1c} не было в подборе — в корзину кладётся только подобранное"}
         product = self.engine.index.get(sku_1c)
         if product is None:
             return {"error": f"товара с кодом {sku_1c} нет в каталоге"}
@@ -460,20 +509,6 @@ class ToolBox:
         self.handoff_reason = reason
         return {"ok": True, "contact": self.engine.settings.manager_contact}
 
-    def _brief(self, hit) -> dict[str, Any]:  # noqa: ANN001
-        product = hit.product
-        self.shown_skus.append(product.sku_1c)
-        self._remember_price(product.price)
-        self._remember_norms(product)
-        return {
-            "sku_1c": product.sku_1c,
-            "name": product.name,
-            "price": price_text(product.price),
-            "stock": stock_text(product),
-            "norm": hit.citation(),
-            "url": product.url,
-        }
-
     def _remember_norms(self, product) -> None:  # noqa: ANN001 — catalog.models.Product
         """Основания показанного товара — то, на что модель вправе сослаться."""
         for ref in product.norms:
@@ -488,6 +523,15 @@ class ToolBox:
         # и придирка к формату превратила бы проверку в источник ложных тревог.
 
 
+
+
+def _whole(value: Any) -> int | None:
+    """Граница цены от модели: число, строка с числом или ничего."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _document_id(name: str) -> str | None:

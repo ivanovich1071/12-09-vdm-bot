@@ -21,8 +21,10 @@ from catalog.search import CatalogIndex, SearchQuery
 from core.config import Settings
 from core.dialog import DialogEngine, Session
 from core.storage import Storage
+from core_api.composition import build_core
 from norms import items as norm_items
 from norms.items import ItemIndex, NormItem
+from norms.repository import FileNormRepository
 from orders.service import OrderService
 from orders.sinks import JsonlSink
 
@@ -112,18 +114,21 @@ def engine(index, tmp_path, monkeypatch) -> DialogEngine:
     )
     # Тексты приказов подменяем на два пункта: чтобы проверить «в 1057 такого
     # пункта нет», настоящие полтора мегабайта справочника не нужны.
-    engine.norm_texts = ItemIndex(
-        {
-            "order_838": {
-                "2.1.14": NormItem("order_838", "2.1.14", "Игровые наборы по русскому языку"),
-                "2.20.63": NormItem("order_838", "2.20.63", "Фрезерно-гравировальный станок"),
-            },
-            "order_1057": {
-                "1.5.1": NormItem("order_1057", "1.5.1", "Спортивное оборудование и инвентарь"),
-                "1.5.1.41": NormItem("order_1057", "1.5.1.41", "Обруч гимнастический"),
-            },
-        }
-    )
+    texts = {
+        "order_838": {
+            "2.1.14": NormItem("order_838", "2.1.14", "Игровые наборы по русскому языку"),
+            "2.20.63": NormItem("order_838", "2.20.63", "Фрезерно-гравировальный станок"),
+        },
+        "order_1057": {
+            "1.5.1": NormItem("order_1057", "1.5.1", "Спортивное оборудование и инвентарь"),
+            "1.5.1.41": NormItem("order_1057", "1.5.1.41", "Обруч гимнастический"),
+        },
+    }
+    engine.norm_texts = ItemIndex(texts)
+    # Товары по пункту подбирает Procurement Core (NEXT-4.1) — по той же нормативной базе.
+    settings.preorders_dir = str(tmp_path / "preorders")
+    settings.uploads_dir = str(tmp_path / "uploads")
+    build_core(settings, engine, norms=FileNormRepository(texts))
     return engine
 
 
@@ -240,6 +245,17 @@ def test_norm_item_answers_that_the_code_does_not_exist(engine):
     assert result["found"] == 0
     assert "не содержит" in result["note"]
     assert result["also_in"]["document"].endswith("838")
+
+
+def test_section_by_code_lists_its_positions_and_each_item_its_path(engine):
+    """14.09: «1.14.2.7.2 Спортивный инвентарь» выдали за спортзал — пункту нужен путь, разделу — состав."""
+    box = tools(engine)
+    section = json.loads(box.run("find_norm_item", {"query": "1.5.1", "document": "1057"}))["items"][0]
+    item = json.loads(box.run("find_norm_item", {"query": "1.5.1.41", "document": "1057"}))["items"][0]
+
+    assert section["positions_total"] == 1 and section["positions"][0]["code"] == "1.5.1.41"
+    assert item["path"] == "1.5.1 Спортивное оборудование и инвентарь"
+    assert ("order_1057", "1.5.1.41") in box.norm_refs, "пункт из состава можно называть в ответе"
 
 
 def test_norm_item_returns_the_wording_with_its_document(engine):
