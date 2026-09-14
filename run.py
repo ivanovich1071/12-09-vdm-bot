@@ -3,6 +3,7 @@
     python run.py ingest --source data/raw/Pricelist20260826.xlsx
     python run.py import-1c --file data/raw/Pricelist20260826.xlsx  # на проверку, бот не меняется
     python run.py llm                      # проверить провайдеров модели
+    python run.py site                      # каталог с сайта → книга в формате выгрузки 1С
     python run.py media                     # фотографии с сайта → в базу знаний
     python run.py widget
     python run.py telegram
@@ -107,6 +108,17 @@ def main() -> None:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=5)
 
+    site = sub.add_parser("site", help="собрать каталог с сайта vdm.ru в формате выгрузки 1С")
+    site.add_argument("--out", help="куда записать книгу (по умолчанию data/raw/site-ДАТА.xlsx)")
+    site.add_argument("--root", action="append", default=[],
+                      help="адрес корневого раздела (можно несколько; по умолчанию — из каталога)")
+    site.add_argument("--limit-sections", type=int,
+                      help="проба: обойти столько конечных разделов; книга — только с --out")
+    site.add_argument("--fresh", action="store_true",
+                      help="начать обход заново, не продолжая прерванный")
+    site.add_argument("--cache", default="data/site/crawl.json",
+                      help="файл обхода, из которого продолжается прерванный запуск")
+
     media = sub.add_parser("media", help="набрать фотографии товаров с сайта")
     media.add_argument("--listing", action="append", default=[],
                        help="адрес страницы списка (можно указать несколько)")
@@ -134,6 +146,9 @@ def main() -> None:
 
     elif args.command == "import-1c":
         _import_1c(args)
+
+    elif args.command == "site":
+        _site(args)
 
     elif args.command == "catalog":
         _catalog(args)
@@ -439,6 +454,142 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     if engine.media.photos is not None:
         print("файлы снимков:", engine.media.photos.stats())
     print(_sync_media(engine, settings))
+
+
+def _site(args) -> None:  # noqa: ANN001 — argparse.Namespace
+    """Каталог с сайта vdm.ru: обход → книга в формате выгрузки 1С → import-1c → approve.
+
+    Выгрузок 1С не будет (заказчик, 14.09). Книга проходит обычный импорт с проверками,
+    diff и порогами — поэтому эта команда каталог бота не меняет, а только собирает файл.
+    Обход длинный и прерываемый: повторный запуск продолжает с места остановки.
+    """
+    import time
+    from collections import Counter
+    from datetime import datetime
+    from urllib.parse import urlparse
+
+    from catalog.current import read_pointer
+    from core.app import build_engine
+    from core.config import Settings
+    from media.fetcher import DEFAULT_USER_AGENT, PageFetcher
+    from site_catalog.crawl import SiteCrawler
+    from site_catalog.export import Known, build_book
+
+    settings = Settings.from_env()
+    engine = build_engine(settings)
+    products = engine.index.products
+
+    roots = args.root
+    if not roots:
+        counts: Counter[str] = Counter()
+        for product in products:
+            parts = urlparse(product.url or "")
+            segments = [segment for segment in parts.path.split("/") if segment]
+            if len(segments) >= 2 and segments[0] == "catalog":
+                counts[f"{parts.scheme}://{parts.netloc}/catalog/{segments[1]}/"] += 1
+        roots = [url for url, _ in counts.most_common()]
+    if not roots:
+        sys.exit("Не из чего взять корневые разделы: укажите --root https://vdm.ru/catalog/<раздел>/")
+
+    cache = Path(args.cache)
+    if args.fresh and cache.exists():
+        cache.unlink()
+    fetcher = PageFetcher(
+        user_agent=settings.media_user_agent or DEFAULT_USER_AGENT,
+        min_interval=settings.media_min_interval,
+        respect_robots=settings.media_respect_robots,
+        retries=4,
+        timeout=40.0,
+    )
+
+    started = last = time.monotonic()
+
+    def progress(result, _url: str) -> None:  # noqa: ANN001 — CrawlResult
+        nonlocal last
+        now = time.monotonic()
+        if now - last >= 15:
+            last = now
+            print(
+                f"  разделов {result.sections} · конечных {result.leaves} · страниц {result.pages} · "
+                f"товаров {len(result.products)} · {int(now - started) // 60} мин",
+                flush=True,
+            )
+
+    crawler = SiteCrawler(fetcher, cache, progress)
+    print(f"Обход каталога vdm.ru, корневых разделов: {len(roots)}.", flush=True)
+    if crawler.resumed:
+        print(f"  продолжаем прерванный обход: страниц уже загружено {len(crawler.pages)}", flush=True)
+    print("  Ctrl+C — остановить; повторный запуск продолжит с места остановки.", flush=True)
+    try:
+        result = crawler.crawl(roots, limit_leaves=args.limit_sections)
+    except KeyboardInterrupt:
+        sys.exit("\nОстановлено. Загруженные страницы сохранены — запустите команду ещё раз.")
+
+    print(
+        f"разделов: {result.sections}, конечных: {result.leaves}, страниц: {result.pages} "
+        f"(загружено сейчас {result.fetched}), товаров на сайте: {len(result.products)}"
+    )
+    if not result.complete:
+        print(f"Не загрузились страницы: {len(result.failed)}")
+        for url in result.failed[:10]:
+            print("   ", url)
+        sys.exit(
+            "Обход неполный — книгу не собираем: товары пропущенных разделов ушли бы в исчезнувшие.\n"
+            "Запустите ту же команду ещё раз: загруженные страницы не повторяются."
+        )
+
+    known = {
+        product.bitrix_id: Known(product.sku_1c, product.description, tuple(product.kit_contents), product.short_url)
+        for product in products
+        if product.bitrix_id is not None
+    }
+    new = [product for bitrix_id, product in result.products.items() if bitrix_id not in known]
+    if new:
+        print(f"Новых товаров: {len(new)} — открываем их страницы ради кода 1С и описания.", flush=True)
+
+    def card_progress(number: int, total: int) -> None:
+        nonlocal last
+        now = time.monotonic()
+        if now - last >= 15 or number == total:
+            last = now
+            print(f"  карточек {number}/{total}", flush=True)
+
+    try:
+        cards, failed_cards = crawler.fetch_cards(new, card_progress)
+    except KeyboardInterrupt:
+        sys.exit("\nОстановлено. Загруженное сохранено — запустите команду ещё раз.")
+    if failed_cards:
+        print(f"Не открылись страницы новых товаров: {len(failed_cards)} — эти товары в книгу не попадут.")
+    for card in cards.values():
+        # Фото и характеристики новых товаров — в кэш снимков: их перенесёт `media --sync`.
+        if card.sku and card.images:
+            engine.storage.save_media(card.sku, card.images, source="card")
+        if card.sku and card.attributes:
+            engine.storage.save_attributes(card.sku, card.attributes)
+
+    missing = sum(1 for bitrix_id in known if bitrix_id not in result.products)
+    book, report = build_book(result, known, cards)
+    if args.limit_sections and not args.out:
+        print(f"Проба: товаров {report.products}, из них уже в каталоге {report.known}, новых {report.new}.")
+        print("Книга по пробному обходу не записана: в импорте почти весь каталог ушёл бы в исчезнувшие.")
+        return
+
+    out = Path(args.out or f"data/raw/site-{datetime.now():%Y%m%d-%H%M}.xlsx")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(book)
+    print(f"\nКнига: {out}")
+    print(f"  товаров: {report.products} (уже в каталоге: {report.known}, новых: {report.new}), разделов: {report.sections}")
+    if report.without_code:
+        print(f"  пропущено без кода 1С: {len(report.without_code)}")
+        for url in report.without_code[:10]:
+            print("   ", url)
+    if missing:
+        print(f"  есть в каталоге, но нет на сайте: {missing} — в diff импорта они будут исчезнувшими")
+    print("\nДальше:")
+    if read_pointer(Path(settings.kb_path).parent) is None:
+        print("  python run.py catalog init          # один раз: каталог начинает вестись версиями")
+    print(f"  python run.py import-1c --file {out}")
+    print("  python run.py catalog approve <ID из вывода импорта>")
 
 
 def _sync_media(engine, settings) -> str:  # noqa: ANN001 — DialogEngine, Settings

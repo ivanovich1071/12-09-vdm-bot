@@ -69,6 +69,57 @@ Cell = tuple[Any, int]
 
 
 def write_workbook(sheet_name: str, rows: list[list[Cell]], widths: list[float]) -> bytes:
+    return write_sheets([(sheet_name, rows, widths)])
+
+
+def write_sheets(sheets: list[tuple[str, list[list[Cell]], list[float]]]) -> bytes:
+    """Книга из нескольких листов. Выгрузке каталога нужен второй лист — ID Битрикса."""
+    count = len(sheets)
+    types = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{n}.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for n in range(1, count + 1)
+    )
+    content_types = _CONTENT_TYPES.replace(
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>',
+        types,
+    )
+    sheet_rels = "".join(
+        f'<Relationship Id="rId{n}" Target="worksheets/sheet{n}.xml" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>'
+        for n in range(1, count + 1)
+    )
+    book_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'{sheet_rels}<Relationship Id="rId{count + 1}" Target="styles.xml" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"/>'
+        "</Relationships>"
+    )
+    names = "".join(
+        f'<sheet name="{escape(name[:31])}" sheetId="{n}" r:id="rId{n}"/>'
+        for n, (name, _rows, _widths) in enumerate(sheets, 1)
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<sheets>{names}</sheets></workbook>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as book:
+        book.writestr("[Content_Types].xml", content_types)
+        book.writestr("_rels/.rels", _ROOT_RELS)
+        book.writestr("xl/workbook.xml", workbook)
+        book.writestr("xl/_rels/workbook.xml.rels", book_rels)
+        book.writestr("xl/styles.xml", _STYLES)
+        for n, (_name, rows, widths) in enumerate(sheets, 1):
+            book.writestr(f"xl/worksheets/sheet{n}.xml", _sheet_xml(rows, widths))
+    return buffer.getvalue()
+
+
+def _sheet_xml(rows: list[list[Cell]], widths: list[float]) -> str:
     body = []
     for number, row in enumerate(rows, 1):
         cells = "".join(
@@ -81,26 +132,11 @@ def write_workbook(sheet_name: str, rows: list[list[Cell]], widths: list[float])
         f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
         for index, width in enumerate(widths, 1)
     )
-    sheet = (
+    return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
         f"<cols>{cols}</cols><sheetData>{''.join(body)}</sheetData></worksheet>"
     )
-    workbook = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        f'<sheets><sheet name="{escape(sheet_name[:31])}" sheetId="1" r:id="rId1"/></sheets></workbook>'
-    )
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as book:
-        book.writestr("[Content_Types].xml", _CONTENT_TYPES)
-        book.writestr("_rels/.rels", _ROOT_RELS)
-        book.writestr("xl/workbook.xml", workbook)
-        book.writestr("xl/_rels/workbook.xml.rels", _BOOK_RELS)
-        book.writestr("xl/styles.xml", _STYLES)
-        book.writestr("xl/worksheets/sheet1.xml", sheet)
-    return buffer.getvalue()
 
 
 def _cell(ref: str, value: Any, style: int) -> str:
