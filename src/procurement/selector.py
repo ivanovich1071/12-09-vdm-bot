@@ -38,6 +38,8 @@ log = logging.getLogger(__name__)
 
 # Позиций за один показ: три помещаются на экран и не превращают чат в ленту.
 PAGE_LIMIT = 3
+# Верх для списка «N позиций» одним сообщением: «подбери из наличия 30 позиций и дай списком» (14.09).
+LIST_LIMIT = 50
 LLM_CANDIDATE_LIMIT = 30
 ALTERNATIVES = 2
 _RELEVANCE = frozenset({"article", "norm_code", "text", "trigram"})
@@ -158,7 +160,7 @@ class ProcurementSelector:
         state: CatalogRuntimeState,
         limit: int = PAGE_LIMIT,
     ) -> SelectionResult:
-        limit = max(1, min(limit, PAGE_LIMIT))
+        limit = max(1, min(limit, LIST_LIMIT))
         norm = requirement.norm
         warnings = list(requirement.warnings)
 

@@ -113,7 +113,10 @@ SALES_INTENTS = frozenset(
 )
 # Реплики, у которых своей темы нет: отвечает тот, кто вёл разговор.
 CONTINUATION_INTENTS = frozenset({GREETING, THANKS, CLARIFICATION, OTHER})
-INTENTS = CONSULTATION_INTENTS | SALES_INTENTS | CONTINUATION_INTENTS | {OFF_TOPIC, UNSUPPORTED}
+# Действие, а не разговор: «сохрани в файл», «дай скачать» — отвечает ядро, модель не зовём.
+EXPORT_REQUEST = "EXPORT_REQUEST"
+SERVICE_INTENTS = frozenset({EXPORT_REQUEST})
+INTENTS = CONSULTATION_INTENTS | SALES_INTENTS | CONTINUATION_INTENTS | SERVICE_INTENTS | {OFF_TOPIC, UNSUPPORTED}
 
 # Что агенту стоит знать о текущем запросе. Уходит в его системный промпт одной строкой:
 # консультанту — что задачу надо довести до итогового списка, продавцу — что консультация
@@ -156,6 +159,18 @@ _INJECTION = re.compile(
     r"выведи\s+(?:свой|своё|весь)\s+(?:промпт|текст\s+инструкц)|jailbreak|DAN\b",
     re.IGNORECASE,
 )
+
+# «Сохрани в файл и дай скачать», «выгрузи в эксель», «пришли списком в ворде».
+_EXPORT = re.compile(
+    # `\w*+` без отката: иначе «скачать приказ» совпадало бы по «скача» + «ть».
+    r"\bскача\w*+(?!\s+(?:приказ|перечен|документ|фгос|фоп))|\bвыгрузи\w*|"
+    r"(?:сохрани|сохранить|пришли|прислать|отправь|сделай|сформируй|дай|перешли|экспорт)\w*\s+(?:\w+\s+){0,3}?"
+    r"(?:в\s+)?(?:файл\w*|excel|эксел\w*|ексел\w*|word|ворд\w*|xlsx|docx)\b|"
+    r"\bв\s+(?:виде\s+)?(?:файл|excel|эксел\w*|ексел\w*|word|ворд\w*)\b",
+    re.IGNORECASE,
+)
+# Выгрузка каталога или базы целиком — не файл разговора, её решает охрана.
+_EXPORT_FORBIDDEN = re.compile(r"каталог\w*|\bбаз[уыае]\b|\bjson\b|\bcsv\b|\bвсе\s+товар", re.IGNORECASE)
 
 # --- Признаки продажи: конкретный товар, цена, наличие, покупка ----------------------
 #
@@ -340,6 +355,10 @@ def by_rules(
 
     if _INJECTION.search(text):
         return Decision(branch=GUARD, intent=UNSUPPORTED, reason="попытка сменить роль или вытащить инструкцию")
+    if _EXPORT.search(text) and not _EXPORT_FORBIDDEN.search(text):
+        # Файл собирает ядро из уже составленного — модель тут не нужна (14.09 она отказала: «не могу»).
+        # «Выгрузи весь каталог в JSON» сюда не попадает: это просьба к охране, а не файл разговора.
+        return _continue(profile, EXPORT_REQUEST, "просит список файлом")
 
     kind = intent.classify(text)
     if kind == intent.GREETING:
@@ -694,6 +713,7 @@ def _load_prompt() -> str:
 __all__ = [
     "CONSULT",
     "CONSULTATION_INTENTS",
+    "EXPORT_REQUEST",
     "GUARD",
     "INTENT_TITLES",
     "SALES_INTENTS",

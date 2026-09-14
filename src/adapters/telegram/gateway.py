@@ -120,9 +120,14 @@ class TelegramGateway:
             "po_consent": lambda: self._consent(user_id, arg),
             "spec_xlsx": lambda: self._spec_file(user_id, arg, "xlsx"),
             "spec_docx": lambda: self._spec_file(user_id, arg, "docx"),
+            # Комплектация или список разговора файлом — по кнопкам «Скачать Excel» и «Скачать Word».
+            "export": lambda: self._export(user_id, arg),
         }
         if verb in handlers:
             return self._guard(handlers[verb])
+        if verb == "restart_yes":
+            # Начали заново — недособранный предзаказ контакта больше не ждёт.
+            self._awaiting_contact.pop(user_id, None)
         return list(self.core.action_primitives(self.session(user_id), data))
 
     def upload(self, user_id: str, filename: str, content: bytes) -> list[TelegramReply]:
@@ -145,7 +150,24 @@ class TelegramGateway:
         if evaluation.status != "REJECTED":
             keyboard.row(Button("Оформить предзаказ", f"po_order:{order.id}"))
         keyboard.row(Button("Меню", "menu"))
-        return [Message(evaluation_text(order, evaluation), keyboard=keyboard)]
+        text = evaluation_text(order, evaluation)
+        if not evaluation.summary.get("checked") and order.warnings:
+            # «Позиций 0» без причины читается как «ничего нет в каталоге» (14.09): причина — первой.
+            text = f"{order.warnings[0].message}\n\n{text}"
+        # Итог проверки — в разговор: иначе «подбери по этому заказу» ни к чему не привязано.
+        self.core.note_dialog(session, text)
+        return [Message(text, keyboard=keyboard)]
+
+    def _export(self, user_id: str, fmt: str) -> list[TelegramReply]:
+        file = self.core.export_dialog_list(self.session(user_id), "docx" if fmt == "docx" else "xlsx")
+        if file is None:
+            return [
+                Message(
+                    "Сохранять пока нечего: сначала соберём комплектацию или подберём позиции.",
+                    keyboard=Keyboard().row(Button("Меню", "menu")),
+                )
+            ]
+        return [FileReply(file.filename, file.content, file.caption)]
 
     def _cart_specification(self, user_id: str) -> list[TelegramReply]:
         session = self.session(user_id)

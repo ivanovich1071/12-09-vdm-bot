@@ -152,6 +152,18 @@ class CoreApi:
             norm_document=profile.norm_doc_ids[0] if profile.norm_doc_ids else None,
         )
 
+    def export_dialog_list(self, session: CoreSession, fmt: str):  # noqa: ANN201 — core.exports.ExportFile | None
+        """Комплектация или список разговора файлом — кнопки «Скачать Excel» и «Скачать Word»."""
+        from core import exports
+
+        engine = self.services.engine
+        with self.runtime.turn():
+            return exports.build(engine, engine.session(session.user_ref, session.channel), fmt)
+
+    def note_dialog(self, session: CoreSession, text: str) -> None:
+        """Ответ, сыгранный мимо диалога (проверка файла заказа), — в историю разговора."""
+        self.services.engine.note(session.user_ref, session.channel, text)
+
     # --- Закупка -------------------------------------------------------------------------
 
     def create_task(self, session: CoreSession, text: str | None, fields: dict[str, Any]) -> Result:

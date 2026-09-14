@@ -131,8 +131,10 @@ class ProcurementService:
 
     # --- Подбор ---------------------------------------------------------------
 
-    def select(self, task_id: str, owner: str, *, restart: bool = False) -> SelectionResult:
-        """Следующие три позиции под задачу. Показанное не повторяется.
+    def select(
+        self, task_id: str, owner: str, *, restart: bool = False, limit: int | None = None
+    ) -> SelectionResult:
+        """Следующие позиции под задачу: три, а по списку «N позиций» — `limit`. Показанное не повторяется.
 
         Сменилась задача (помещение, документ, запрос) — прежняя выдача больше не
         считается показанной: это уже другой подбор.
@@ -144,7 +146,10 @@ class ProcurementService:
             if restart or (previous is not None and previous != requirement.signature):
                 task.shown_products = []
                 requirement = self.requirements.build(task, state.index.products)
-            result = self.selector.select(task, requirement, state)
+            if limit:
+                result = self.selector.select(task, requirement, state, limit=limit)
+            else:
+                result = self.selector.select(task, requirement, state)
 
         if result.status is not SelectionStatus.NEEDS_DETAILS:
             for item in result.items:

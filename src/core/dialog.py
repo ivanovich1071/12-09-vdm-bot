@@ -16,7 +16,7 @@ from catalog.models import Product
 from catalog.runtime import CatalogRuntime, CatalogRuntimeState
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
 from catalog.service import CatalogService
-from core import intent, selection
+from core import exports, intent, selection
 from core.config import Settings
 from core.models import CartItem, Customer
 from core.profile import DialogProfile
@@ -112,6 +112,8 @@ KEYBOARD_ACTIONS: dict[str, str] = {
     "корзина": "cart",
     "менеджер": "manager",
     "связаться с менеджером": "manager",
+    # Сначала подтверждение: «Начать заново» стирает разговор и корзину (решение заказчика 14.09).
+    "начать заново": "restart",
 }
 
 
@@ -219,6 +221,8 @@ class DialogEngine:
         self.procurement = None
         self.procurement_provider = None
         self._sessions: dict[str, Session] = {}
+        # Товары, фото которых скачать не удалось: второй раз на сайт за ними не ходим.
+        self._photo_misses: set[str] = set()
         # Пункты приказов с формулировками и поиском по словам. Файла может не
         # быть — тогда бот называет номер пункта без текста, как и раньше.
         self.norm_texts = norm_items.ItemIndex(norm_items.load())
@@ -454,6 +458,12 @@ class DialogEngine:
                 return self._clear_cart(session)
             case "restart":
                 return self._confirm_restart()
+            case "add_all":
+                return self._add_all(session)
+            case "export":
+                # Файл отдаёт адаптер канала через Core API (`TelegramGateway._export`); сюда нажатие
+                # доходит только из каналов, где файлов нет.
+                return [Message("Файл со списком пришлю в Telegram-боте.", keyboard=self._main_menu())]
             case "restart_yes":
                 return self._restart(session)
             case "manager":
@@ -483,10 +493,7 @@ class DialogEngine:
             case "more":
                 return self._more(session, int(arg or 0))
             case "select_more":
-                result = selection.more(self, session)
-                if result is None:
-                    return [Message("Больше ничего нет.", keyboard=self._main_menu())]
-                return self._selection_reply(session, result, "Ещё варианты из каталога")
+                return self.more_selection(session)
         return [Message("Не понял действие.", keyboard=self._main_menu())]
 
     # --- Команды -------------------------------------------------------------
@@ -495,10 +502,13 @@ class DialogEngine:
         command = text.split()[0].lower()
         match command:
             case "/start":
-                # Начать заново: команда и есть та самая «Перезагрузка». Люди не
-                # догадывались, что для нового подбора надо звать /start, поэтому
-                # теперь она и в меню команд, и по кнопке.
+                # Разговор уже идёт — сначала подтверждение: /start стирает разговор и корзину, а
+                # нажимают его и те, кто просто вернулся в чат (решение заказчика 14.09).
+                if session.history:
+                    return self._confirm_restart()
                 return self._restart(session)
+            case "/restart":
+                return self._confirm_restart()
             case "/menu":
                 return [Message("Чем помочь?", keyboard=self._main_menu())]
             case "/cart":
@@ -678,6 +688,97 @@ class DialogEngine:
         keyboard.row(Button("Моя корзина", "cart"), Button("Меню", "menu"))
         return ProductList(title="Подбор из каталога", cards=cards, total_found=result.matched, keyboard=keyboard)
 
+    def shortlist(self, session: Session, text: str, size: int) -> list[Response]:
+        """Список из N позиций одним сообщением — строками, с файлом и «Всё в корзину».
+
+        14.09: «подбери из наличия 30 позиций и дай списком» — просьба о перечне, а не о трёх
+        карточках (решение заказчика). Позиции — из Procurement Core; если консультант уже
+        составил комплектацию, — по её разделу перечня.
+        """
+        profile = session.profile
+        kit = profile.kit or {}
+        low = text.lower()
+        in_stock = "налич" in low or "со склада" in low
+        result = selection.select(
+            self,
+            session,
+            query="",
+            norm_item=kit.get("code") or "",
+            norm_document=kit.get("document"),
+            available_only=in_stock,
+            limit=size,
+        )
+        if result is None or result.status is SelectionStatus.NEEDS_DETAILS or not result.items:
+            return self._selection_reply(session, result, "Подобрал в каталоге")
+
+        lines = []
+        for number, item in enumerate(result.items, 1):
+            product = self.index.get(item.product_id)
+            stock = stock_text(product) if product is not None else str(item.availability)
+            point = next((mapping.item_code for mapping in item.norm_mappings if mapping.item_code), None)
+            lines.append(f"{number}. {item.name} — {price_text(item.price)} — {stock}" + (f" — п. {point}" if point else ""))
+        found = len(result.items)
+        where = f" по разделу {kit.get('code')} «{kit.get('title')}»" if kit else ""
+        head = f"{'В наличии' if in_stock else 'Подобрал'}{where}: {found} {plural(found, 'позиция', 'позиции', 'позиций')}"
+        if found < size:
+            head += f" из {size} запрошенных — больше {'в наличии ' if in_stock else ''}не нашлось"
+
+        skus = [item.product_id for item in result.items]
+        profile.shortlist = skus
+        profile.export = "shortlist"
+        profile.remember_offered(skus)
+        message = "\n".join([f"{head}:", "", *lines])
+        session.remember("assistant", message)
+        keyboard = exports.buttons()
+        keyboard.row(Button("Всё в корзину", "add_all"), Button("Меню", "menu"))
+        return [Message(message, keyboard=keyboard)]
+
+    def more_selection(self, session: Session) -> list[Response]:
+        """Следующая страница того же подбора — на «а ещё что есть» и на кнопку «Показать ещё»."""
+        result = selection.more(self, session)
+        if result is None:
+            return [Message("Больше ничего нет.", keyboard=self._main_menu())]
+        return self._selection_reply(session, result, "Ещё варианты из каталога")
+
+    def _add_all(self, session: Session) -> list[Response]:
+        """«Всё в корзину» под списком N позиций: по одной штуке каждой."""
+        cart = self.storage.load_cart(session.user_id)
+        added = 0
+        for sku in session.profile.shortlist:
+            product = self.index.get(sku)
+            if product is None:
+                continue
+            norm = product.norm_for(session.profile.audience, session.profile.room or "")
+            cart.add(
+                CartItem(
+                    sku_1c=product.sku_1c,
+                    name=product.name,
+                    price=product.price,
+                    quantity=1,
+                    url=product.url,
+                    norm_citation=norm.citation if norm else None,
+                )
+            )
+            added += 1
+        if not added:
+            return [Message("Список пуст — сначала подберём позиции.", keyboard=self._main_menu())]
+        self.storage.save_cart(cart)
+        return [
+            Message(
+                f"Добавил в корзину {added} {plural(added, 'позицию', 'позиции', 'позиций')}. "
+                f"В корзине {cart.count} шт. на {price_text(cart.total)}.",
+                keyboard=Keyboard().row(Button("Моя корзина", "cart"), Button("Оформить", "checkout")),
+            )
+        ]
+
+    def note(self, user_id: str, channel: str, text: str) -> None:
+        """Ответ, сыгранный мимо диалога, — в историю разговора: итог проверки присланного файла."""
+        with self.runtime.turn():
+            session = self.session(user_id, channel)
+            self._sync(session)
+            session.remember("assistant", text)
+            self._remember(session)
+
     def _offer_menu(self) -> Keyboard:
         return Keyboard().row(
             Button("Каталог", "catalog"),
@@ -793,10 +894,25 @@ class DialogEngine:
         if self.media is None:
             return None
         try:
-            return self.media.local_photo(product)
+            path = self.media.local_photo(product)
         except Exception as exc:  # фото не должно ломать ответ
             log.warning("Локальное фото для %s не найдено: %s", product.sku_1c, exc)
             return None
+        if path or self.media.photos is None or product.sku_1c in self._photo_misses:
+            return path
+        # Файла нет — скачиваем сами (бот работает под VPN РФ): 14.09 фото фитбола не пришло, потому
+        # что Telegram пошёл за ним на vdm.ru по адресу. Неудачу запоминаем, чтобы не ходить снова.
+        try:
+            url = self._image(product)
+            if url:
+                self.media.photos.download(product.sku_1c, [url])
+            path = self.media.local_photo(product)
+        except Exception as exc:  # фото не должно ломать ответ
+            log.warning("Фото для %s не скачано: %s", product.sku_1c, exc)
+            path = None
+        if not path:
+            self._photo_misses.add(product.sku_1c)
+        return path
 
     def _image(self, product: Product) -> str | None:
         """Фото только для подробной карточки.

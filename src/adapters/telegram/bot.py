@@ -156,7 +156,8 @@ def to_markup(keyboard: Keyboard | None) -> InlineKeyboardMarkup | None:
 # человек именно их. Меню разгружает окно диалога: постоянные кнопки «Корзина»
 # и «Оформить» под каждым сообщением заказчик назвал перегрузом.
 COMMANDS: tuple[tuple[str, str], ...] = (
-    ("start", "начать заново"),
+    ("start", "начать"),
+    ("restart", "начать заново"),
     ("help", "что я умею"),
     ("cart", "корзина"),
     ("spec", "спецификация из корзины"),
@@ -166,15 +167,16 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 # Постоянная клавиатура под полем ввода. Сам список команд Telegram рисует только
-# столбцом — это UI клиента, раскладку задать нечем. Строку кнопок даёт вот эта
-# клавиатура: три частых действия всегда под рукой, остальное остаётся в «Меню».
+# столбцом — это UI клиента, раскладку задать нечем. Строки кнопок даёт вот эта
+# клавиатура: частые действия всегда под рукой, остальное остаётся в «Меню».
 # Нажатие приходит обычным текстом, разбирает его ядро (`dialog.KEYBOARD_ACTIONS`).
-PERSISTENT_BUTTONS: tuple[str, ...] = ("Каталог", "Моя корзина", "Менеджер")
+# «Начать заново» — с подтверждением, корзина очищается (решение заказчика 14.09).
+PERSISTENT_BUTTONS: tuple[tuple[str, ...], ...] = (("Каталог", "Моя корзина"), ("Менеджер", "Начать заново"))
 
 
 def persistent_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=title) for title in PERSISTENT_BUTTONS]],
+        keyboard=[[KeyboardButton(text=title) for title in row] for row in PERSISTENT_BUTTONS],
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Напишите, что нужно подобрать",
@@ -208,9 +210,9 @@ def render_card(card: ProductCard) -> str:
     if card.norms:
         lines.append("")
         lines.append("<b>Основание:</b>")
-        lines += [f"• {_escape(line)}" for line in card.norms]
+        lines += [f"• {code_numbers(_escape(line))}" for line in card.norms]
     elif card.citation:
-        lines.append(f"Основание: {_escape(card.citation)}")
+        lines.append(f"Основание: {code_numbers(_escape(card.citation))}")
 
     # Код в характеристиках дублирует код 1С, он уже выведен строкой выше.
     extra = [(k, v) for k, v in product.attributes.items() if k.lower() != "код"]
@@ -218,9 +220,14 @@ def render_card(card: ProductCard) -> str:
         lines.append("")
         lines += [f"{_escape(name)}: {_escape(value)}" for name, value in extra]
 
-    if product.description:
+    # Основание уже названо строкой выше — абзац «Соответствует Приказу №1057 … ФЕДЕРАЦИИ» на 600
+    # знаков из описания сайта его только повторяет (14.09 он шёл в каждой карточке).
+    description = product.description or ""
+    if card.norms or card.citation:
+        description = _NORM_BOILERPLATE.sub("", description).strip()
+    if description:
         lines.append("")
-        lines.append(_escape(product.description))
+        lines.append(_escape(description))
     if product.kit_contents:
         lines.append("")
         lines.append("<b>Состав комплекта:</b>")
@@ -238,6 +245,11 @@ def render_list_header(items: ProductList) -> str:
     return f"<b>{_escape(items.title)}</b>"
 
 
+# Абзац описания сайта, повторяющий основание: «Соответствует Приказу №1057 от 25 декабря 2024 г
+# "ОБ УТВЕРЖДЕНИИ ПЕРЕЧНЯ…" МИНИСТЕРСТВА ПРОСВЕЩЕНИЯ РОССИЙСКОЙ ФЕДЕРАЦИИ» — до пустой строки.
+_NORM_BOILERPLATE = re.compile(r"Соответствует\s+Приказу\b.*?(?=\n\s*\n|\Z)", re.IGNORECASE | re.DOTALL)
+
+
 def render_list_item(card: ProductCard) -> str:
     product = card.product
     lines = [
@@ -245,7 +257,7 @@ def render_list_item(card: ProductCard) -> str:
         f"{price_text(product.price)} · {stock_text(product)}",
     ]
     if card.citation:
-        lines.append(_escape(card.citation))
+        lines.append(code_numbers(_escape(card.citation)))
     return "\n".join(lines)
 
 
@@ -280,6 +292,7 @@ async def send(
     storage=None,  # noqa: ANN001
     origin: TgMessage | None = None,
     persistent: bool = False,
+    edit_cards: bool = False,
 ) -> None:
     for response in responses:
         markup = to_markup(getattr(response, "keyboard", None))
@@ -294,8 +307,10 @@ async def send(
         # Изменение количества правит то сообщение, под которым нажали кнопку.
         # Раньше каждое «+» присылало новую копию корзины, изменений в ней было
         # не разглядеть, и человек жал ещё раз — так в чате и появлялись пять
-        # одинаковых карточек подряд.
-        if getattr(response, "replace", False) and origin is not None:
+        # одинаковых карточек подряд. «Подробнее» (`edit_cards`) так же раскрывает
+        # карточку на месте.
+        replace = getattr(response, "replace", False) or (edit_cards and isinstance(response, ProductCard))
+        if replace and origin is not None:
             text = _replacement_text(response)
             if text is not None and await _edit(bot, origin, text, markup):
                 continue
@@ -346,6 +361,9 @@ async def _edit(bot: Bot, origin: TgMessage, text: str, markup) -> bool:  # noqa
     или текст не изменился вовсе. Ни один из случаев не повод потерять ответ —
     поэтому при неудаче вызывающая сторона просто отправляет новое сообщение.
     """
+    if origin.photo and len(text) > CAPTION_LIMIT:
+        # Подпись к фото длиннее не бывает, а обрезанная карточка хуже новой.
+        return False
     try:
         if origin.photo:
             await bot.edit_message_caption(
@@ -471,6 +489,8 @@ def build_dispatcher(gateway: TelegramGateway) -> Dispatcher:
             # «Начать заново» кнопкой возвращает то же приветствие, что и /start,
             # — и строку кнопок вместе с ним.
             persistent=data == "restart_yes",
+            # «Подробнее» раскрывает карточку на месте: 14.09 три нажатия дали три одинаковые карточки.
+            edit_cards=data.startswith("card:"),
         )
 
     @dispatcher.message(F.document)
@@ -485,6 +505,11 @@ def build_dispatcher(gateway: TelegramGateway) -> Dispatcher:
         content = buffer.read() if buffer is not None else b""
         name = document.file_name or "order"
         await _reply(bot, chat, gateway, lambda: gateway.upload(user, name, content))
+        # Подпись к файлу — такая же реплика, как текст: 14.09 «подбери из наличия 30 позиций и дай
+        # списком» пришло подписью к docx и потерялось.
+        caption = (message.caption or "").strip()
+        if caption:
+            await _reply(bot, chat, gateway, lambda: gateway.text(user, caption))
 
     @dispatcher.message(F.contact)
     async def on_contact(message: TgMessage, bot: Bot) -> None:
@@ -509,6 +534,7 @@ async def _reply(  # noqa: ANN001
     work,
     origin: TgMessage | None = None,
     persistent: bool = False,
+    edit_cards: bool = False,
 ) -> None:
     """Ответ на сообщение: считаем в отдельном потоке, показываем «печатает».
 
@@ -539,7 +565,7 @@ async def _reply(  # noqa: ANN001
         return
 
     try:
-        await send(bot, chat_id, responses, source.storage, origin, persistent=persistent)
+        await send(bot, chat_id, responses, source.storage, origin, persistent=persistent, edit_cards=edit_cards)
     except TelegramNetworkError as exc:
         # Ответ уже посчитан, но связь оборвалась. Молчим в чат и остаёмся живыми:
         # опрос продолжится, а человек повторит вопрос.
@@ -609,16 +635,52 @@ _MD_BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
 _MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)\"<>]+)\)")
 
 
+# Разделитель markdown-таблицы: «|---|:---:|».
+_MD_TABLE_RULE = re.compile(r"^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?$")
+# Номер пункта из четырёх чисел — «1.5.1.35» — Telegram принимает за IP-адрес и делает ссылкой.
+_IP_LIKE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
+_TAG = re.compile(r"(<[^>]+>)")
+
+
 def render_text(text: str) -> str:
     """Ответ модели для Telegram: экранирование и простая разметка в HTML.
 
     Живой прогон 14.09: консультант писал комплектацию с `###` и `**` вопреки промпту, и
     Telegram показал бы звёздочки и решётки как есть. Заголовок и жирный переводятся в
     `<b>` в пределах строки — поэтому разбивка ответа по строкам тег не разрывает.
+    Markdown-таблица становится строками «•», а номера вида «1.5.1.35» — `<code>`.
     """
-    html = _MD_HEADING.sub(r"<b>\1</b>", _escape(text))
+    html = _MD_HEADING.sub(r"<b>\1</b>", _escape(_without_tables(text)))
     html = _MD_LINK.sub(r'<a href="\2">\1</a>', html)
-    return _MD_BOLD.sub(r"<b>\1</b>", html)
+    return code_numbers(_MD_BOLD.sub(r"<b>\1</b>", html))
+
+
+def code_numbers(html: str) -> str:
+    """Номера пунктов, похожие на IP-адрес, — в `<code>`, чтобы не стали ссылкой. Внутри тегов не трогаем."""
+    parts = _TAG.split(html)
+    return "".join(part if part.startswith("<") else _IP_LIKE.sub(r"<code>\1</code>", part) for part in parts)
+
+
+def _without_tables(text: str) -> str:
+    """Markdown-таблица — строками «•»: Telegram таблиц не рисует и показывает «| № | Товар |» как есть (14.09)."""
+    lines: list[str] = []
+    table_row = False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if "-" in stripped and _MD_TABLE_RULE.match(stripped):
+            # Строка над разделителем — заголовок таблицы: в списке он не нужен.
+            if table_row and lines:
+                lines.pop()
+            table_row = False
+            continue
+        if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 3:
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            lines.append("• " + " — ".join(cell for cell in cells if cell))
+            table_row = True
+            continue
+        table_row = False
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def use_compatible_event_loop() -> None:

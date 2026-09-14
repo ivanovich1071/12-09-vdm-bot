@@ -108,10 +108,53 @@ class WordOrderParser:
             tables.append(RawTable(f"Таблица {number}", tuple(rows)))
         warnings = ()
         if not tables:
-            warnings = (
-                Notice("NO_TABLES", "В документе Word нет таблиц — позиции заказа не найдены."),
-            )
+            # Таблицы нет — бывает список строками: 14.09 в Word вставили комплектацию бота
+            # («1.13.3.3.27 Логопедические зонды — набор, 1 шт.»), и проверка сказала «позиций 0».
+            rows = _paragraph_rows(root)
+            if rows:
+                tables.append(RawTable("Текст документа", tuple(rows)))
+            else:
+                warnings = (
+                    Notice(
+                        "NO_TABLES",
+                        "В документе Word нет ни таблицы, ни списка позиций с номерами пунктов — "
+                        "позиции заказа не найдены.",
+                    ),
+                )
         return RawDocument(self.name, tuple(tables), warnings)
+
+
+# Строка списка: «1.13.3.3.27 Логопедические зонды — набор, 1 шт.», «1.13.3.3.16–1.13.3.3.18 Картинки — 4 комплекта».
+_LIST_LINE = re.compile(
+    r"^\s*(?:\d{1,3}[.)]\s+)?(\d{1,2}(?:\.\d{1,3}){2,6})(?:\s*[–—-]\s*\d{1,2}(?:\.\d{1,3}){2,6})?\s+(\S.*)$"
+)
+_LINE_QUANTITY = re.compile(r"(\d{1,4})\s*(?:шт|компл|набор|ед|экз)\w*\.?", re.IGNORECASE)
+
+
+def _paragraph_rows(root: ET.Element) -> list[RawRow]:
+    """Позиции из текста документа: строка с номером пункта — позиция, количество — «N шт.»."""
+    lines: list[str] = []
+    for paragraph in root.iter(f"{W}p"):
+        current: list[str] = []
+        for node in paragraph.iter():
+            if node.tag == f"{W}t" and node.text:
+                current.append(node.text)
+            elif node.tag == f"{W}tab":
+                current.append(" ")
+            elif node.tag in (f"{W}br", f"{W}cr"):
+                lines.append("".join(current))
+                current = []
+        lines.append("".join(current))
+    rows = [RawRow(0, ("Пункт", "Наименование", "Количество"))]
+    for number, line in enumerate(lines, 1):
+        match = _LIST_LINE.match(line)
+        if match is None:
+            continue
+        code, rest = match.groups()
+        parts = [part.strip() for part in re.split(r"\s+[—–]\s+", rest) if part.strip()]
+        quantity = next((found.group(1) for part in parts[1:] if (found := _LINE_QUANTITY.search(part))), "")
+        rows.append(RawRow(number, (code, parts[0] if parts else rest, quantity)))
+    return rows if len(rows) > 1 else []
 
 
 class PdfOrderParser:

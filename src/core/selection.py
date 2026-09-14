@@ -44,6 +44,7 @@ def select(
     norm_document: str | None = None,
     available_only: bool | None = None,
     budget: int | None = None,
+    limit: int | None = None,
 ) -> SelectionResult | None:
     """Следующие позиции под задачу разговора. `None` — Procurement Core не подключён.
 
@@ -78,7 +79,7 @@ def select(
     fresh = [sku for sku in profile.rejected if sku not in task.rejected_products]
     if fresh:
         service.reject(task.id, session.user_id, fresh)
-    return service.select(task.id, session.user_id)
+    return service.select(task.id, session.user_id, limit=limit)
 
 
 def more(engine: DialogEngine, session: Session) -> SelectionResult | None:
@@ -108,7 +109,10 @@ def citation(item: SelectionItem) -> str | None:
     mappings = item.norm_mappings
     if not mappings:
         return None
-    return next((mapping for mapping in mappings if mapping.item_code), mappings[0]).citation
+    # Первым — пункт, названный в причине подбора: 14.09 текст писал «пункт 1.14.2.7.2.3», а
+    # карточка того же фитбола под ним — «позиция 1.5.1.35».
+    named = next((m for m in mappings if m.item_code and f"пункт {m.item_code}," in item.reason), None)
+    return (named or next((mapping for mapping in mappings if mapping.item_code), mappings[0])).citation
 
 
 def question(missing: tuple[str, ...] | list[str]) -> str:

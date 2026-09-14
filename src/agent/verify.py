@@ -157,6 +157,21 @@ def invented_norm_refs(
     return invented
 
 
+def without_unverified(answer: str, prices: set[int], refs: set[tuple[str, str]]) -> str:
+    """Ответ без строк, где есть неподтверждённая сумма или пункт приказа.
+
+    Консультанту выдача каталога вместо ответа не годится. 14.09 на «дай консультацию… кабинет
+    логопеда» дважды не подтвердился один пункт, и человек получил фитбол и тактильные мячики,
+    хотя остальная комплектация была подтверждена инструментом. Теряла её одна строка.
+    """
+    kept = [
+        line
+        for line in (answer or "").splitlines()
+        if not invented_prices(line, prices) and not invented_norm_refs(line, refs)
+    ]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
 def describe_refs(refs: set[tuple[str | None, str]]) -> str:
     """Человеческий список ссылок для просьбы переписать ответ."""
     from norms import documents as docs

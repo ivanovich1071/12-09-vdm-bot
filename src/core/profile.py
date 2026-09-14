@@ -106,6 +106,12 @@ _REGION = re.compile(
 _REJECTION = re.compile(
     r"не\s+подход\w+|\bне\s+то\b|\bдорог\w+|\bдешевле\b|не\s+нужн\w+", re.IGNORECASE
 )
+# Объект целиком, а не помещение: «открыли детский сад», «рекомендации по оснащению сада».
+_NEW_OBJECT = re.compile(
+    r"\bоткрыл\w*|\bоткрыва\w*|\bоснащени\w*|\bоснасти\w*|\bоснащаем\b|\bукомплект\w*|\bрекомендац\w*|"
+    r"\bцеликом\b|\bпострои\w*|\bнов(?:ый|ого|ом)\s+(?:детск\w+\s+)?сад",
+    re.IGNORECASE,
+)
 
 
 # Человеческие названия возражений — для строки «незакрытое возражение» в промпте.
@@ -162,6 +168,14 @@ class DialogProfile:
     # маршрут решает намерение новой реплики.
     last_agent: str | None = None  # consult | sell
     intent: str | None = None
+    # Комплектация, которую составил консультант: документ, раздел, позиции с количеством по
+    # перечню — из результата `find_norm_item`, не из текста модели. 14.09 список жил только
+    # текстом ответа, и на «сохрани в файл» выгружать было нечего.
+    kit: dict[str, Any] | None = None
+    # Коды 1С последнего списка «N позиций» — для файла и кнопки «Всё в корзину».
+    shortlist: list[str] = field(default_factory=list)
+    # Что отдавать файлом — `kit` или `shortlist`: то, что показано последним.
+    export: str | None = None
 
     @property
     def audience(self) -> str | None:
@@ -224,6 +238,7 @@ class DialogProfile:
                 self.deadline,
                 self.region,
                 self.offered,
+                self.kit,
             )
         )
 
@@ -238,6 +253,13 @@ class DialogProfile:
         low = (text or "").lower()
         if not low:
             return changed
+
+        # Новый объект целиком сбрасывает прежнюю задачу. 14.09 после кабинета логопеда пришло «мы
+        # открыли частный детский сад, дай рекомендации по его оснащению»: помещение осталось в
+        # профиле, промпт запрещал переспрашивать — и бот снова выдал перечень логопеда.
+        if self.room and _NEW_OBJECT.search(low) and _first_match(low, _INSTITUTIONS) and not _first_match(low, _ROOMS):
+            self.reset_task()
+            changed.append("task")
 
         if self.institution is None:
             self.institution = _first_match(low, _INSTITUTIONS)
@@ -289,6 +311,24 @@ class DialogProfile:
             changed.append("rejected")
         return changed
 
+    def reset_task(self) -> None:
+        """Новая задача: забыть помещение, возраст, показанное, комплектацию и задачу закупки.
+
+        Учреждение, документ, бюджет и срок остаются — они про объект, а не про кабинет.
+        """
+        self.room = None
+        self.age = None
+        self.offered = []
+        self.rejected = []
+        self.procurement_task_id = None
+        self.kit = None
+        self.shortlist = []
+        self.export = None
+
+    def remember_kit(self, kit: dict[str, Any]) -> None:
+        self.kit = kit
+        self.export = "kit"
+
     def remember_offered(self, skus: list[str]) -> None:
         for sku in skus:
             if sku not in self.offered:
@@ -330,7 +370,18 @@ class DialogProfile:
             )
         if self.objection != "none" and not self.objection_handled:
             lines.append(f"- Незакрытое возражение: {_OBJECTION_NAMES.get(self.objection, self.objection)}")
-        lines += ["", "Это уже сказано пользователем. Переспрашивать перечисленное запрещено."]
+        if self.kit:
+            count = len(self.kit.get("positions") or [])
+            names = _doc_names([self.kit.get("document") or ""])
+            lines.append(
+                f"- Составлена комплектация: {names[0] + ', ' if names else ''}раздел {self.kit.get('code')} "
+                f"«{self.kit.get('title')}», позиций {count}; полный список человек скачивает файлом"
+            )
+        lines += [
+            "",
+            "Это уже сказано пользователем. Переспрашивать перечисленное не нужно. Если новая реплика меняет "
+            "задачу — другое помещение или объект целиком, — отвечай на новую реплику, а не на прежнюю задачу.",
+        ]
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -352,6 +403,9 @@ class DialogProfile:
             "ready_to_see": self.ready_to_see,
             "last_agent": self.last_agent,
             "intent": self.intent,
+            "kit": self.kit,
+            "shortlist": self.shortlist,
+            "export": self.export,
         }
 
     @classmethod

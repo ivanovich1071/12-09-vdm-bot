@@ -41,7 +41,15 @@ from pathlib import Path
 
 from agent.client import ChatClient, LLMError
 from agent.providers import LLMRouter
-from agent.routing import CONSULT, GUARD, INTENT_TITLES, SELL, Decision, Orchestrator
+from agent.routing import (
+    CONSULT,
+    EXPORT_REQUEST,
+    GUARD,
+    INTENT_TITLES,
+    SELL,
+    Decision,
+    Orchestrator,
+)
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from agent.verify import (
     describe_refs,
@@ -50,8 +58,9 @@ from agent.verify import (
     prices_in,
     promises_goods,
     without_promises,
+    without_unverified,
 )
-from core import intent, selection
+from core import exports, intent, selection
 from core.ui import Button, Keyboard, Message, ProductCard, Response
 
 log = logging.getLogger(__name__)
@@ -74,6 +83,21 @@ _REWRITE_HINT = (
 
 # Короче этого остаток ответа после вырезания обещания — вежливость, а не ответ.
 MIN_KEPT = 40
+# Сколько знаков отвергнутого ответа пишем в журнал хода — хватает, чтобы увидеть, что выдумано.
+DISCARDED_KEPT = 1500
+# Длинные ответы ассистента в истории для модели: полная комплектация уже лежит в профиле.
+HISTORY_CHARS = 1500
+_UNVERIFIED_NOTE = (
+    "Часть пунктов по тексту приказа не подтвердилась — их я не привожу. Назовите номер раздела "
+    "перечня, и я сверю состав по нему."
+)
+# Вопрос консультанта, когда подтвердить не удалось ничего. Выдачу каталога вместо консультации
+# не показываем: 14.09 на «дай консультацию… кабинет логопеда» пришли фитбол и мячики.
+_CONSULT_RETRY = (
+    "Пункты перечня по этому вопросу подтвердить по тексту приказа не получилось, а называть их по "
+    "памяти я не буду. Назовите помещение или раздел перечня — например, «1.13.3», — и я соберу "
+    "комплектацию по нему."
+)
 # Один вопрос по неснятому возражению, когда от ответа модели ничего не осталось. Порядок —
 # первый шаг работы с возражением из промпта продавца: понять, что именно мешает.
 _OBJECTION_QUESTIONS = {
@@ -100,7 +124,8 @@ _INSIST = (
 # Код 1С в ответе модели: она обязана его называть, чтобы карточки сошлись с
 # текстом, а перед показом человеку код вырезается — он служебный.
 _CODE_MENTION = re.compile(
-    r"[ \t]*[(\[]?[ \t]*(?:\*\*)?(?:код\s*1\s*[СCc]|артикул)[\s*:]*[A-Za-z0-9А-ЯЁа-яё\-]+[ \t]*[)\]]?",
+    # «Артикул» — только целым словом: 14.09 «Артикуляционная моторика» превратилась в «, мимика».
+    r"[ \t]*[(\[]?[ \t]*(?:\*\*)?(?:код\s*1\s*[СCc]|артикул(?![а-яё]))[\s*:]*[A-Za-z0-9А-ЯЁа-яё\-]+[ \t]*[)\]]?",
     re.IGNORECASE,
 )
 # Пункт списка, от которого после вырезания кода ничего не осталось: «- **Код 1С:** 42639» → «-».
@@ -209,6 +234,13 @@ class SalesAgent:
             "cards": {"allowed": show_cards, "reason": reason},
         }
 
+        # Файл, следующая страница и список из N позиций — действия, а не разговор: отвечает ядро,
+        # без модели. 14.09 на «сохрани в файл» модель ответила «не могу», на «а ещё что есть» —
+        # таблицей, а «подбери из наличия 30 позиций» свела к трём карточкам.
+        service = self._service_reply(session, text, decision)
+        if service is not None:
+            return service
+
         tools = ToolBox(self.engine, session)
         messages = [
             {"role": "system", "content": self._system_prompt(session, decision)},
@@ -245,9 +277,16 @@ class SalesAgent:
         if tools.norm_lookups:
             session.route["norm_lookups"] = tools.norm_lookups
 
-        answer = self._verified(answer, messages, tools, text, session, tools_for(decision.branch))
+        answer = self._verified(
+            answer, messages, tools, text, session, tools_for(decision.branch), decision.branch
+        )
+        if decision.branch == CONSULT and tools.kit:
+            session.profile.remember_kit(tools.kit)
         if not answer:
             session.route["discarded_answer"] = True
+            if decision.branch == CONSULT:
+                # Консультацию выдачей каталога не заменяем: 14.09 вместо неё пришли фитбол и мячики.
+                return self._consult_question(session, tools, decision)
             return self.engine.offer(session, text)
 
         answer = session.masker.unmask(answer)
@@ -435,12 +474,16 @@ class SalesAgent:
         question: str,
         session,
         schemas: list[dict] | None = None,
+        branch: str = SELL,
     ) -> str:
         """Ответ, в котором каждая сумма и каждый пункт приказа подтверждены данными.
 
         Одна попытка исправиться: модель почти всегда переписывает ответ честно,
-        когда ей называют конкретные лишние числа. Если и второй ответ выдуман,
-        возвращаем пустую строку — вызывающая сторона ответит выдачей каталога.
+        когда ей называют конкретные лишние числа. Если и второй ответ выдуман, у
+        консультанта из него убираются строки с неподтверждённым, у продавца
+        возвращается пустая строка, и вызывающая сторона отвечает подбором.
+        Отвергнутый текст пишется в журнал хода: 14.09 без него было не понять,
+        выдумала модель «пункт 33.1.2» или ошиблась проверка.
         """
         # Цены и основания за весь разговор, а не только за этот ход. Отвечая на
         # «дорого», модель ссылается на уже показанные позиции и в инструменты не
@@ -458,6 +501,7 @@ class SalesAgent:
             return answer
 
         log.warning("%s Просим переписать ответ.", complaint)
+        session.route["rewritten"] = {"complaint": complaint, "answer": answer[:DISCARDED_KEPT]}
         messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
         messages.append({"role": "user", "content": complaint + _REWRITE_HINT})
         try:
@@ -469,10 +513,18 @@ class SalesAgent:
 
         prices |= tools.prices
         refs |= tools.norm_refs
-        if self._complaint(second, prices, refs):
-            log.warning("Ответ выдуман повторно — отвечаем выдачей каталога.")
-            return ""
-        return second
+        second_complaint = self._complaint(second, prices, refs)
+        if not second_complaint:
+            return second
+        session.route["discarded"] = {"complaint": second_complaint, "answer": second[:DISCARDED_KEPT]}
+        if branch == CONSULT:
+            kept = without_unverified(second, prices, refs)
+            if len(kept) >= MIN_KEPT:
+                log.warning("Ответ консультанта выдуман повторно — строки с неподтверждённым убраны.")
+                session.route["fallback"] = "unverified_lines_removed"
+                return f"{kept}\n\n{_UNVERIFIED_NOTE}"
+        log.warning("Ответ выдуман повторно — текст модели не показываем.")
+        return ""
 
     def _complaint(
         self, answer: str, prices: set[int], refs: set[tuple[str, str]]
@@ -555,6 +607,28 @@ class SalesAgent:
         norm = product.norm_for(session.profile.audience, session.profile.room or "")
         return norm.citation if norm else None
 
+    # --- Действия без модели -------------------------------------------------------
+
+    def _service_reply(self, session, text: str, decision: Decision) -> list[Response] | None:  # noqa: ANN001
+        """Ответ ядра без модели: файл, список из N позиций, следующая страница подбора."""
+        if decision.intent == EXPORT_REQUEST:
+            session.route["fallback"] = "export"
+            return exports.offer(self.engine, session)
+        size = intent.list_size(text)
+        if size and (decision.sells or "налич" in text.lower()):
+            session.route["fallback"] = "shortlist"
+            return self.engine.shortlist(session, text, size)
+        profile = session.profile
+        if decision.sells and intent.asks_more(text) and profile.procurement_task_id and profile.offered:
+            session.route["fallback"] = "select_more"
+            return self.engine.more_selection(session)
+        return None
+
+    def _consult_question(self, session, tools: ToolBox, decision: Decision) -> list[Response]:  # noqa: ANN001
+        session.route["fallback"] = "consult_question"
+        session.remember("assistant", _CONSULT_RETRY)
+        return [Message(_CONSULT_RETRY, keyboard=self._keyboard(session, tools, decision))]
+
     def _keyboard(self, session, tools: ToolBox, decision: Decision) -> Keyboard | None:  # noqa: ANN001
         """Кнопки под ответом модели.
 
@@ -563,6 +637,9 @@ class SalesAgent:
         задачу, а ему предлагают оформить пустую корзину.
         """
         keyboard = Keyboard()
+        if decision.branch == CONSULT and tools.kit:
+            # Комплектация раздела — файлом (решение заказчика 14.09: кратко в чате, полностью в файле).
+            exports.buttons(keyboard)
         if tools.handoff_reason:
             keyboard.row(Button("Связаться с менеджером", "menu"))
         if decision.sells and self.engine.storage.load_cart(session.user_id).count:
@@ -595,7 +672,12 @@ class SalesAgent:
         """
         history = []
         for item in session.history[-HISTORY_LIMIT:]:
-            message = {"role": item["role"], "content": item["content"]}
+            content = item["content"]
+            if item["role"] == "assistant" and len(content) > HISTORY_CHARS:
+                # Комплектация на 88 позиций раздувала каждый следующий ход (14.09: 52 тыс. токенов на входе),
+                # а полностью она всё равно лежит в профиле.
+                content = content[:HISTORY_CHARS].rstrip() + "\n…(сокращено)"
+            message = {"role": item["role"], "content": content}
             if item["role"] == "assistant":
                 # Само рассуждение не храним, но поле должно присутствовать:
                 # валидатор Cloud.ru требует его у каждого ответа ассистента.

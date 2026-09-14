@@ -218,6 +218,9 @@ class ToolBox:
         self.selected = False
         # Основание каждой подобранной позиции — как его вернуло ядро. Из него карточка.
         self.citations: dict[str, str] = {}
+        # Раздел перечня с составом, разобранный в этом ходе: из него комплектация файлом.
+        # Берётся из результата инструмента, а не из текста модели.
+        self.kit: dict[str, Any] | None = None
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
         handler = getattr(self, f"_{name}", None)
@@ -405,6 +408,20 @@ class ToolBox:
             if positions:
                 brief["positions_total"] = len(positions)
                 brief["positions"] = [self._position(child) for child in positions[:MAX_POSITIONS]]
+                # Комплектация для файла — весь раздел без обрезки: в файле место есть.
+                self.kit = {
+                    "document": item.doc_id,
+                    "code": item.code,
+                    "title": item.title,
+                    "positions": [
+                        {
+                            "code": child.code,
+                            "title": child.title,
+                            "quantity": f"{child.quantity} {child.unit or ''}".strip() if child.quantity else "",
+                        }
+                        for child in positions
+                    ],
+                }
         return brief
 
     def _position(self, item) -> dict[str, Any]:  # noqa: ANN001 — norms.items.NormItem

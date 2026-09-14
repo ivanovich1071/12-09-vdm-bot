@@ -169,6 +169,36 @@ def is_short(text: str) -> bool:
     return len(words) <= SHORT_REPLY_WORDS
 
 
+# «Подбери из наличия 30 позиций и дай списком», «выведи 20 товаров» — просьба о перечне, а не о
+# трёх карточках (прогон 14.09).
+_LIST_SIZE = re.compile(r"\b(\d{1,3})\s+(?:позици\w*|товар\w*|наименовани\w*|вариант\w*)", re.IGNORECASE)
+_LIST_ASK = re.compile(
+    r"списк\w*|список|перечн\w*|подбер\w*|подобра\w*|выведи\w*|покаж\w*|\bдай\w*|пришли\w*", re.IGNORECASE
+)
+MAX_LIST = 50
+# «А ещё что есть», «покажи ещё», «ещё варианты» — следующая страница того же подбора, без новых слов.
+_MORE_ONLY = re.compile(
+    r"^\s*(?:а\s+|и\s+)?(?:что\s+)?(?:ещ[её]|дальше)"
+    r"(?:\s+(?:что|есть|что-нибудь|варианты|позиции|товары|покажи\w*|давай\w*|у\s+вас))*\s*[?!.]*\s*$|"
+    r"^\s*(?:покажи\w*|показать|давай\w*)\s+ещ[её](?:\s+\w+)?\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def list_size(text: str) -> int | None:
+    """Сколько позиций человек просит одним списком. `None` — обычный подбор страницей."""
+    match = _LIST_SIZE.search(text or "")
+    if match is None or not _LIST_ASK.search(text or ""):
+        return None
+    size = int(match.group(1))
+    return min(size, MAX_LIST) if size > 3 else None
+
+
+def asks_more(text: str) -> bool:
+    """Просьба о следующей странице подбора — без новых слов запроса."""
+    return bool(_MORE_ONLY.match(text or ""))
+
+
 def classify(text: str) -> str:
     """Одно из: greeting, small_talk, norm_code, norm_question, product, task, other.
 
@@ -220,10 +250,12 @@ __all__ = [
     "SMALL_TALK",
     "TASK",
     "asks_for_goods",
+    "asks_more",
     "asks_to_show",
     "classify",
     "describes_task",
     "is_short",
+    "list_size",
     "names_goods",
     "norm_code",
 ]
