@@ -1,0 +1,239 @@
+"""Автотест сценариев: разбор файла, тестировщик, проверки, судья, отчёт и ожидание хода — без Telegram и сети."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+from core_fixtures import products
+from qa.checks import CatalogFacts, check_turn
+from qa.judge import judge, verdict_from
+from qa.llm import parse_json
+from qa.models import BotMessage, DialogResult, Finding, Turn, Verdict
+from qa.persona import Move, move_from, next_move
+from qa.report import append_result, load_results, render
+from qa.runner import plan_dialogs, stop_time
+from qa.scenarios import parse, select, variants
+from qa.telegram import BotChat
+
+SAMPLE = """# 100 сценариев
+
+## Сценарий 7. Воспитатель — Оснастить игровой уголок «Магазин »
+
+**Категория:** Игрушки и сюжетные игры
+**Тип клиента:** B2G/B2B
+**Маршрут:** Консультант → Продажник
+**Цель:** Оснастить игровой уголок «Магазин »
+
+### Диалог: бот-консультант
+
+**Клиент:** Оснастить игровой уголок «Магазин ».
+
+**Консультант:** Уточните, пожалуйста, возраст.
+
+### Данные передачи
+
+- `category`: Игрушки и сюжетные игры
+- `required_fields`: возраст, число детей, место, бюджет
+
+### Диалог: бот-продажник
+
+**Продажник:** Принял запрос.
+
+### Ветки
+
+- **Цена:** «Покажу цену из актуальной карточки ».
+- **Строго по приказу:** «Сопоставим ваш ТЗ ».
+
+---
+
+## Сценарий 8. Родитель — Выбрать сюжетную игру ребёнку 5 лет
+
+**Цель:** Выбрать сюжетную игру ребёнку 5 лет
+
+**Клиент:** Выбрать сюжетную игру.
+"""
+
+
+class FakeModel:
+    def __init__(self, *answers: str) -> None:
+        self.answers = list(answers)
+        self.requests: list[list[dict]] = []
+
+    def complete(self, messages, tools=None, temperature=0.3, max_tokens=None):  # noqa: ANN001, ANN201
+        self.requests.append(messages)
+        return {"content": self.answers.pop(0)}
+
+
+class ReplyInlineMarkup:
+    """Кнопки под сообщением — имя класса то же, что у Telethon."""
+
+    def __init__(self, *rows: list[str]) -> None:
+        self.rows = [SimpleNamespace(buttons=[SimpleNamespace(text=label) for label in row]) for row in rows]
+
+
+def _message(number: int, text: str, markup=None):  # noqa: ANN001, ANN202
+    return SimpleNamespace(id=number, message=text, reply_markup=markup, document=None, file=None, photo=None)
+
+
+def _turn(*texts: str, kind: str = "text", said: str = "привет", seconds: float = 5.0) -> Turn:
+    return Turn(1, kind, said, seconds=seconds, messages=[BotMessage(id=i, text=text) for i, text in enumerate(texts)])
+
+
+def test_scenarios_are_parsed_from_the_customer_markdown():
+    first, second = parse(SAMPLE)
+
+    assert (first.number, first.role, first.client_type) == (7, "Воспитатель", "B2G/B2B")
+    assert first.title == "Воспитатель — Оснастить игровой уголок «Магазин»"
+    assert first.goal == "Оснастить игровой уголок «Магазин»"
+    assert first.first_message == "Оснастить игровой уголок «Магазин»."
+    assert first.required_fields == ("возраст", "число детей", "место", "бюджет")
+    assert [(branch.name, branch.expected) for branch in first.branches] == [
+        ("Цена", "Покажу цену из актуальной карточки"),
+        ("Строго по приказу", "Сопоставим ваш ТЗ"),
+    ]
+    assert "Продажник: Принял запрос." in first.reference
+    assert (second.number, second.branches, second.required_fields) == (8, (), ())
+
+
+def test_all_hundred_customer_scenarios_are_readable():
+    text = (Path(__file__).parent / "scenarios" / "vdm_100_scenarios.md").read_text(encoding="utf-8")
+    scenarios = parse(text)
+
+    assert [scenario.number for scenario in scenarios] == list(range(1, 101))
+    assert all(s.first_message and s.goal and s.role and s.required_fields for s in scenarios)
+    assert all([b.name for b in s.branches] == ["Цена", "Строго по приказу", "Нужен аналог", "Нужно срочно"] for s in scenarios)
+
+
+def test_main_paths_go_first_and_until_is_the_next_such_moment():
+    plan = plan_dialogs(parse(SAMPLE), "main+1", done={"8:основной"})
+    assert [(scenario.number, variant.name) for scenario, variant in plan] == [(7, "основной"), (7, "Цена")]
+    plan = plan_dialogs(parse(SAMPLE) + [parse(SAMPLE.replace("Сценарий 7.", "Сценарий 9."))[0]], "main+1", set())
+    assert [(s.number, v.name) for s, v in plan] == [(7, "основной"), (8, "основной"), (9, "основной"), (7, "Цена"), (9, "Цена")]
+
+    night = datetime(2026, 9, 14, 23, 0)
+    assert stop_time("06:40", night) == datetime(2026, 9, 15, 6, 40)
+    assert stop_time("23:30", night) == datetime(2026, 9, 14, 23, 30)
+    assert stop_time(None, night) is None
+
+
+def test_only_and_variants_choose_the_dialogs():
+    scenarios = parse(SAMPLE)
+    assert [s.number for s in select(scenarios, "8")] == [8]
+    assert [s.number for s in select(scenarios, "1-7, 9")] == [7]
+    assert [v.name for v in variants(scenarios[0], "main+1")] == ["основной", "Цена"]
+    assert [v.name for v in variants(scenarios[0], "all")] == ["основной", "Цена", "Строго по приказу"]
+    assert [v.name for v in variants(scenarios[1], "main+1")] == ["основной"]
+
+
+def test_tester_writes_the_first_message_from_the_scenario():
+    scenario = parse(SAMPLE)[0]
+    model = FakeModel('```json\n{"action": "text", "text": "нужен уголок магазин в группу", "reason": "начало"}\n```')
+
+    move = next_move(model, scenario, variants(scenario, "main")[0], [], 1, 8)
+
+    assert move == Move("text", "нужен уголок магазин в группу", "начало")
+    prompt = model.requests[0][1]["content"]
+    assert "Оснастить игровой уголок «Магазин»" in prompt and "ещё не начат" in prompt
+
+
+def test_tester_presses_only_existing_buttons_and_never_restarts():
+    buttons = ["Показать ещё", "Скачать Excel"]
+    assert move_from({"action": "button", "text": "показать ещё"}, buttons) == Move("button", "Показать ещё", "")
+    assert move_from({"action": "button", "text": "Моя корзина"}, buttons).kind == "text"
+    assert move_from({"action": "button", "text": "Да, начать заново"}, buttons).kind == "end"
+    assert move_from({}, buttons).kind == "end"
+
+
+def test_card_and_list_prices_are_checked_against_the_catalog():
+    product = next(item for item in products() if item.price)
+    facts = CatalogFacts(products(), {"1.5.1.7"})
+
+    card = f"{product.name}\n{product.price + 100} ₽ · в наличии\nКод 1С: {product.sku_1c}\nОснование: 1.5.1.7 и 9.9.9.9"
+    assert {finding.code for finding in check_turn(_turn(card), facts, [])} == {"PRICE_MISMATCH", "UNKNOWN_POINT"}
+    listed = f"Подобрал:\n\n1. {product.name} — {product.price + 1} ₽ — в наличии — п. 1.5.1.7"
+    assert [finding.code for finding in check_turn(_turn(listed), facts, [])] == ["PRICE_MISMATCH"]
+    exact = f"{product.name}\n{product.price} ₽ · в наличии\nКод 1С: {product.sku_1c}"
+    assert check_turn(_turn(exact), facts, []) == []
+    assert [f.code for f in check_turn(_turn("Код 1С: НЕТ-ТАКОГО"), facts, [])] == ["UNKNOWN_SKU"]
+
+
+def test_silence_slowness_markdown_and_repeats_are_noticed():
+    facts = CatalogFacts([], ())
+    silent = Turn(2, "button", "Скачать Excel", seconds=300, timed_out=True)
+    assert {f.code for f in check_turn(silent, facts, [])} == {"NO_REPLY", "FILE_MISSING"}
+    assert {f.code for f in check_turn(_turn("**Итог**\n| a | b |", seconds=200), facts, [])} == {"SLOW", "MARKDOWN"}
+    again = _turn("Для какого помещения подбираем?")
+    assert [f.code for f in check_turn(again, facts, ["Для какого помещения подбираем?"])] == ["REPEAT"]
+
+
+def test_judge_verdict_is_read_from_json():
+    scenario = parse(SAMPLE)[0]
+    result = DialogResult(7, scenario.title, scenario.role, scenario.goal, "основной", "now", turns=[_turn("ответ")])
+    model = FakeModel(
+        '{"score": 2, "goal_reached": false, "context_kept": true, "branch_handled": null, '
+        '"problems": [{"turn": 1, "severity": "критично", "problem": "не показал товары"}, {"problem": ""}], '
+        '"summary": "Цель не достигнута."}'
+    )
+
+    verdict = judge(model, scenario, variants(scenario, "main")[0], result)
+
+    assert (verdict.score, verdict.goal_reached, verdict.context_kept, verdict.branch_handled) == (2, False, True, None)
+    assert verdict.problems == [{"turn": 1, "severity": "критично", "problem": "не показал товары"}]
+    assert verdict_from({"score": "плохо"}).score == 0
+    assert parse_json('вот: {"a": 1} спасибо') == {"a": 1} and parse_json("без json") == {}
+
+
+def test_report_has_summary_table_problems_and_transcript(tmp_path):
+    turn = _turn("Мяч — 900 ₽", said="нужны мячи")
+    turn.findings = [Finding("PRICE_MISMATCH", "error", "«Мяч»: в ответе 900 ₽, в каталоге 908 ₽")]
+    result = DialogResult(
+        7,
+        "Воспитатель — Уголок | магазин",
+        "Воспитатель",
+        "цель",
+        "Цена",
+        "14.09.2026 18:00",
+        seconds=120,
+        turns=[turn],
+        verdict=Verdict(score=3, goal_reached=True, context_kept=False, problems=[{"turn": 1, "severity": "важно", "problem": "забыл возраст"}]),
+    )
+    path = tmp_path / "results.jsonl"
+    append_result(path, result)
+    loaded = load_results(path)
+    assert loaded[0].turns[0].findings[0].code == "PRICE_MISMATCH" and loaded[0].key == "7:Цена"
+
+    text = render(loaded, {"started": "14.09.2026 18:00", "Бот": "@vdm_bot"})
+    assert "| 7 | Воспитатель — Уголок \\| магазин | Цена | 1 | 5 | 5 | 1 | 0 | 3 | да | нет |" in text
+    assert "- цена не совпадает с каталогом — 1: сценарии 7" in text
+    assert "- [важно] сц. 7 (Цена, ход 1): забыл возраст" in text
+    assert "**1. Клиент:** нужны мячи" in text and "> Мяч — 900 ₽" in text
+    assert "❌ цена не совпадает с каталогом" in text
+
+
+def test_turn_waits_while_the_bot_types_and_ends_after_quiet():
+    async def talk():
+        chat = BotChat(None, None, quiet=0.3, timeout=5)
+
+        async def bot():
+            await chat._events.put(("typing", None))
+            await asyncio.sleep(0.4)
+            await chat._events.put(("message", _message(1, "Подобрал", ReplyInlineMarkup(["Показать ещё"]))))
+            await asyncio.sleep(0.1)
+            await chat._events.put(("edit", _message(1, "Подобрал 3 позиции", ReplyInlineMarkup(["Показать ещё"]))))
+
+        task = asyncio.create_task(bot())
+        exchange = await chat._collect(time.monotonic(), first_timeout=0.2)
+        await task
+        silent = await chat._collect(time.monotonic(), first_timeout=0.2)
+        return chat, exchange, silent
+
+    chat, exchange, silent = asyncio.run(talk())
+    assert [message.text for message in exchange.messages] == ["Подобрал 3 позиции"]
+    assert exchange.messages[0].edited and exchange.messages[0].buttons == ["Показать ещё"]
+    assert not exchange.timed_out and exchange.seconds >= 0.4
+    assert chat._button("показать ещё")[0] is not None
+    assert silent.timed_out and not silent.messages

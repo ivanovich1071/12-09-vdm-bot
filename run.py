@@ -8,6 +8,7 @@
     python run.py widget
     python run.py telegram
     python run.py search "мячи для спортивного зала"
+    python run.py scenarios сценарии.md --only 1-5   # автотест через Telegram, бот уже запущен
 """
 
 from __future__ import annotations
@@ -139,6 +140,23 @@ def main() -> None:
     dialogs.add_argument("--channel", help="telegram | web | max")
     dialogs.add_argument("--export", help="выгрузить в файл .md для работы над промптами")
 
+    scenarios = sub.add_parser(
+        "scenarios", help="автотест сценариев через Telegram: тестировщик на OpenRouter, отчёт в markdown"
+    )
+    scenarios.add_argument("file", nargs="?",
+                           help="markdown со сценариями (по умолчанию tests/scenarios/vdm_100_scenarios.md)")
+    scenarios.add_argument("--until", help="не начинать новый диалог после этого времени, например 06:40")
+    scenarios.add_argument("--only", help="номера сценариев, например 1-10,15")
+    scenarios.add_argument("--mode", choices=("main", "main+1", "all"), default="main+1",
+                           help="main — основной путь; main+1 — и одна ветка по очереди (по умолчанию); all — все ветки")
+    scenarios.add_argument("--turns", type=int, default=8, help="лимит реплик тестировщика в диалоге")
+    scenarios.add_argument("--out", help="папка прогона; уже существующая — продолжить с места остановки")
+    scenarios.add_argument("--model", help="модель OpenRouter (по умолчанию QA_MODEL или deepseek/deepseek-chat-v3-0324)")
+    scenarios.add_argument("--bot", help="имя бота без @ (по умолчанию QA_BOT_USERNAME или по токену бота)")
+    scenarios.add_argument("--quiet", type=float, default=8.0, help="секунд тишины, после которых ход бота закончен")
+    scenarios.add_argument("--timeout", type=float, default=300.0, help="сколько секунд ждать ответа бота на ход")
+    scenarios.add_argument("--login", action="store_true", help="только войти в Telegram тестовым аккаунтом")
+
     args = parser.parse_args()
 
     if args.command == "ingest":
@@ -241,6 +259,13 @@ def main() -> None:
             print(f"Выгружено {len(sessions)} диалогов в {args.export}")
         else:
             print(text)
+
+    elif args.command == "scenarios":
+        import asyncio
+
+        from qa.runner import main as run_scenarios
+
+        sys.exit(asyncio.run(run_scenarios(args)))
 
     elif args.command == "search":
         from catalog.runtime import CatalogRuntime

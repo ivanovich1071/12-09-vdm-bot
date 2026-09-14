@@ -241,6 +241,18 @@ def classify(text: str) -> str:
     return OTHER
 
 
+# «Подбери по этому заказу», «что есть из файла» — список по присланному заказу, а не новый подбор.
+_ORDER_REF = re.compile(
+    r"\bпо\s+(?:этому|моему|присланному|загруженному|отправленному|нашему|своему)?\s*(?:заказу|файлу|документу)\b|"
+    r"\bиз\s+(?:этого\s+|моего\s+|присланного\s+)?(?:заказа|файла)\b",
+    re.IGNORECASE,
+)
+
+
+def mentions_order(text: str) -> bool:
+    return bool(_ORDER_REF.search(text or ""))
+
+
 __all__ = [
     "GREETING",
     "NORM_CODE",
@@ -256,6 +268,7 @@ __all__ = [
     "describes_task",
     "is_short",
     "list_size",
+    "mentions_order",
     "names_goods",
     "norm_code",
 ]

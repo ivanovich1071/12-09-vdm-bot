@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 
-from catalog.models import Product
+from catalog.models import Availability, Product
 from catalog.runtime import CatalogRuntime, CatalogRuntimeState
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
 from catalog.service import CatalogService
@@ -43,6 +44,10 @@ from privacy.masking import Masker
 from procurement.models import SelectionResult, SelectionStatus
 
 log = logging.getLogger(__name__)
+
+# Помещения детского сада — разделы приказа 1057 в том порядке, в каком их оснащают чаще.
+OBJECT_SECTIONS = ("1.14", "1.5", "1.6", "1.13", "1.7", "1.8", "1.10", "1.12", "3.2", "3.3")
+_GROUP_AGE = re.compile(r"для\s+детей\s+(.+?)\s*$", re.IGNORECASE)
 
 # Приветствие открытое: кнопки — подсказка, а не единственный путь. Четыре
 # жёстких сценария на старте отсекали тех, кто пришёл с вопросом, а не с заявкой.
@@ -460,6 +465,8 @@ class DialogEngine:
                 return self._confirm_restart()
             case "add_all":
                 return self._add_all(session)
+            case "order_more":
+                return self.order_list(session, "", None, more=True)
             case "export":
                 # Файл отдаёт адаптер канала через Core API (`TelegramGateway._export`); сюда нажатие
                 # доходит только из каналов, где файлов нет.
@@ -740,6 +747,120 @@ class DialogEngine:
             return [Message("Больше ничего нет.", keyboard=self._main_menu())]
         return self._selection_reply(session, result, "Ещё варианты из каталога")
 
+    def order_list(self, session: Session, text: str, size: int | None, more: bool = False) -> list[Response]:
+        """Список по присланному заказу — одним сообщением, с файлом и «Всё в корзину».
+
+        14.09 после файла «подбери из наличия 30 позиций» и «подбери по этому заказу, выведи списком
+        то, что есть» бот спрашивал помещение: итог проверки жил только текстом, и «этот заказ» ни на
+        что не ссылался. Товары — из проверки заказа (по коду, названию или пункту перечня), цены и
+        наличие — из каталога на сейчас.
+        """
+        profile = session.profile
+        order = profile.order or {}
+        positions = order.get("positions") or []
+        in_stock = order.get("in_stock", False) if more else "налич" in text.lower() or "со склада" in text.lower()
+        rows: list[tuple[Product, str | None]] = []
+        seen: set[str] = set()
+        for position in positions:
+            product = self.index.get(position.get("sku") or "")
+            if product is None or product.id in seen:
+                continue
+            if in_stock and product.availability is not Availability.AVAILABLE:
+                continue
+            seen.add(product.id)
+            rows.append((product, position.get("point")))
+
+        start = int(order.get("shown", 0)) if more else 0
+        limit = min(size or intent.MAX_LIST, intent.MAX_LIST)
+        page = rows[start : start + limit]
+        name, where = order.get("file") or "заказ", "в наличии" if in_stock else "в каталоге"
+        if not page:
+            reply = (
+                f"По заказу «{name}» больше позиций {where} нет."
+                if more
+                else f"По заказу «{name}» {where} не нашлось ни одной из {len(positions)} строк. "
+                "Могу передать заказ менеджеру — он подберёт замены."
+            )
+            session.remember("assistant", reply)
+            keyboard = Keyboard().row(Button("Связаться с менеджером", "manager"), Button("Меню", "menu"))
+            return [Message(reply, keyboard=keyboard)]
+
+        order.update(shown=start + len(page), in_stock=in_stock)
+        head = (
+            f"По заказу «{name}» {where}: {len(rows)} {plural(len(rows), 'позиция', 'позиции', 'позиций')} "
+            f"из {len(positions)} строк"
+        )
+        if start:
+            head += f", показываю {start + 1}–{start + len(page)}"
+        elif size and len(page) < size:
+            head += f" — {size} не набралось"
+        lines = [
+            f"{number}. {product.name} — {price_text(product.price)} — {stock_text(product)}"
+            + (f" — п. {point}" if point else "")
+            for number, (product, point) in enumerate(page, start + 1)
+        ]
+        skus = [product.id for product, _ in page]
+        profile.shortlist = skus
+        profile.remember_offered(skus)
+        profile.export = "order"
+        message = "\n".join([f"{head}:", "", *lines])
+        session.remember("assistant", message)
+        keyboard = exports.buttons()
+        if start + len(page) < len(rows):
+            keyboard.row(Button("Показать ещё", "order_more"))
+        keyboard.row(Button("Всё в корзину", "add_all"), Button("Меню", "menu"))
+        return [Message(message, keyboard=keyboard)]
+
+    def object_rooms(self, session: Session) -> list[Response] | None:
+        """Детский сад целиком: помещения по разделам приказа 1057 и вопрос, с какого начать.
+
+        14.09 на «мы открыли частный детский сад, дай рекомендации по оснащению» консультант выдал
+        общий текст про мебель и игрушки без единого пункта перечня. Разделы приказа по помещениям
+        известны заранее — их называет код, число товаров — каталог. `None` — перечня 1057 нет.
+        """
+        doc_id = norm_docs.ORDER_1057.id
+        sections = [(code, self.norm_texts.get(doc_id, code)) for code in OBJECT_SECTIONS]
+        sections = [(code, item) for code, item in sections if item is not None]
+        if not sections:
+            return None
+        counts: dict[str, int] = {}
+        for product in self.index.products:
+            if not product.is_active:
+                continue
+            codes = {ref.item_code for ref in product.norms if ref.doc_id == doc_id and ref.item_code}
+            for code, _ in sections:
+                if any(point.startswith(f"{code}.") for point in codes):
+                    counts[code] = counts.get(code, 0) + 1
+
+        lines = []
+        for code, item in sections:
+            children = [
+                child for child in self.norm_texts.children(doc_id, code) if child.code.count(".") == code.count(".") + 1
+            ]
+            title = item.title
+            ages = [
+                re.sub(r"\s*-\s*", "–", match.group(1)) for child in children if (match := _GROUP_AGE.search(child.title))
+            ]
+            if ages:
+                title += f" — отдельно по возрастам: {ages[0]} … {ages[-1]}"
+            elif code == "1.13" and children:
+                title += ": " + ", ".join(re.sub(r"^Кабинет\s+", "", child.title) for child in children)
+            count = counts.get(code, 0)
+            suffix = f" (в каталоге {count} {plural(count, 'товар', 'товара', 'товаров')})" if count else ""
+            lines.append(f"• {code} {title}{suffix}")
+        text = "\n".join(
+            [
+                "Детский сад по приказу № 1057 оснащают по помещениям — у каждого в перечне свой раздел:",
+                "",
+                *lines,
+                "",
+                "С какого помещения начнём? Напишите его — например, «спортзал» или «группа 3–4 лет», — "
+                "и я разберу раздел и соберу комплектацию.",
+            ]
+        )
+        session.remember("assistant", text)
+        return [Message(text)]
+
     def _add_all(self, session: Session) -> list[Response]:
         """«Всё в корзину» под списком N позиций: по одной штуке каждой."""
         cart = self.storage.load_cart(session.user_id)
@@ -771,12 +892,17 @@ class DialogEngine:
             )
         ]
 
-    def note(self, user_id: str, channel: str, text: str) -> None:
-        """Ответ, сыгранный мимо диалога, — в историю разговора: итог проверки присланного файла."""
+    def note(self, user_id: str, channel: str, text: str, order: dict | None = None) -> None:
+        """Ответ, сыгранный мимо диалога, — в историю разговора: итог проверки присланного файла.
+
+        Проверенный заказ — ещё и в профиль: на «подбери по этому заказу» список строится по нему.
+        """
         with self.runtime.turn():
             session = self.session(user_id, channel)
             self._sync(session)
             session.remember("assistant", text)
+            if order is not None:
+                session.profile.remember_order(order)
             self._remember(session)
 
     def _offer_menu(self) -> Keyboard:

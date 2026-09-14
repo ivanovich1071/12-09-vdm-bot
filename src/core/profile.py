@@ -112,6 +112,8 @@ _NEW_OBJECT = re.compile(
     r"\bцеликом\b|\bпострои\w*|\bнов(?:ый|ого|ом)\s+(?:детск\w+\s+)?сад",
     re.IGNORECASE,
 )
+# Названа часть объекта — группа, кабинет, зал, класс, площадка: это уже не «сад целиком».
+_PART_OF_OBJECT = re.compile(r"\bгрупп\w*|\bкабинет\w*|\bзал\w*|\bкласс\w*|\bплощадк\w*|\bкомнат\w*", re.IGNORECASE)
 
 
 # Человеческие названия возражений — для строки «незакрытое возражение» в промпте.
@@ -174,8 +176,11 @@ class DialogProfile:
     kit: dict[str, Any] | None = None
     # Коды 1С последнего списка «N позиций» — для файла и кнопки «Всё в корзину».
     shortlist: list[str] = field(default_factory=list)
-    # Что отдавать файлом — `kit` или `shortlist`: то, что показано последним.
+    # Что показано последним — `kit`, `shortlist` или `order`: от этого зависят файл, «ещё» и «N позиций».
     export: str | None = None
+    # Присланный заказ: файл и строки с товарами каталога — из проверки заказа, не из текста. 14.09
+    # после файла «подбери по этому заказу» и «30 позиций из наличия» ни на что не ссылались.
+    order: dict[str, Any] | None = None
 
     @property
     def audience(self) -> str | None:
@@ -239,6 +244,7 @@ class DialogProfile:
                 self.region,
                 self.offered,
                 self.kit,
+                self.order,
             )
         )
 
@@ -257,7 +263,7 @@ class DialogProfile:
         # Новый объект целиком сбрасывает прежнюю задачу. 14.09 после кабинета логопеда пришло «мы
         # открыли частный детский сад, дай рекомендации по его оснащению»: помещение осталось в
         # профиле, промпт запрещал переспрашивать — и бот снова выдал перечень логопеда.
-        if self.room and _NEW_OBJECT.search(low) and _first_match(low, _INSTITUTIONS) and not _first_match(low, _ROOMS):
+        if self.room and whole_object(low):
             self.reset_task()
             changed.append("task")
 
@@ -324,10 +330,15 @@ class DialogProfile:
         self.kit = None
         self.shortlist = []
         self.export = None
+        self.order = None
 
     def remember_kit(self, kit: dict[str, Any]) -> None:
         self.kit = kit
         self.export = "kit"
+
+    def remember_order(self, order: dict[str, Any]) -> None:
+        self.order = order
+        self.export = "order"
 
     def remember_offered(self, skus: list[str]) -> None:
         for sku in skus:
@@ -377,6 +388,13 @@ class DialogProfile:
                 f"- Составлена комплектация: {names[0] + ', ' if names else ''}раздел {self.kit.get('code')} "
                 f"«{self.kit.get('title')}», позиций {count}; полный список человек скачивает файлом"
             )
+        if self.order:
+            positions = self.order.get("positions") or []
+            found = sum(1 for position in positions if position.get("sku"))
+            lines.append(
+                f"- Прислан заказ «{self.order.get('file')}»: строк {len(positions)}, товаров каталога нашлось "
+                f"{found}; список по заказу бот выдаёт сам"
+            )
         lines += [
             "",
             "Это уже сказано пользователем. Переспрашивать перечисленное не нужно. Если новая реплика меняет "
@@ -406,6 +424,7 @@ class DialogProfile:
             "kit": self.kit,
             "shortlist": self.shortlist,
             "export": self.export,
+            "order": self.order,
         }
 
     @classmethod
@@ -417,6 +436,21 @@ class DialogProfile:
         """
         known = set(cls().to_dict())
         return cls(**{key: value for key, value in (raw or {}).items() if key in known})
+
+
+def whole_object(text: str) -> bool:
+    """Объект целиком, без помещения: «мы открыли детский сад, дай рекомендации по оснащению».
+
+    «Открываем новую группу в детском саду» — это группа, а не сад: часть объекта названа, хотя в
+    списке помещений такой формы нет.
+    """
+    low = (text or "").lower()
+    return bool(
+        _NEW_OBJECT.search(low)
+        and _first_match(low, _INSTITUTIONS)
+        and not _first_match(low, _ROOMS)
+        and not _PART_OF_OBJECT.search(low)
+    )
 
 
 def _first_match(low: str, rules: tuple[tuple[str, str], ...]) -> str | None:

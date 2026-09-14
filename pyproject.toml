@@ -25,6 +25,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6"]
+# Автотест сценариев через Telegram пользовательским аккаунтом: python run.py scenarios.
+qa = ["telethon>=1.36"]
 
 [project.scripts]
 vdm-ingest = "ingest.build_kb:main"

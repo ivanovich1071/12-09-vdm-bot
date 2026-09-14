@@ -155,7 +155,7 @@ class TelegramGateway:
             # «Позиций 0» без причины читается как «ничего нет в каталоге» (14.09): причина — первой.
             text = f"{order.warnings[0].message}\n\n{text}"
         # Итог проверки — в разговор: иначе «подбери по этому заказу» ни к чему не привязано.
-        self.core.note_dialog(session, text)
+        self.core.note_dialog(session, text, order, evaluation)
         return [Message(text, keyboard=keyboard)]
 
     def _export(self, user_id: str, fmt: str) -> list[TelegramReply]:

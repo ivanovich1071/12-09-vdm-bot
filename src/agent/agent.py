@@ -61,6 +61,7 @@ from agent.verify import (
     without_unverified,
 )
 from core import exports, intent, selection
+from core.profile import whole_object
 from core.ui import Button, Keyboard, Message, ProductCard, Response
 
 log = logging.getLogger(__name__)
@@ -614,14 +615,27 @@ class SalesAgent:
         if decision.intent == EXPORT_REQUEST:
             session.route["fallback"] = "export"
             return exports.offer(self.engine, session)
+        profile = session.profile
         size = intent.list_size(text)
+        # Присланный заказ: «подбери по этому заказу», «из наличия 30 позиций» и «а ещё» — по его строкам.
+        if profile.order and (intent.mentions_order(text) or (size and profile.export == "order")):
+            session.route["fallback"] = "order_list"
+            return self.engine.order_list(session, text, size)
+        if profile.order and profile.export == "order" and profile.order.get("shown") and intent.asks_more(text):
+            session.route["fallback"] = "order_more"
+            return self.engine.order_list(session, text, None, more=True)
         if size and (decision.sells or "налич" in text.lower()):
             session.route["fallback"] = "shortlist"
             return self.engine.shortlist(session, text, size)
-        profile = session.profile
         if decision.sells and intent.asks_more(text) and profile.procurement_task_id and profile.offered:
             session.route["fallback"] = "select_more"
             return self.engine.more_selection(session)
+        # Детский сад целиком, без помещения — разделы приказа 1057 по помещениям и вопрос, с какого начать.
+        if whole_object(text) and profile.audience == "preschool" and not profile.room and not intent.names_goods(text):
+            rooms = self.engine.object_rooms(session)
+            if rooms is not None:
+                session.route["fallback"] = "object_rooms"
+                return rooms
         return None
 
     def _consult_question(self, session, tools: ToolBox, decision: Decision) -> list[Response]:  # noqa: ANN001

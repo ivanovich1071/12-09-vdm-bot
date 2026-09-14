@@ -160,7 +160,7 @@ class OrderEvaluator:
         where = {"line_no": item.line_no, "source_line": item.source_line}
         errors: list[Notice] = []
         warnings: list[Notice] = []
-        match = matcher.match(item)
+        match = matcher.match(item, _document(order, item))
         product = state.index.get(match.product_id) if match.product_id else None
 
         if match.status is MatchStatus.NOT_FOUND:
@@ -263,13 +263,35 @@ class OrderEvaluator:
         if document is None and point is None:
             return NormCheckStatus.NORM_UNKNOWN, None, None, "NORM_NOT_REQUESTED"
         if document is None:
-            document = DEFAULT_DOCUMENT.get(audience or "")
+            document = DEFAULT_DOCUMENT.get(audience or "") or _document_of_point(product, point)
             if document is None:
                 return NormCheckStatus.REVIEW_REQUIRED, None, point, "DOCUMENT_UNKNOWN"
         if product is None:
             return NormCheckStatus.NORM_UNKNOWN, document, point, "PRODUCT_NOT_MATCHED"
         check = self.mapping.check(product, document, point, audience)
         return check.status, document, point, check.reason
+
+
+def _document(order: UploadedOrder, item: UploadedOrderItem) -> str | None:
+    """Перечень строки — свой, из контекста заказа или по типу учреждения: по нему ищется пункт."""
+    context = order.context
+    return (
+        item.norm_document
+        or context.norm_document
+        or DEFAULT_DOCUMENT.get(institution_code(context.institution_type) or "")
+    )
+
+
+def _document_of_point(product, point: str | None) -> str | None:  # noqa: ANN001 — catalog.models.Product
+    """Приказ по привязке найденного товара к пункту строки — когда учреждение в заказе не названо.
+
+    14.09 в Telegram учреждение не прозвучало, и все 65 строк заказа ушли «норматив проверит менеджер»,
+    хотя пункт 1.13.3.3.27 есть только в приказе 1057 и товар привязан именно к нему.
+    """
+    if product is None or point is None:
+        return None
+    documents = {ref.doc_id for ref in product.norms if ref.item_code == point}
+    return documents.pop() if len(documents) == 1 else None
 
 
 def _overall(order: UploadedOrder, items: tuple[OrderEvaluationItem, ...]) -> EvaluationStatus:

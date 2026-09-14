@@ -160,9 +160,35 @@ class CoreApi:
         with self.runtime.turn():
             return exports.build(engine, engine.session(session.user_ref, session.channel), fmt)
 
-    def note_dialog(self, session: CoreSession, text: str) -> None:
-        """Ответ, сыгранный мимо диалога (проверка файла заказа), — в историю разговора."""
-        self.services.engine.note(session.user_ref, session.channel, text)
+    def note_dialog(
+        self,
+        session: CoreSession,
+        text: str,
+        order: dto.OrderOut | None = None,
+        evaluation: dto.EvaluationOut | None = None,
+    ) -> None:
+        """Ответ, сыгранный мимо диалога (проверка файла заказа), — в историю разговора.
+
+        Проверенный заказ — в профиль: строки с пунктом перечня и найденным товаром. По ним бот
+        отвечает на «подбери по этому заказу» и «из наличия 30 позиций» без модели.
+        """
+        remembered = None
+        if order is not None and evaluation is not None:
+            found = {"MATCHED_EXACT", "MATCHED_HIGH", "MATCHED_REVIEW"}
+            remembered = {
+                "id": order.id,
+                "file": order.source_file.get("filename"),
+                "positions": [
+                    {
+                        "point": item.get("norm_item"),
+                        "name": item.get("source_name"),
+                        "quantity": item.get("quantity"),
+                        "sku": item.get("product_id") if item.get("match_status") in found else None,
+                    }
+                    for item in evaluation.items[:200]
+                ],
+            }
+        self.services.engine.note(session.user_ref, session.channel, text, remembered)
 
     # --- Закупка -------------------------------------------------------------------------
 
