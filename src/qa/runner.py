@@ -20,9 +20,9 @@ from qa.checks import CatalogFacts, check_turn
 from qa.judge import judge
 from qa.llm import DEFAULT_MODEL, Model, openrouter
 from qa.models import DialogResult, Turn
-from qa.persona import next_move
+from qa.persona import Move, next_move
 from qa.report import append_result, load_results, render
-from qa.scenarios import Scenario, Variant, parse, select, variants
+from qa.scenarios import Scenario, Variant, merge, parse, select, variants
 from qa.telegram import BotChat, LoginError
 
 SESSION = Path("data/qa/tester")
@@ -61,20 +61,28 @@ async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
             return 2
         me = await chat.client.get_me()
         print(f"Вход выполнен: {me.first_name or me.username}. Бот для прогона: @{username}")
+        print(f"Id тестового аккаунта {me.id} — впишите в .env бота: QA_USER_IDS={me.id}")
         await chat.close()
         return 0
 
     if not settings.openrouter_api_key:
         print("Нужен OPENROUTER_API_KEY в .env: на нём работают тестировщик и судья.")
         return 2
-    source = Path(args.file) if args.file else DEFAULT_SCENARIOS
-    if not source.exists():
-        print(f"Файл сценариев не найден: {source}")
+    names = args.file if isinstance(args.file, list) else [args.file] if args.file else []
+    sources = [Path(name) for name in names] or [DEFAULT_SCENARIOS]
+    missing = [str(path) for path in sources if not path.exists()]
+    if missing:
+        print(f"Файл сценариев не найден: {', '.join(missing)}")
         return 2
-    scenarios = select(parse(source.read_text(encoding="utf-8")), args.only)
+    try:
+        scenarios = select(merge(*(parse(path.read_text(encoding="utf-8")) for path in sources)), args.only)
+    except ValueError as exc:
+        print(exc)
+        return 2
     if not scenarios:
-        print("В файле нет сценариев вида «## Сценарий N. Роль — Цель» (или --only их отсёк).")
+        print("В файле нет сценариев вида «## Сценарий N. …» (или --only их отсёк).")
         return 2
+    scripted = sum(1 for scenario in scenarios if scenario.script)
 
     out = Path(args.out or f"data/qa/run-{datetime.now():%Y%m%d-%H%M}")
     out.mkdir(parents=True, exist_ok=True)
@@ -86,13 +94,17 @@ async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
     judge_name = getattr(args, "judge_model", None) or os.environ.get("QA_JUDGE_MODEL") or model_name
     meta = {
         "started": f"{datetime.now():%d.%m.%Y %H:%M}",
-        "Файл сценариев": source.name,
+        "Файл сценариев": ", ".join(path.name for path in sources),
         "Бот": f"@{username}",
         "Модель тестировщика": model_name,
         "Модель судьи": judge_name,
         "Варианты": MODES[args.mode],
         "Лимит реплик тестировщика": args.turns,
     }
+    if scripted:
+        meta["Реплики клиента"] = (
+            f"у {scripted} из {len(scenarios)} сценариев — из файла по ходам, как написаны (лимит --turns к ним не применяется)"
+        )
 
     facts = CatalogFacts.load(settings)
     model = openrouter(settings, model_name)
@@ -192,8 +204,12 @@ async def play(
         if restart.timed_out:
             result.error = "бот не ответил на «Начать заново» — он запущен?"
             return result
-        for number in range(1, max_turns + 1):
-            move = await asyncio.to_thread(next_move, model, scenario, variant, result.turns, number, max_turns)
+        limit = len(scenario.script) or max_turns
+        for number in range(1, limit + 1):
+            if scenario.script:
+                move = Move("text", scenario.script[number - 1].client, "по сценарию")
+            else:
+                move = await asyncio.to_thread(next_move, model, scenario, variant, result.turns, number, max_turns)
             if move.kind == "end":
                 result.end_reason = move.reason
                 break
@@ -205,8 +221,12 @@ async def play(
             turn.findings = check_turn(turn, facts, history, said + ([move.text] if move.kind == "text" else []))
             history += [message.text for message in turn.messages]
             result.turns.append(turn)
+            # Бот упал посреди разговора: остаток сценария по пять минут ожидания на реплику не гоним.
+            if len(result.turns) >= 2 and not any(earlier.messages for earlier in result.turns[-2:]):
+                result.end_reason = "бот молчит два хода подряд"
+                break
         else:
-            result.end_reason = f"лимит {max_turns} реплик"
+            result.end_reason = "сценарий пройден до конца" if scenario.script else f"лимит {max_turns} реплик"
     except LLMAuthError:
         raise
     except Exception as exc:  # noqa: BLE001 — один сорванный диалог не останавливает прогон

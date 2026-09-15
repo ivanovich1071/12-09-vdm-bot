@@ -35,6 +35,7 @@ LABELS = {
     "DEAD_BUTTON": "кнопка менеджера не ведёт к менеджеру",
     "ZERO_PREORDER": "предзаказ на 0 ₽",
     "FALSE_HANDOFF": "«передал» без заявки",
+    "PROMISE": "скидка или бесплатная доставка без источника",
 }
 
 _PRICE = re.compile(r"(\d{1,3}(?:[   ]\d{3})+|\d+)\s*₽")
@@ -54,6 +55,9 @@ _AGE_SECTION = re.compile(r"для\s+детей\s+(?:от\s+)?(\d{1,2})\s*[-–�
 _CONTACT = re.compile(r"\+7|\b8\s*\(?\d{3}|@\w")
 _ZERO_PREORDER = re.compile(r"Предварительный заказ PO-\S+: позиций \d+ на 0 ₽")
 _HANDOFF = re.compile(r"\bпередал[аи]?\b", re.IGNORECASE)
+# Эталон сценариев 15.09 обещает «скидку 5–10 %» и «бесплатную доставку от 100 000» — у магазина таких правил нет.
+_DISCOUNT = re.compile(r"скидк\w*[^.\n]{0,40}?\d{1,2}\s*(?:[-–—]\s*\d{1,2}\s*)?%|\d{1,2}\s*%[^.\n]{0,20}скидк", re.IGNORECASE)
+_FREE_DELIVERY = re.compile(r"бесплатн\w*\s+доставк|доставк\w*[^.\n]{0,40}бесплатн", re.IGNORECASE)
 
 
 class CatalogFacts:
@@ -101,6 +105,10 @@ def check_turn(turn: Turn, facts: CatalogFacts, history: list[str], said: list[s
             findings.append(Finding("ZERO_PREORDER", "error", text.splitlines()[0][:120]))
         if _HANDOFF.search(text) and "PO-" not in text:
             findings.append(Finding("FALSE_HANDOFF", "warning", _around(text, _HANDOFF.search(text).start())))
+        if promise := _DISCOUNT.search(text):
+            findings.append(Finding("PROMISE", "error", _around(text, promise.start())))
+        elif promise := _FREE_DELIVERY.search(text):
+            findings.append(Finding("PROMISE", "warning", _around(text, promise.start())))
         if facts.points:
             for code in _POINT.findall(text):
                 if code not in facts.points:

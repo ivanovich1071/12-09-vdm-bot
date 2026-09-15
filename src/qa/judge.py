@@ -19,6 +19,8 @@ SYSTEM = """Ты — строгий QA-аналитик диалоговых б�
 Правила бота:
 - цены, наличие, коды 1С и характеристики — только из каталога, ничего не выдумывать;
 - не обещать соответствие приказу без сверки с перечнем; номера пунктов — только настоящие;
+- скидки, условия доставки и оплаты, сроки — не придумывать: скидка в процентах или бесплатная доставка без \
+источника — ошибка;
 - не давать юридических, медицинских и дефектологических заключений;
 - уточнять недостающее коротко, не анкетой; не переспрашивать то, что клиент уже сказал;
 - держать контекст: отвечать на последнюю реплику, не возвращаться к старой задаче;
@@ -35,6 +37,15 @@ SYSTEM = """Ты — строгий QA-аналитик диалоговых б�
 "summary": "2–3 предложения: что получилось и что сломалось"}"""
 
 SEVERITIES = ("критично", "важно", "мелочь")
+# Сценарии «Ход N» (15.09): хвост из семи реплик одинаков во всех 50, эталонные ответы — шаблоны с условиями,
+# которых у магазина нет («скидка 5–10 % от 150 000», «доставка по Москве бесплатна от 100 000»).
+SCRIPT_NOTE = (
+    "Реплики клиента шли строго по файлу сценария, без подстройки под ответы бота. Если реплика не вяжется "
+    "с ответом (просит «подробнее по первой», а товаров не показали), оценивай, как бот с ней справился.",
+    "Эталон по ходам — ориентир по смыслу, не текст для сверки. Условия из эталона, которых нет в каталоге "
+    "и правилах (скидка в процентах, порог бесплатной доставки, срок ответа менеджера, сертификаты на каждую "
+    "позицию), — не факты: бот, который их не повторил, прав, а повторивший — ошибся.",
+)
 
 
 def judge(model: Model, scenario: Scenario, variant: Variant, result: DialogResult) -> Verdict:
@@ -59,7 +70,17 @@ def brief(scenario: Scenario, variant: Variant, result: DialogResult) -> str:
         lines.append("Вариант: основной путь (branch_handled = null).")
     else:
         lines.append(f"Вариант — ветка «{variant.branch.name}». Ожидаемая реакция бота: «{variant.branch.expected}»")
-    if scenario.reference:
+    if scenario.script:
+        lines += ["", *SCRIPT_NOTE]
+        for number, step in enumerate(scenario.script, 1):
+            lines.append(f"ход {number}. Клиент: {step.client}")
+            if step.expected:
+                lines.append(f"  ждём от бота: {step.expected}")
+            if step.reference:
+                lines.append(f"  эталонный ответ: {_short(step.reference, 300)}")
+        if scenario.checks:
+            lines += ["", "Что проверяет сценарий:", *[f"- {check}" for check in scenario.checks]]
+    elif scenario.reference:
         lines += ["", "Эталон сценария (ориентир по смыслу, не текст для сверки слово в слово):", scenario.reference[:1500]]
     found = result.findings
     if found:
@@ -95,6 +116,10 @@ def verdict_from(data: dict) -> Verdict:
         problems=problems[:12],
         summary=str(data.get("summary") or "").strip(),
     )
+
+
+def _short(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _flag(value: object) -> bool | None:

@@ -143,13 +143,14 @@ def main() -> None:
     scenarios = sub.add_parser(
         "scenarios", help="автотест сценариев через Telegram: тестировщик на OpenRouter, отчёт в markdown"
     )
-    scenarios.add_argument("file", nargs="?",
-                           help="markdown со сценариями (по умолчанию tests/scenarios/vdm_100_scenarios.md)")
+    scenarios.add_argument("file", nargs="*",
+                           help="markdown со сценариями (по умолчанию tests/scenarios/vdm_100_scenarios.md); "
+                                "полный и урезанный файл одних сценариев можно дать вместе — они сводятся")
     scenarios.add_argument("--until", help="не начинать новый диалог после этого времени, например 06:40")
     scenarios.add_argument("--only", help="номера сценариев, например 1-10,15")
     scenarios.add_argument("--mode", choices=("main", "main+1", "all"), default="main+1",
                            help="main — основной путь; main+1 — и одна ветка по очереди (по умолчанию); all — все ветки")
-    scenarios.add_argument("--turns", type=int, default=8, help="лимит реплик тестировщика в диалоге")
+    scenarios.add_argument("--turns", type=int, default=8, help="лимит реплик тестировщика в диалоге (сценарии «Ход N» идут целиком)")
     scenarios.add_argument("--out", help="папка прогона; уже существующая — продолжить с места остановки")
     scenarios.add_argument("--model", help="модель OpenRouter (по умолчанию QA_MODEL или deepseek/deepseek-chat-v3-0324)")
     scenarios.add_argument("--judge-model", help="модель судьи (по умолчанию QA_JUDGE_MODEL или модель тестировщика)")

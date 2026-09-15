@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from core_fixtures import products
 from qa.checks import CatalogFacts, check_turn
 from qa.judge import judge, verdict_from
@@ -15,9 +17,9 @@ from qa.llm import parse_json
 from qa.models import BotMessage, DialogResult, Finding, Turn, Verdict
 from qa.persona import Move, move_from, next_move, recent_buttons
 from qa.report import append_result, load_results, render
-from qa.runner import finished, plan_dialogs, stop_time
-from qa.scenarios import parse, select, variants
-from qa.telegram import BotChat, ask_phone
+from qa.runner import finished, plan_dialogs, play, stop_time
+from qa.scenarios import merge, parse, select, variants
+from qa.telegram import BotChat, Exchange, ask_phone
 
 SAMPLE = """# 100 сценариев
 
@@ -295,3 +297,130 @@ def test_tester_presses_a_button_from_a_recent_message_instead_of_typing_it():
         Turn(2, "button", "Скачать Word", messages=[BotMessage(id=2, text="Комплектация 1.5", file="k.docx")]),
     ]
     assert move_from({"action": "button", "text": "Скачать Excel"}, recent_buttons(turns)) == Move("button", "Скачать Excel", "")
+
+
+# Формат «50 сценариев» 15.09: урезанный файл — ожидания вместо части ответов бота, полный — все ответы.
+SCRIPTED = """# 50 сценариев
+
+## Сценарий 1. Заведующая ДОУ, новостройка
+
+**Тип клиента:** B2G
+**Цель:** Оснастить 6 групп по приказу 1057
+**Удалено ходов бота:** 2 из 3 (ходы: [1, 3])
+
+---
+
+### Диалог
+
+**[БОТ ДОЛЖЕН СГЕНЕРИРОВАТЬ: стандартное приветствие]**
+
+**Ход 1. Клиент:** Оснастить 6 групп, возраст 3-7 лет .
+
+**Ход 2. Бот:** Уточните площадь.
+
+**Ход 2. Клиент:** без мебели.
+
+**[БОТ ДОЛЖЕН СГЕНЕРИРОВАТЬ: предложение передать продажнику]**
+
+**Ход 3. Клиент:** /my_data
+
+---
+
+**Что проверяет сценарий:**
+- Не обещает скидку, корректно переводит на менеджера.
+- Сохраняет спокойный тон .
+
+---
+"""
+FULL = SCRIPTED.replace("**[БОТ ДОЛЖЕН СГЕНЕРИРОВАТЬ: стандартное приветствие]**", "**Ход 1. Бот:** Здравствуйте!").replace(
+    "**[БОТ ДОЛЖЕН СГЕНЕРИРОВАТЬ: предложение передать продажнику]**", "**Ход 3. Бот:** Обещаю скидку 10 %."
+)
+
+
+class FakeChat:
+    """Бот в Telegram: на каждую реплику — заранее заданные сообщения, пустой список — молчание."""
+
+    def __init__(self, *replies: list[str]) -> None:
+        self.replies = list(replies)
+        self.sent: list[str] = []
+
+    async def restart(self) -> Exchange:
+        return Exchange(messages=[BotMessage(id=0, text="Здравствуйте!")], seconds=1)
+
+    async def send(self, text: str) -> Exchange:
+        self.sent.append(text)
+        texts = self.replies.pop(0)
+        return Exchange(messages=[BotMessage(id=len(self.sent), text=t) for t in texts], seconds=1, timed_out=not texts)
+
+    async def click(self, label: str) -> Exchange:
+        raise AssertionError(f"по сценарию «Ход N» кнопки не нажимаются: {label}")
+
+
+def test_turn_by_turn_scenarios_keep_the_client_script_and_merge_full_with_trimmed():
+    (trimmed,) = parse(SCRIPTED)
+
+    assert (trimmed.number, trimmed.role, trimmed.client_type) == (1, "Заведующая ДОУ, новостройка", "B2G")
+    assert trimmed.goal == "Оснастить 6 групп по приказу 1057"
+    assert [step.client for step in trimmed.script] == ["Оснастить 6 групп, возраст 3-7 лет.", "без мебели.", "/my_data"]
+    assert trimmed.first_message == "Оснастить 6 групп, возраст 3-7 лет."
+    # Приветствие до первой реплики не сверяется; ожидание относится к реплике перед ним.
+    assert [(s.reference, s.expected) for s in trimmed.script] == [
+        ("Уточните площадь.", ""),
+        ("", "предложение передать продажнику"),
+        ("", ""),
+    ]
+    assert trimmed.checks == ("Не обещает скидку, корректно переводит на менеджера.", "Сохраняет спокойный тон.")
+
+    (merged,) = merge(parse(SCRIPTED), parse(FULL))
+    assert [(s.reference, s.expected) for s in merged.script] == [
+        ("Уточните площадь.", ""),
+        ("Обещаю скидку 10 %.", "предложение передать продажнику"),
+        ("", ""),
+    ]
+    assert [s.number for s in merge(parse(SAMPLE), parse(SCRIPTED))] == [1, 7, 8]
+    with pytest.raises(ValueError, match="Сценарий 1 есть в двух файлах"):
+        merge(parse(SCRIPTED), parse(SCRIPTED.replace("без мебели.", "с мебелью.")))
+
+
+def test_fifty_customer_scenarios_of_both_files_merge_into_one_run():
+    folder = Path(__file__).parent / "scenarios"
+    full = parse((folder / "vdm_50_scenarios_full.md").read_text(encoding="utf-8"))
+    trimmed = parse((folder / "vdm_50_scenarios_autotest_trimmed.md").read_text(encoding="utf-8"))
+
+    merged = merge(trimmed, full)
+
+    assert [scenario.number for scenario in merged] == list(range(1, 51))
+    assert all(len(s.script) == 11 and s.goal and s.client_type and len(s.checks) == 8 for s in merged)
+    assert all(step.reference for scenario in merged for step in scenario.script)
+    # Вырезано 214 ответов, из них 50 приветствий — ожидания остаются у 164 реплик.
+    assert sum(1 for scenario in merged for step in scenario.script if step.expected) == 164
+
+
+def test_turn_by_turn_scenario_is_sent_as_written_and_judged_by_the_script():
+    (scenario,) = merge(parse(SCRIPTED), parse(FULL))
+    main = variants(scenario, "main")[0]
+    chat = FakeChat(["Уточните площадь"], ["Передам продажнику"], ["Храню корзину"])
+    judge_model = FakeModel('{"score": 4, "goal_reached": true, "context_kept": true, "summary": "ок"}')
+
+    # Лимит --turns 2 сценарий не обрезает; тестировщик-модель не вызывается (у FakeModel нет ответов).
+    result = asyncio.run(play(chat, FakeModel(), CatalogFacts([], ()), scenario, main, 2, judge_model))
+
+    assert chat.sent == ["Оснастить 6 групп, возраст 3-7 лет.", "без мебели.", "/my_data"]
+    assert result.error is None and result.end_reason == "сценарий пройден до конца" and result.verdict.score == 4
+    prompt = judge_model.requests[0][1]["content"]
+    assert "ход 2. Клиент: без мебели." in prompt and "ждём от бота: предложение передать продажнику" in prompt
+    assert "эталонный ответ: Обещаю скидку 10 %." in prompt and "- Сохраняет спокойный тон." in prompt
+
+    silent = FakeChat([], [], ["поздно"])
+    result = asyncio.run(play(silent, FakeModel(), CatalogFacts([], ()), scenario, main, 8, FakeModel('{"score": 1}')))
+    assert silent.sent == ["Оснастить 6 групп, возраст 3-7 лет.", "без мебели."]
+    assert result.end_reason == "бот молчит два хода подряд" and len(result.turns) == 2
+
+
+def test_discount_and_free_delivery_promises_are_flagged():
+    facts = CatalogFacts([], ())
+    promised = _turn("Обычно менеджер даёт дополнительную скидку 5–10%, точную цифру назовёт он.")
+    assert [(f.code, f.severity) for f in check_turn(promised, facts, [])] == [("PROMISE", "error")]
+    delivery = _turn("При заказе от 100 000 доставка по Москве бесплатна.")
+    assert [(f.code, f.severity) for f in check_turn(delivery, facts, [])] == [("PROMISE", "warning")]
+    assert check_turn(_turn("Скидку и условия доставки назовёт менеджер."), facts, []) == []
