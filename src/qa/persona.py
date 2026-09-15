@@ -49,7 +49,20 @@ class Move:
 
 def next_move(model: Model, scenario: Scenario, variant: Variant, turns: list[Turn], number: int, max_turns: int) -> Move:
     data = ask_json(model, SYSTEM, brief(scenario, variant, turns, number, max_turns), temperature=0.8, max_tokens=400)
-    return move_from(data, last_buttons(turns))
+    return move_from(data, recent_buttons(turns))
+
+
+def recent_buttons(turns: list[Turn], depth: int = 3) -> list[str]:
+    """Кнопки последних ответов бота, свежие первыми.
+
+    Под сообщением с файлом кнопок нет, а «Скачать Word» двумя сообщениями выше нажать можно. Ночью 14.09
+    тестировщик печатал такие надписи текстом, бот переспрашивал формат, и проверка насчитала 32 «повтора».
+    """
+    labels: list[str] = []
+    for turn in reversed([turn for turn in turns if turn.messages][-depth:]):
+        for message in reversed(turn.messages):
+            labels += [label for label in message.buttons if label not in labels]
+    return labels
 
 
 def brief(scenario: Scenario, variant: Variant, turns: list[Turn], number: int, max_turns: int) -> str:

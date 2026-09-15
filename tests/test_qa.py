@@ -13,11 +13,11 @@ from qa.checks import CatalogFacts, check_turn
 from qa.judge import judge, verdict_from
 from qa.llm import parse_json
 from qa.models import BotMessage, DialogResult, Finding, Turn, Verdict
-from qa.persona import Move, move_from, next_move
+from qa.persona import Move, move_from, next_move, recent_buttons
 from qa.report import append_result, load_results, render
-from qa.runner import plan_dialogs, stop_time
+from qa.runner import finished, plan_dialogs, stop_time
 from qa.scenarios import parse, select, variants
-from qa.telegram import BotChat
+from qa.telegram import BotChat, ask_phone
 
 SAMPLE = """# 100 сценариев
 
@@ -114,10 +114,19 @@ def test_main_paths_go_first_and_until_is_the_next_such_moment():
     plan = plan_dialogs(parse(SAMPLE) + [parse(SAMPLE.replace("Сценарий 7.", "Сценарий 9."))[0]], "main+1", set())
     assert [(s.number, v.name) for s, v in plan] == [(7, "основной"), (8, "основной"), (9, "основной"), (7, "Цена"), (9, "Цена")]
 
+    refused = DialogResult(1, "т", "р", "ц", "основной", "now", error="BadRequestError: USER_BOT_TO_BOT_DISABLED")
+    played = DialogResult(2, "т", "р", "ц", "основной", "now", turns=[_turn("ответ")], error="TimeoutError")
+    assert finished([refused, played]) == [played]
+
     night = datetime(2026, 9, 14, 23, 0)
     assert stop_time("06:40", night) == datetime(2026, 9, 15, 6, 40)
     assert stop_time("23:30", night) == datetime(2026, 9, 14, 23, 30)
     assert stop_time(None, night) is None
+
+
+def test_login_takes_a_phone_not_a_bot_token():
+    answers = iter(["", "123456789:AAE-token", " +79990000000 "])
+    assert ask_phone(lambda prompt: next(answers)) == "+79990000000"
 
 
 def test_only_and_variants_choose_the_dialogs():
@@ -207,7 +216,9 @@ def test_report_has_summary_table_problems_and_transcript(tmp_path):
     assert loaded[0].turns[0].findings[0].code == "PRICE_MISMATCH" and loaded[0].key == "7:Цена"
 
     text = render(loaded, {"started": "14.09.2026 18:00", "Бот": "@vdm_bot"})
-    assert "| 7 | Воспитатель — Уголок \\| магазин | Цена | 1 | 5 | 5 | 1 | 0 | 3 | да | нет |" in text
+    # Судья сказал «цель достигнута», но в ходе ошибка проверки — в итог идёт «нет», мнение судьи — рядом.
+    assert "| 7 | Воспитатель — Уголок \\| магазин | Цена | 1 | 5 | 5 | 1 | 0 | 3 | нет | да | нет |" in text
+    assert "Цель достигнута: 0 из 1 (по судье 1" in text
     assert "- цена не совпадает с каталогом — 1: сценарии 7" in text
     assert "- [важно] сц. 7 (Цена, ход 1): забыл возраст" in text
     assert "**1. Клиент:** нужны мячи" in text and "> Мяч — 900 ₽" in text
@@ -237,3 +248,50 @@ def test_turn_waits_while_the_bot_types_and_ends_after_quiet():
     assert not exchange.timed_out and exchange.seconds >= 0.4
     assert chat._button("показать ещё")[0] is not None
     assert silent.timed_out and not silent.messages
+
+
+def test_night_problems_are_caught_by_code():
+    """Ночь 14.09: не тот файл, чужой возраст, иероглифы, мёртвая кнопка менеджера, предзаказ на 0 ₽."""
+    facts = CatalogFacts([], ())
+    technopark = ["Предварительная комплектация — технопарк\nОснование: приказ № 838\n- 2.20.153 — робототехнический набор"]
+    chairs = Turn(
+        4,
+        "button",
+        "Скачать Excel",
+        seconds=1,
+        messages=[BotMessage(id=1, text="Комплектация 2.14 Стул ученический. Предварительный список.", file="Комплектация_2_14.xlsx")],
+    )
+    assert [finding.code for finding in check_turn(chairs, facts, technopark)] == ["WRONG_FILE"]
+
+    toddlers = _turn("Раздел 1.14.3 «Групповые помещения для детей 1 - 2 лет»")
+    assert [f.code for f in check_turn(toddlers, facts, [], ["детям 5-6 лет, подготовительная группа"])] == ["AGE_MISMATCH"]
+    assert [f.code for f in check_turn(toddlers, facts, [], ["малыши 1-2 года"])] == []
+
+    assert [f.code for f in check_turn(_turn("полоса должна быть不大"), facts, [])] == ["FOREIGN_SCRIPT"]
+    dead = Turn(3, "button", "Связаться с менеджером", seconds=1, messages=[BotMessage(id=1, text="Чем помочь?")])
+    assert [f.code for f in check_turn(dead, facts, [])] == ["DEAD_BUTTON"]
+    zero = _turn("Предварительный заказ PO-20260915-CDE760: позиций 15 на 0 ₽ по текущим ценам.")
+    assert [f.code for f in check_turn(zero, facts, [])] == ["ZERO_PREORDER"]
+    assert [f.code for f in check_turn(_turn("Я передал ваш запрос специалисту."), facts, [])] == ["FALSE_HANDOFF"]
+    sent = _turn("Предварительный заказ PO-20260915-F39948 передан менеджеру.")
+    assert check_turn(sent, facts, []) == []
+
+    cards = Turn(
+        1,
+        "text",
+        "все по 1",
+        seconds=2,
+        messages=[
+            BotMessage(id=1, text="Найдено:\n\n13. ПОН Звонкий-глухой (Д-214) — 205 ₽"),
+            BotMessage(id=2, text="ПОН Логопедическое лото (Д-222)\n205 ₽ · в наличии 1 шт.\nКод 1С: 34894"),
+        ],
+    )
+    assert "CARD_TEXT" in {finding.code for finding in check_turn(cards, facts, [])}
+
+
+def test_tester_presses_a_button_from_a_recent_message_instead_of_typing_it():
+    turns = [
+        Turn(1, "text", "нужна комплектация", messages=[BotMessage(id=1, text="Комплектация…", buttons=["Скачать Excel", "Скачать Word"])]),
+        Turn(2, "button", "Скачать Word", messages=[BotMessage(id=2, text="Комплектация 1.5", file="k.docx")]),
+    ]
+    assert move_from({"action": "button", "text": "Скачать Excel"}, recent_buttons(turns)) == Move("button", "Скачать Excel", "")

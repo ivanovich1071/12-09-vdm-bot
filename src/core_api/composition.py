@@ -67,6 +67,7 @@ def build_core(
         orders,
         engine.storage.active_consent,
         notifier or FileNotificationChannel(Path(settings.preorders_dir)),
+        test_owners=settings.qa_user_ids,
     )
     sessions = SessionService(SqliteSessionRepository(db))
     engine.storage.add_user_data_hook(CoreUserData(procurement_repository, orders, preorder_repository))

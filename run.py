@@ -152,6 +152,7 @@ def main() -> None:
     scenarios.add_argument("--turns", type=int, default=8, help="лимит реплик тестировщика в диалоге")
     scenarios.add_argument("--out", help="папка прогона; уже существующая — продолжить с места остановки")
     scenarios.add_argument("--model", help="модель OpenRouter (по умолчанию QA_MODEL или deepseek/deepseek-chat-v3-0324)")
+    scenarios.add_argument("--judge-model", help="модель судьи (по умолчанию QA_JUDGE_MODEL или модель тестировщика)")
     scenarios.add_argument("--bot", help="имя бота без @ (по умолчанию QA_BOT_USERNAME или по токену бота)")
     scenarios.add_argument("--quiet", type=float, default=8.0, help="секунд тишины, после которых ход бота закончен")
     scenarios.add_argument("--timeout", type=float, default=300.0, help="сколько секунд ждать ответа бота на ход")

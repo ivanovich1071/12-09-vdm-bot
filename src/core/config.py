@@ -98,6 +98,8 @@ class Settings:
     max_token: str = ""
     site_url: str = "https://vdm.ru"
     manager_contact: str = "+7 (495) 646-01-40, elti@vdm.ru"
+    # Telegram id тестовых аккаунтов автотеста: их предзаказы менеджеру не отправляются.
+    qa_user_ids: frozenset[str] = frozenset()
 
     # Заказы
     order_sink: str = "jsonl"  # jsonl | google_sheets | bitrix24
@@ -187,6 +189,7 @@ class Settings:
             max_token=env.get("MAX_TOKEN", ""),
             site_url=env.get("SITE_URL", cls.site_url),
             manager_contact=env.get("MANAGER_CONTACT", cls.manager_contact),
+            qa_user_ids=frozenset(part.strip() for part in env.get("QA_USER_IDS", "").split(",") if part.strip()),
             order_sink=env.get("ORDER_SINK", cls.order_sink),
             google_sheets_id=env.get("GOOGLE_SHEETS_ID", ""),
             google_credentials_file=env.get(

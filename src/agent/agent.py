@@ -52,11 +52,16 @@ from agent.routing import (
 )
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from agent.verify import (
+    client_ages,
     describe_refs,
+    foreign_script,
     invented_norm_refs,
     invented_prices,
+    listed_codes,
     prices_in,
     promises_goods,
+    section_ages,
+    title_matches,
     without_promises,
     without_unverified,
 )
@@ -281,8 +286,13 @@ class SalesAgent:
         answer = self._verified(
             answer, messages, tools, text, session, tools_for(decision.branch), decision.branch
         )
-        if decision.branch == CONSULT and tools.kit:
-            session.profile.remember_kit(tools.kit)
+        if decision.branch == CONSULT:
+            # В файл — раздел, о котором ответ, а не последний разобранный: ночью 14.09 (сц. 24) текст был
+            # про технопарк, а «Скачать Excel» прислал ученические стулья из последнего поиска «раздел 2.14».
+            tools.kit = tools.kit_for(answer)
+            if tools.kit:
+                session.profile.remember_kit(tools.kit)
+                answer = _short_kit_answer(answer)
         if not answer:
             session.route["discarded_answer"] = True
             if decision.branch == CONSULT:
@@ -327,6 +337,10 @@ class SalesAgent:
             # бронемобиля всё равно пришла — «упомянут» и «рекомендован» тут не
             # различались. Сомневаемся — карточку не показываем.
             if _rejected(answer, product.name):
+                continue
+            # 15.09 строка «Звонкий-глухой (Д-214)» получила карточку «Логопедическое лото (Д-222)»: совпали
+            # общие слова «лото», «настольно-печатная игра». Строка с чужим артикулом — не этот товар.
+            if not _marks_agree(product.name, answer):
                 continue
             matched.append(sku)
         return matched
@@ -445,7 +459,7 @@ class SalesAgent:
         """
         kept = without_promises(answer)
         prices = session.prices | prices_in(question) | prices_in(session.profile.budget or "")
-        if len(kept) < MIN_KEPT or self._complaint(kept, prices, session.norm_refs):
+        if len(kept) < MIN_KEPT or self._complaint(kept, prices, session.norm_refs, session):
             return ""
         return kept
 
@@ -497,7 +511,7 @@ class SalesAgent:
             | prices_in(session.profile.budget or "")
         )
         refs = tools.norm_refs | session.norm_refs
-        complaint = self._complaint(answer, prices, refs)
+        complaint = self._complaint(answer, prices, refs, session)
         if not complaint:
             return answer
 
@@ -514,12 +528,12 @@ class SalesAgent:
 
         prices |= tools.prices
         refs |= tools.norm_refs
-        second_complaint = self._complaint(second, prices, refs)
+        second_complaint = self._complaint(second, prices, refs, session)
         if not second_complaint:
             return second
         session.route["discarded"] = {"complaint": second_complaint, "answer": second[:DISCARDED_KEPT]}
         if branch == CONSULT:
-            kept = without_unverified(second, prices, refs)
+            kept = without_unverified(second, prices, refs, self._registry_problems(second, session)[1])
             if len(kept) >= MIN_KEPT:
                 log.warning("Ответ консультанта выдуман повторно — строки с неподтверждённым убраны.")
                 session.route["fallback"] = "unverified_lines_removed"
@@ -528,10 +542,16 @@ class SalesAgent:
         return ""
 
     def _complaint(
-        self, answer: str, prices: set[int], refs: set[tuple[str, str]]
+        self, answer: str, prices: set[int], refs: set[tuple[str, str]], session=None  # noqa: ANN001
     ) -> str:
         """Что в ответе не подтверждено данными. Пустая строка — всё в порядке."""
         parts: list[str] = []
+        foreign = foreign_script(answer)
+        if foreign:
+            parts.append(
+                "слова не на русском: " + ", ".join(f"«{word}»" for word in sorted(foreign)) + " — замени их русскими"
+            )
+        parts.extend(self._registry_problems(answer, session)[0])
         invented = invented_prices(answer, prices)
         if invented:
             parts.append(
@@ -545,6 +565,53 @@ class SalesAgent:
                 + describe_refs(wrong_refs)
             )
         return f"В твоём ответе есть {' и '.join(parts)}." if parts else ""
+
+    def _registry_problems(self, answer: str, session=None) -> tuple[list[str], set[str]]:  # noqa: ANN001
+        """Коды из строк списка и «раздел X» — против текста приказов, раздел группы — против возраста клиента.
+
+        Ночью 14.09 проверка оснований смотрела только «пункт X»: прошли пункты 1.14.5.7.1.39–48, которых в
+        приказе нет (сц. 11), раздел 2.12 приказа 838 «Словари» под видом кабинета ИЗО (сц. 53) и группа
+        1–2 лет для детей 5–6 лет (сц. 2). Возвращает жалобы и коды, чьи строки можно вырезать.
+        """
+        index = getattr(self.engine, "norm_texts", None)
+        if index is None or not index.loaded:
+            return [], set()
+        client = client_ages(session.profile.age) if session is not None else None
+        # Пункты ФГОС и ФОП в реестре не разобраны — их коды «неизвестными» не считаем.
+        strict = not re.search(r"ФГОС|ФОП", answer or "")
+        unknown: list[str] = []
+        renamed: list[str] = []
+        other_age: list[str] = []
+        bad: set[str] = set()
+        for code, claimed in dict(listed_codes(answer)).items():
+            docs = index.documents_with(code)
+            if not docs:
+                if strict:
+                    unknown.append(code)
+                    bad.add(code)
+                continue
+            titles = [index.get(doc, code).title for doc in docs]
+            if claimed and not title_matches(claimed, titles):
+                renamed.append(f"{code} — в приказе «{titles[0]}»")
+                bad.add(code)
+                continue
+            if client is None:
+                continue
+            for doc in docs:
+                chain = [*index.parents(doc, code), index.get(doc, code)]
+                group = next((ages for item in reversed(chain) if (ages := section_ages(item.title))), None)
+                if group and not (group[0] <= client[1] and client[0] <= group[1]):
+                    other_age.append(f"{code} (для детей {group[0]}–{group[1]} лет)")
+                    bad.add(code)
+                    break
+        problems = []
+        if unknown:
+            problems.append("пункты, которых нет ни в одном приказе: " + ", ".join(unknown))
+        if renamed:
+            problems.append("пункты, названные не так, как в приказе: " + "; ".join(renamed))
+        if other_age:
+            problems.append(f"разделы для другого возраста, а у клиента {session.profile.age}: " + ", ".join(other_age))
+        return problems, bad
 
     # --- Сборка ответа --------------------------------------------------------
 
@@ -617,6 +684,11 @@ class SalesAgent:
             return exports.offer(self.engine, session)
         profile = session.profile
         size = intent.list_size(text)
+        # Оформление по присланному файлу — ядро, а не модель: 15.09 на «сформируй предзаказ» и «все найденные
+        # по 1 шт.» модель трижды пересобрала строки файла по-разному (14 из 15, потом 4 из 15).
+        if profile.order and profile.export == "order" and intent.asks_order_checkout(text):
+            session.route["fallback"] = "order_cart"
+            return self.engine.order_cart(session, override=intent.each_quantity(text))
         # Присланный заказ: «подбери по этому заказу», «из наличия 30 позиций» и «а ещё» — по его строкам.
         if profile.order and (intent.mentions_order(text) or (size and profile.export == "order")):
             session.route["fallback"] = "order_list"
@@ -655,7 +727,8 @@ class SalesAgent:
             # Комплектация раздела — файлом (решение заказчика 14.09: кратко в чате, полностью в файле).
             exports.buttons(keyboard)
         if tools.handoff_reason:
-            keyboard.row(Button("Связаться с менеджером", "menu"))
+            # Ночью 14.09 кнопка вела на "menu": человек просил менеджера и получал «Чем помочь?».
+            keyboard.row(Button("Связаться с менеджером", "manager"))
         if decision.sells and self.engine.storage.load_cart(session.user_id).count:
             keyboard.row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
         return keyboard if keyboard.rows else None
@@ -819,6 +892,47 @@ def _named_in(name: str, words: list[str], pairs: set[tuple[str, str]]) -> bool:
     if len(own) == 1:
         return own[0] in words
     return any((own[i], own[i + 1]) in pairs for i in range(len(own) - 1))
+
+
+# Артикул поставщика в названии: «Д-214», «С-913», «У1076», «KF0015». Цифры отдельно — не артикул.
+_MARK = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])[A-Za-zА-Яа-яЁё]{1,4}-?\d{2,6}(?![0-9A-Za-zА-Яа-яЁё])")
+
+
+def _marks(text: str) -> set[str]:
+    return {mark.replace("-", "").lower() for mark in _MARK.findall(text or "")}
+
+
+def _marks_agree(name: str, answer: str) -> bool:
+    """Не стоит ли название в строке, где назван другой артикул.
+
+    Строка без артикулов не мешает: модель часто пишет «Азбука, настольная игра» без кода поставщика.
+    """
+    own = _marks(name)
+    if not own:
+        return True
+    naming = []
+    for line in (answer or "").splitlines():
+        words = _significant(line)
+        if _named_in(name, words, {(words[i], words[i + 1]) for i in range(len(words) - 1)}):
+            naming.append(_marks(line))
+    return not naming or any(not marks or marks & own for marks in naming)
+
+
+# Комплектация раздела в чате — кратко, полный список в файле (решение заказчика 14.09). Ночью консультант
+# всё равно писал раздел целиком, до 4 тыс. знаков, при кнопках «Скачать» под тем же сообщением.
+KIT_ANSWER_CHARS = 2500
+_KIT_TAIL = "Полный список — в файле, кнопки под сообщением."
+
+
+def _short_kit_answer(answer: str) -> str:
+    if len(answer) <= KIT_ANSWER_CHARS:
+        return answer
+    last = answer.rstrip().rsplit("\n\n", 1)[-1]
+    question = last if last.rstrip().endswith("?") and len(last) <= 300 else ""
+    budget = KIT_ANSWER_CHARS - len(_KIT_TAIL) - len(question) - 4
+    cut = answer.rfind("\n", 0, budget)
+    body = answer[: cut if cut > 0 else budget].rstrip()
+    return "\n\n".join(part for part in (body, _KIT_TAIL, question) if part)
 
 
 def _without_codes(answer: str) -> str:

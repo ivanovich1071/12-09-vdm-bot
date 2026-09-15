@@ -465,6 +465,8 @@ class DialogEngine:
                 return self._confirm_restart()
             case "add_all":
                 return self._add_all(session)
+            case "order_cart":
+                return self.order_cart(session, default=int(arg) if arg.isdigit() else None)
             case "order_more":
                 return self.order_list(session, "", None, more=True)
             case "export":
@@ -891,6 +893,83 @@ class DialogEngine:
                 keyboard=Keyboard().row(Button("Моя корзина", "cart"), Button("Оформить", "checkout")),
             )
         ]
+
+    def order_cart(self, session: Session, default: int | None = None, override: int | None = None) -> list[Response]:
+        """Найденные позиции присланного заказа — в корзину, без модели.
+
+        15.09 на «сформируй предзаказ» и «все найденные позиции по 1 шт.» модель заново искала строки
+        файла по названиям — 14 из 15, потом 4 из 15, — подменила набор зондов товаром с той же ценой и
+        закончила «нажмите «Оформить»» без кнопки при пустой корзине. Позиции берутся из проверки
+        заказа, количество — из файла, названное человеком (`override`) или кнопкой «по 1 шт.» (`default`).
+        """
+        profile = session.profile
+        order = profile.order or {}
+        positions = order.get("positions") or []
+        name = order.get("file") or "заказ"
+        found: list[tuple[Product, int | None]] = []
+        seen: set[str] = set()
+        for position in positions:
+            product = self.index.get(position.get("sku") or "")
+            if product is None or product.id in seen:
+                continue
+            seen.add(product.id)
+            found.append((product, _quantity(position.get("quantity"))))
+        missing = sum(1 for position in positions if self.index.get(position.get("sku") or "") is None)
+
+        keyboard = Keyboard()
+        if not found:
+            text = f"По заказу «{name}» в каталоге не нашлось ни одной позиции — класть в корзину нечего."
+            keyboard.row(Button("Связаться с менеджером", "manager"), Button("Меню", "menu"))
+        elif override is None and default is None:
+            unknown = sum(1 for _, quantity in found if quantity is None)
+            if unknown:
+                text = (
+                    f"По заказу «{name}» в каталоге {len(found)} из {len(positions)} строк, но у {unknown} "
+                    f"{plural(unknown, 'позиции', 'позиций', 'позиций')} не указано количество. Нажмите "
+                    "«Найденные в корзину по 1 шт.» или напишите, например, «все по 2»."
+                )
+                keyboard.row(Button("Найденные в корзину по 1 шт.", "order_cart:1"), Button("Меню", "menu"))
+            else:
+                # Количество есть везде — предзаказ по файлу целиком: не найденные строки менеджер увидит сам.
+                text = (
+                    f"По заказу «{name}» всё готово к предзаказу: в каталоге {len(found)} из {len(positions)} "
+                    "строк, количество — из файла. Нажмите «Оформить предзаказ»: строки, которых нет в "
+                    "каталоге, менеджер проверит сам."
+                )
+                keyboard.row(Button("Оформить предзаказ", f"po_order:{order.get('id')}"), Button("Меню", "menu"))
+        else:
+            cart = self.storage.load_cart(session.user_id)
+            for product, quantity in found:
+                count = override or quantity or default or 1
+                if cart.find(product.sku_1c) is not None:
+                    # Повторное нажатие не удваивает количество.
+                    cart.set_quantity(product.sku_1c, count)
+                    continue
+                norm = product.norm_for(profile.audience, profile.room or "")
+                cart.add(
+                    CartItem(
+                        sku_1c=product.sku_1c,
+                        name=product.name,
+                        price=product.price,
+                        quantity=count,
+                        url=product.url,
+                        norm_citation=norm.citation if norm else None,
+                    )
+                )
+            self.storage.save_cart(cart)
+            how = f"по {override} шт." if override else "количество — из файла" + (f", где его нет — {default} шт." if default else "")
+            text = (
+                f"Положил в корзину {len(found)} {plural(len(found), 'позицию', 'позиции', 'позиций')} из заказа "
+                f"«{name}», {how} В корзине {cart.count} шт. на {price_text(cart.total)}."
+            )
+            if missing:
+                text += (
+                    f"\nНе нашлось в каталоге: {missing} {plural(missing, 'строка', 'строки', 'строк')} — в корзину "
+                    "не попали; их подберёт менеджер."
+                )
+            keyboard.row(Button("Моя корзина", "cart"), Button("Оформить", "checkout"))
+        session.remember("assistant", text)
+        return [Message(text, keyboard=keyboard)]
 
     def note(self, user_id: str, channel: str, text: str, order: dict | None = None) -> None:
         """Ответ, сыгранный мимо диалога, — в историю разговора: итог проверки присланного файла.
@@ -1488,6 +1567,15 @@ class DialogEngine:
                 keyboard=self._main_menu(),
             )
         ]
+
+
+def _quantity(value: object) -> int | None:
+    """Количество строки заказа целым числом; нет или не число — `None`."""
+    try:
+        number = float(str(value).replace(",", "."))
+    except ValueError:
+        return None
+    return int(number) if number >= 1 else None
 
 
 def describe(product: Product) -> str:

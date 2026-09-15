@@ -28,6 +28,11 @@ log = logging.getLogger(__name__)
 
 CHANNEL = "telegram"
 PROBLEM_LINES = 10
+# Надписи постоянной клавиатуры и «Меню»: пока бот ждёт контакт, они сбрасывают ожидание, а не читаются как имя.
+LEAVES_CONTACT = frozenset(
+    {"начать заново", "каталог", "моя корзина", "корзина", "менеджер", "связаться с менеджером", "меню", "отмена"}
+)
+MATCHED = frozenset({"MATCHED_EXACT", "MATCHED_HIGH", "MATCHED_REVIEW"})
 
 EVALUATION_LABELS = {
     "READY": "всё сошлось — можно передавать менеджеру",
@@ -78,6 +83,7 @@ class TelegramGateway:
         self.max_upload_bytes = max_upload_bytes
         self._sessions: dict[str, CoreSession] = {}
         self._awaiting_contact: dict[str, str] = {}
+        self._contact_misses: dict[str, int] = {}
 
     @property
     def storage(self):  # noqa: ANN201 — кэш file_id снимков у рендера
@@ -96,7 +102,21 @@ class TelegramGateway:
         stripped = (text or "").strip()
         command = stripped.split()[0].lower() if stripped.startswith("/") else ""
         if user_id in self._awaiting_contact and not command:
-            return self._guard(lambda: self._contact_from_text(user_id, stripped))
+            if stripped.lower() in LEAVES_CONTACT:
+                # «Начать заново» и постоянная клавиатура — не контакт. Ночью 14.09 тестовый клиент не мог
+                # сбросить разговор, и следующий сценарий начался с «Не вижу телефона».
+                self._forget_contact(user_id)
+            elif PHONE.search(stripped) or not self._contact_misses.get(user_id):
+                return self._guard(lambda: self._contact_from_text(user_id, stripped))
+            else:
+                # Второй раз без телефона — человек говорит о другом: отвечаем на реплику, предзаказ ждёт.
+                preorder_id = self._awaiting_contact.get(user_id)
+                self._forget_contact(user_id)
+                note = Message(
+                    f"Предзаказ {preorder_id} сохранён, но без телефона менеджеру не ушёл. Передать его можно "
+                    "позже: «Оформить» ещё раз и имя с телефоном одним сообщением."
+                )
+                return [note, *self.core.message_primitives(self.session(user_id), text)]
         if command == "/order":
             return self._guard(lambda: self._checkout(user_id))
         if command == "/spec":
@@ -104,7 +124,7 @@ class TelegramGateway:
         if command == "/preorders":
             return self._guard(lambda: self._history(user_id))
         if command in ("/start", "/delete_data"):
-            self._awaiting_contact.pop(user_id, None)
+            self._forget_contact(user_id)
         replies = self.core.message_primitives(self.session(user_id), text)
         if command == "/delete_data":
             self._sessions.pop(user_id, None)
@@ -127,7 +147,7 @@ class TelegramGateway:
             return self._guard(handlers[verb])
         if verb == "restart_yes":
             # Начали заново — недособранный предзаказ контакта больше не ждёт.
-            self._awaiting_contact.pop(user_id, None)
+            self._forget_contact(user_id)
         return list(self.core.action_primitives(self.session(user_id), data))
 
     def upload(self, user_id: str, filename: str, content: bytes) -> list[TelegramReply]:
@@ -147,10 +167,19 @@ class TelegramGateway:
         evaluation = self.core.evaluate_order(session, order.id).data
         assert isinstance(evaluation, dto.EvaluationOut)
         keyboard = Keyboard()
-        if evaluation.status != "REJECTED":
-            keyboard.row(Button("Оформить предзаказ", f"po_order:{order.id}"))
-        keyboard.row(Button("Меню", "menu"))
         text = evaluation_text(order, evaluation)
+        if evaluation.status != "REJECTED":
+            matched = [item for item in evaluation.items if item.get("match_status") in MATCHED]
+            if all(item.get("quantity") is not None for item in matched):
+                keyboard.row(Button("Оформить предзаказ", f"po_order:{order.id}"))
+            else:
+                # 15.09 свой же файл «Подобранные позиции» без количества ушёл менеджеру предзаказом на 0 ₽.
+                keyboard.row(Button("Найденные в корзину по 1 шт.", "order_cart:1"))
+                text += (
+                    "\n\nКоличество указано не у всех позиций. Нажмите «Найденные в корзину по 1 шт.» "
+                    "или напишите, например, «все по 2»."
+                )
+        keyboard.row(Button("Меню", "menu"))
         if not evaluation.summary.get("checked") and order.warnings:
             # «Позиций 0» без причины читается как «ничего нет в каталоге» (14.09): причина — первой.
             text = f"{order.warnings[0].message}\n\n{text}"
@@ -234,12 +263,14 @@ class TelegramGateway:
     def _contact_from_text(self, user_id: str, text: str) -> list[TelegramReply]:
         match = PHONE.search(text)
         if match is None:
+            self._contact_misses[user_id] = self._contact_misses.get(user_id, 0) + 1
             return [ContactRequest("Не вижу телефона. " + _ASK_CONTACT)]
         name = " ".join(PHONE.sub(" ", text).replace(",", " ").split()).strip(" .;—-") or "Клиент"
         return self._send_preorder(user_id, name, match.group(0).strip())
 
     def _send_preorder(self, user_id: str, name: str, phone: str) -> list[TelegramReply]:
         preorder_id = self._awaiting_contact.pop(user_id, None)
+        self._contact_misses.pop(user_id, None)
         if preorder_id is None:
             return [Message("Контакт получен, но предзаказ не выбран. Соберите его заново: /order или файлом заказа.")]
         customer = dto.CustomerIn(name=name[:200], phone=phone[:50])
@@ -265,6 +296,10 @@ class TelegramGateway:
             lines += ["", "Спецификации:"]
             lines += [f"• {s['id']} — {price_text(s['amount'])}, каталог {s['catalog_version']}" for s in data.specifications[:10]]
         return [Message("\n".join(lines).strip())]
+
+    def _forget_contact(self, user_id: str) -> None:
+        self._awaiting_contact.pop(user_id, None)
+        self._contact_misses.pop(user_id, None)
 
     def _guard(self, work: Callable[[], list[TelegramReply]]) -> list[TelegramReply]:
         """Ошибка ядра — понятная фраза человеку, а не молчание бота."""

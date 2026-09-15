@@ -57,6 +57,7 @@ class PreorderService:
         notifier: NotificationChannel,
         *,
         clock: Callable[[], datetime] | None = None,
+        test_owners: frozenset[str] = frozenset(),
     ) -> None:
         self.repository = repository
         self.runtime = runtime
@@ -65,6 +66,7 @@ class PreorderService:
         self.consents = consents
         self.notifier = notifier
         self._clock = clock or (lambda: datetime.now(UTC))
+        self.test_owners = test_owners
 
     # --- Создание ---------------------------------------------------------------
 
@@ -375,6 +377,16 @@ class PreorderService:
         return replace(preorder, history=(PreorderEvent(PreorderStatus.DRAFT, SYSTEM, stamp, None),))
 
     def _notify(self, preorder: Preorder) -> Preorder:
+        if preorder.owner in self.test_owners:
+            # Тестовый аккаунт автотеста (QA_USER_IDS): ночью 14.09 он отправил менеджеру четыре предзаказа,
+            # один — с выдуманным телефоном. Для бота всё как у настоящего, наружу не уходит ничего.
+            log.info("Предзаказ %s тестового пользователя — менеджеру не отправлен.", preorder.id)
+            preorder = preorder.with_status(PreorderStatus.SENT_TO_MANAGER, SYSTEM, self._now())
+            self.repository.save(preorder)
+            self.repository.set_notification(
+                preorder.id, "qa-test", NotificationStatus.SENT, "тестовый пользователь — не отправлялось", self._now()
+            )
+            return self.repository.get(preorder.id)  # type: ignore[return-value]
         channel = getattr(self.notifier, "name", "notifier")
         try:
             self.notifier.send(preorder)

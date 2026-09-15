@@ -23,7 +23,7 @@ from qa.models import DialogResult, Turn
 from qa.persona import next_move
 from qa.report import append_result, load_results, render
 from qa.scenarios import Scenario, Variant, parse, select, variants
-from qa.telegram import BotChat
+from qa.telegram import BotChat, LoginError
 
 SESSION = Path("data/qa/tester")
 # 100 сценариев заказчика — файл по умолчанию (tests/scenarios, сверен с присланными частями 14.09).
@@ -33,7 +33,7 @@ MODES = {"main": "только основной путь", "main+1": "основ
 HELP_API = """Нужны TELEGRAM_API_ID и TELEGRAM_API_HASH в .env — ключи приложения для пользовательского аккаунта, не бота.
 1. Откройте https://my.telegram.org тестовым аккаунтом → API development tools.
 2. Создайте приложение (название любое), впишите api_id и api_hash в .env.
-3. Войдите один раз: python run.py scenarios --login — телефон и код из Telegram вводите сами."""
+3. Войдите один раз: python run.py scenarios --login — телефон тестового аккаунта (не токен бота) и код из Telegram вводите сами."""
 
 
 async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
@@ -54,7 +54,11 @@ async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
     session.parent.mkdir(parents=True, exist_ok=True)
 
     if args.login:
-        chat = await BotChat.connect(str(session), int(api_id), api_hash, username)
+        try:
+            chat = await BotChat.connect(str(session), int(api_id), api_hash, username)
+        except LoginError as exc:
+            print(exc)
+            return 2
         me = await chat.client.get_me()
         print(f"Вход выполнен: {me.first_name or me.username}. Бот для прогона: @{username}")
         await chat.close()
@@ -75,26 +79,33 @@ async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
     out = Path(args.out or f"data/qa/run-{datetime.now():%Y%m%d-%H%M}")
     out.mkdir(parents=True, exist_ok=True)
     results_path, report_path = out / "results.jsonl", out / "report.md"
-    results = load_results(results_path)
+    results = finished(load_results(results_path))
     plan = plan_dialogs(scenarios, args.mode, {result.key for result in results})
     stop = stop_time(args.until)
     model_name = args.model or os.environ.get("QA_MODEL") or DEFAULT_MODEL
+    judge_name = getattr(args, "judge_model", None) or os.environ.get("QA_JUDGE_MODEL") or model_name
     meta = {
         "started": f"{datetime.now():%d.%m.%Y %H:%M}",
         "Файл сценариев": source.name,
         "Бот": f"@{username}",
-        "Модель тестировщика и судьи": model_name,
+        "Модель тестировщика": model_name,
+        "Модель судьи": judge_name,
         "Варианты": MODES[args.mode],
         "Лимит реплик тестировщика": args.turns,
     }
 
     facts = CatalogFacts.load(settings)
     model = openrouter(settings, model_name)
+    judge_model = model if judge_name == model_name else openrouter(settings, judge_name)
     print(f"Сценариев: {len(scenarios)}, диалогов к прогону: {len(plan)}, уже готово: {len(results)}.")
     if stop:
         print(f"Новые диалоги не начинаю после {stop:%d.%m %H:%M}.")
     print(f"Отчёт: {report_path}", flush=True)
-    chat = await BotChat.connect(str(session), int(api_id), api_hash, username, quiet=args.quiet, timeout=args.timeout)
+    try:
+        chat = await BotChat.connect(str(session), int(api_id), api_hash, username, quiet=args.quiet, timeout=args.timeout)
+    except LoginError as exc:
+        print(exc)
+        return 2
     spent: list[float] = []
     silent = 0
     try:
@@ -103,7 +114,7 @@ async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
                 print(f"Время --until вышло: пройдено {index - 1} из {len(plan)}. Продолжить — тот же --out.")
                 break
             print(f"[{index}/{len(plan)}] сценарий {scenario.number} «{scenario.title}» — {variant.name}", flush=True)
-            result = await play(chat, model, facts, scenario, variant, args.turns)
+            result = await play(chat, model, facts, scenario, variant, args.turns, judge_model)
             results.append(result)
             spent.append(result.seconds)
             append_result(results_path, result)
@@ -119,13 +130,21 @@ async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
             # Бот упал или пропал VPN: ночью не жечь по пять минут ожидания на каждый оставшийся диалог.
             silent = silent + 1 if result.error and not result.turns else 0
             if silent >= 3:
-                print("Три диалога подряд бот не отвечает — прогон остановлен. Проверьте бота и VPN, потом тот же --out.")
+                print(
+                    f"Три диалога подряд сорвались до первого ответа ({result.error}) — прогон остановлен. "
+                    "Проверьте бота и VPN, потом тот же --out: сорванные диалоги пройдут заново."
+                )
                 break
     finally:
         await chat.close()
         report_path.write_text(render(results, meta), encoding="utf-8")
     print(f"Готово. Отчёт: {report_path}")
     return 0
+
+
+def finished(results: list[DialogResult]) -> list[DialogResult]:
+    """Сорванный до первого хода диалог (бот молчал, Telegram отказал) не пройден — тот же --out его повторит."""
+    return [result for result in results if result.turns or not result.error]
 
 
 def plan_dialogs(scenarios: list[Scenario], mode: str, done: set[str]) -> list[tuple[Scenario, Variant]]:
@@ -150,7 +169,13 @@ def stop_time(until: str | None, now: datetime | None = None) -> datetime | None
 
 
 async def play(
-    chat: BotChat, model: Model, facts: CatalogFacts, scenario: Scenario, variant: Variant, max_turns: int
+    chat: BotChat,
+    model: Model,
+    facts: CatalogFacts,
+    scenario: Scenario,
+    variant: Variant,
+    max_turns: int,
+    judge_model: Model | None = None,
 ) -> DialogResult:
     result = DialogResult(
         scenario=scenario.number,
@@ -176,7 +201,8 @@ async def play(
             if exchange.late and result.turns:
                 result.turns[-1].messages.extend(exchange.late)
             turn = Turn(number, move.kind, move.text, move.reason, exchange.seconds, exchange.timed_out, exchange.messages)
-            turn.findings = check_turn(turn, facts, history)
+            said = [earlier.text for earlier in result.turns if earlier.kind == "text"]
+            turn.findings = check_turn(turn, facts, history, said + ([move.text] if move.kind == "text" else []))
             history += [message.text for message in turn.messages]
             result.turns.append(turn)
         else:
@@ -188,7 +214,7 @@ async def play(
     finally:
         result.seconds = round(time.monotonic() - clock, 1)
     if result.turns:
-        result.verdict = await asyncio.to_thread(judge, model, scenario, variant, result)
+        result.verdict = await asyncio.to_thread(judge, judge_model or model, scenario, variant, result)
     return result
 
 

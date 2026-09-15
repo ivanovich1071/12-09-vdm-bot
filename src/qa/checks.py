@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 
+from agent.verify import foreign_script
 from qa.models import Finding, Turn
 
 SLOW_WARNING, SLOW_ERROR = 60.0, 180.0
@@ -26,6 +27,14 @@ LABELS = {
     "FILE_MISSING": "файл не пришёл",
     "DUPLICATE": "одинаковые сообщения в одном ходе",
     "REPEAT": "повтор прошлого ответа",
+    # Ночь 14.09: судья засчитывал «файл получен», хотя файл был не тот, — эти проверки ловят такое кодом.
+    "WRONG_FILE": "файл не по разделу из ответа",
+    "AGE_MISMATCH": "раздел для другого возраста",
+    "FOREIGN_SCRIPT": "слова не на русском",
+    "CARD_TEXT": "карточка не из списка ответа",
+    "DEAD_BUTTON": "кнопка менеджера не ведёт к менеджеру",
+    "ZERO_PREORDER": "предзаказ на 0 ₽",
+    "FALSE_HANDOFF": "«передал» без заявки",
 }
 
 _PRICE = re.compile(r"(\d{1,3}(?:[   ]\d{3})+|\d+)\s*₽")
@@ -38,6 +47,13 @@ _ERROR = re.compile(
     re.IGNORECASE,
 )
 _MARKDOWN = re.compile(r"\*\*|^#{1,4}\s|^\s*\|.*\|\s*$", re.MULTILINE)
+_FILE_CODE = re.compile(r"Комплектация[ _](\d{1,2}(?:[._]\d{1,3}){0,5})")
+_SECTION_WORD = re.compile(r"раздел\w*\s*№?\s*(\d{1,2}(?:\.\d{1,3}){1,5})(?!\d|\.\d)", re.IGNORECASE)
+_AGE_SAID = re.compile(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(?:лет|года)|(\d{1,2})\s*(?:лет|года)\b", re.IGNORECASE)
+_AGE_SECTION = re.compile(r"для\s+детей\s+(?:от\s+)?(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(?:лет|года)", re.IGNORECASE)
+_CONTACT = re.compile(r"\+7|\b8\s*\(?\d{3}|@\w")
+_ZERO_PREORDER = re.compile(r"Предварительный заказ PO-\S+: позиций \d+ на 0 ₽")
+_HANDOFF = re.compile(r"\bпередал[аи]?\b", re.IGNORECASE)
 
 
 class CatalogFacts:
@@ -62,7 +78,8 @@ class CatalogFacts:
         return cls(state.index.products, {code for by_code in documents.values() for code in by_code})
 
 
-def check_turn(turn: Turn, facts: CatalogFacts, history: list[str]) -> list[Finding]:
+def check_turn(turn: Turn, facts: CatalogFacts, history: list[str], said: list[str] | None = None) -> list[Finding]:
+    """Замечания к ходу. `history` — прежние ответы бота, `said` — реплики тестировщика, включая эту."""
     findings: list[Finding] = []
     if not turn.messages:
         findings.append(Finding("NO_REPLY", "error", f"бот не ответил за {turn.seconds:.0f} с"))
@@ -78,6 +95,12 @@ def check_turn(turn: Turn, facts: CatalogFacts, history: list[str]) -> list[Find
         if _MARKDOWN.search(text):
             findings.append(Finding("MARKDOWN", "warning", "в тексте **, # или таблица с «|»"))
         findings += _prices(text, facts)
+        if foreign := foreign_script(text):
+            findings.append(Finding("FOREIGN_SCRIPT", "error", ", ".join(sorted(foreign))))
+        if _ZERO_PREORDER.search(text):
+            findings.append(Finding("ZERO_PREORDER", "error", text.splitlines()[0][:120]))
+        if _HANDOFF.search(text) and "PO-" not in text:
+            findings.append(Finding("FALSE_HANDOFF", "warning", _around(text, _HANDOFF.search(text).start())))
         if facts.points:
             for code in _POINT.findall(text):
                 if code not in facts.points:
@@ -85,8 +108,15 @@ def check_turn(turn: Turn, facts: CatalogFacts, history: list[str]) -> list[Find
 
     if turn.kind == "button" and turn.text.lower().startswith("скачать") and not any(m.file for m in turn.messages):
         findings.append(Finding("FILE_MISSING", "error", f"после «{turn.text}» файла нет"))
+    if turn.kind == "button" and "менеджер" in turn.text.lower():
+        texts = [message.text for message in turn.messages if message.text]
+        if texts and not any("менеджер" in text.lower() or _CONTACT.search(text) for text in texts):
+            findings.append(Finding("DEAD_BUTTON", "error", f"«{turn.text}» → «{texts[0][:60]}»"))
+    findings += _wrong_files(turn, history)
+    findings += _other_age(turn, said or [])
+    findings += _cards_off_list(turn)
 
-    seen = [_norm(message.text)[:300] for message in turn.messages if message.text.strip()]
+    seen =[_norm(message.text)[:300] for message in turn.messages if message.text.strip()]
     if len(set(seen)) < len(seen):
         findings.append(Finding("DUPLICATE", "warning", "бот прислал одно и то же несколько раз"))
     earlier = {_norm(text)[:300] for text in history if text.strip()}
@@ -116,6 +146,71 @@ def _prices(text: str, facts: CatalogFacts) -> list[Finding]:
                 Finding("PRICE_MISMATCH", "error", f"«{product.name}»: в списке {prices[0]} ₽, в каталоге {product.price} ₽")
             )
     return found
+
+
+def _wrong_files(turn: Turn, history: list[str]) -> list[Finding]:
+    """Файл комплектации не по тому разделу, о котором последний ответ (сц. 24: технопарк → стулья)."""
+    texts = [m.text for m in turn.messages if m.text and not m.file] + list(reversed(history))
+    named = next((codes for text in texts if not text.startswith("Комплектация ") and (codes := _codes_in(text))), set())
+    found = []
+    for message in turn.messages:
+        match = _FILE_CODE.search(message.text or "") or _FILE_CODE.search(message.file or "") if message.file else None
+        if match is None or not named:
+            continue
+        code = match.group(1).replace("_", ".")
+        if not any(other == code or other.startswith(f"{code}.") or code.startswith(f"{other}.") for other in named):
+            found.append(Finding("WRONG_FILE", "error", f"файл по разделу {code}, а в ответе — {', '.join(sorted(named)[:3])}"))
+    return found
+
+
+def _codes_in(text: str) -> set[str]:
+    return set(_POINT.findall(text)) | set(_SECTION_WORD.findall(text))
+
+
+def _other_age(turn: Turn, said: list[str]) -> list[Finding]:
+    """Раздел «для детей A–B лет», не пересекающийся с возрастом, который назвал клиент (сц. 2, 5)."""
+    numbers: list[int] = []
+    for low, high, single in _AGE_SAID.findall(" ".join(said)):
+        numbers += [int(low), int(high)] if low else [int(single)]
+    if not numbers:
+        return []
+    client = (min(numbers), max(numbers))
+    found = []
+    for message in turn.messages:
+        groups = [(int(low), int(high)) for low, high in _AGE_SECTION.findall(message.text or "")]
+        if groups and not any(low <= client[1] and client[0] <= high for low, high in groups):
+            found.append(
+                Finding(
+                    "AGE_MISMATCH",
+                    "error",
+                    f"раздел для детей {groups[0][0]}–{groups[0][1]} лет, а клиенту нужно {client[0]}–{client[1]}",
+                )
+            )
+    return found
+
+
+def _cards_off_list(turn: Turn) -> list[Finding]:
+    """Карточка товара, которого нет в списке того же хода (15.09: «Д-214» в списке, карточка «Д-222»)."""
+    listed = [
+        _plain(name)
+        for message in turn.messages
+        if message.text and not _SKU.search(message.text)
+        for name, _ in _LIST_LINE.findall(message.text)
+    ]
+    if not listed:
+        return []
+    found = []
+    for message in turn.messages:
+        if not _SKU.search(message.text or ""):
+            continue
+        title = message.text.splitlines()[0]
+        if not any(_plain(title) in name or name in _plain(title) for name in listed):
+            found.append(Finding("CARD_TEXT", "warning", f"«{title[:80]}»"))
+    return found
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[«»\"„“*]", "", _norm(text))).strip()
 
 
 def _amount(value: str) -> int:

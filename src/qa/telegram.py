@@ -11,17 +11,39 @@ api_id и api_hash с my.telegram.org и один вход по коду. Сес
 from __future__ import annotations
 
 import asyncio
+import getpass
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from qa.models import BotMessage
 
+RESTART_COMMAND = "/restart"
 RESTART_LABEL = "Начать заново"
 RESTART_CONFIRM = "Да, начать заново"
 # Сколько ждать первого сообщения после «печатает…» — бот обновляет его примерно раз в 4–5 секунд.
 TYPING_GRACE = 12.0
 RECENT = 40
+PHONE_PROMPT = "Телефон тестового аккаунта Telegram (+7…), не токен бота: "
+CODE_PROMPT = "Код входа — пришёл в приложение Telegram (чат «Telegram») или по SMS: "
+PASSWORD_PROMPT = "Облачный пароль Telegram (двухэтапная проверка). Символы при вводе не видны — наберите и нажмите Enter: "
+
+
+class LoginError(RuntimeError):
+    """Вход тестового аккаунта не удался — сообщение для человека, без трассировки."""
+
+
+class NotAUserError(LoginError):
+    """Сессия вошла ботом: Telegram не пускает бота писать боту (USER_BOT_TO_BOT_DISABLED)."""
+
+
+def ask_phone(read=input) -> str:  # noqa: ANN001 — read подменяется в тестах
+    """Telethon по умолчанию принимает и токен бота; токен (в нём есть «:») не берём — нужен человек."""
+    while True:
+        answer = read(PHONE_PROMPT).strip()
+        if answer and ":" not in answer:
+            return answer
+        print("Нужен номер телефона человека. Токен бота не подходит: бот не может писать боту.")
 
 
 @dataclass
@@ -43,11 +65,37 @@ class BotChat:
 
     @classmethod
     async def connect(cls, session: str, api_id: int, api_hash: str, bot_username: str, **options: float) -> BotChat:
-        from telethon import TelegramClient, events
+        from telethon import TelegramClient, errors, events
 
         client = TelegramClient(session, api_id, api_hash)
-        # Первый запуск спрашивает в терминале телефон и код из Telegram — вводит их человек.
-        await client.start()
+        # Первый запуск спрашивает в терминале телефон, код и облачный пароль — вводит их человек.
+        try:
+            await client.start(
+                phone=ask_phone,
+                code_callback=lambda: input(CODE_PROMPT),
+                password=lambda: getpass.getpass(PASSWORD_PROMPT),
+            )
+        except errors.PasswordHashInvalidError as exc:
+            await client.disconnect()
+            raise LoginError(
+                "Облачный пароль Telegram не подошёл три раза. Это пароль двухэтапной проверки, не код из SMS: "
+                "Telegram → Настройки → Конфиденциальность → Облачный пароль. Набирайте вручную — символы не видны. "
+                "Забыли — сбросьте там же через почту восстановления. Потом снова: python run.py scenarios --login"
+            ) from exc
+        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as exc:
+            await client.disconnect()
+            raise LoginError("Код входа не подошёл или устарел. Запросите новый: python run.py scenarios --login") from exc
+        except errors.FloodWaitError as exc:
+            await client.disconnect()
+            raise LoginError(f"Telegram просит подождать {exc.seconds} с после неудачных попыток, потом --login снова.") from exc
+        me = await client.get_me()
+        if me.bot:
+            await client.disconnect()
+            raise NotAUserError(
+                f"Сессия {session}.session вошла ботом @{me.username}, а писать боту может только аккаунт человека.\n"
+                f"Удалите файл сессии и войдите заново по номеру телефона тестового аккаунта:\n"
+                f"  Remove-Item {session}.session\n  python run.py scenarios --login"
+            )
         bot = await client.get_entity(bot_username)
         chat = cls(client, bot, **options)
         client.add_event_handler(chat._on_message, events.NewMessage(chats=bot, incoming=True))
@@ -59,11 +107,18 @@ class BotChat:
         await self.client.disconnect()
 
     async def restart(self) -> Exchange:
-        """«Начать заново» с нижней клавиатуры и подтверждение — чистый разговор перед сценарием."""
-        first = await self.send(RESTART_LABEL)
+        """`/restart` и подтверждение — чистый разговор перед сценарием.
+
+        Команда, а не надпись с клавиатуры: ночью 14.09 бот ждал контакт и прочитал «Начать заново» как
+        имя для заявки, и сценарий 29 начался с «Не вижу телефона». Нет подтверждения — пробуем надпись.
+        """
+        first = await self.send(RESTART_COMMAND)
         message, _ = self._button(RESTART_CONFIRM)
         if message is None:
-            return first
+            first = await self.send(RESTART_LABEL)
+            message, _ = self._button(RESTART_CONFIRM)
+            if message is None:
+                return first
         return await self.click(RESTART_CONFIRM)
 
     async def send(self, text: str) -> Exchange:

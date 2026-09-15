@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from core import selection
@@ -182,7 +183,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "handoff_to_manager",
             "description": (
                 "Позвать живого менеджера: вопрос вне каталога, нестандартные условия, "
-                "нужен расчёт или документы."
+                "нужен расчёт или документы. Сам вызов менеджеру ничего не отправляет: под ответом "
+                "появится кнопка «Связаться с менеджером» с контактами."
             ),
             "parameters": {
                 "type": "object",
@@ -192,6 +194,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+# Код пункта или раздела в тексте ответа: «1.14.7», «2.12.15». Дата «25.12.2024» кодом не считается.
+_CODE_IN_TEXT = re.compile(r"(?<![\d.])\d{1,2}(?:\.\d{1,3}){1,5}(?!\d|\.\d)")
 
 
 class ToolBox:
@@ -221,6 +227,8 @@ class ToolBox:
         # Раздел перечня с составом, разобранный в этом ходе: из него комплектация файлом.
         # Берётся из результата инструмента, а не из текста модели.
         self.kit: dict[str, Any] | None = None
+        # Все разделы с составом, разобранные за ход: модель смотрит несколько, пишет об одном.
+        self.kits: dict[str, dict[str, Any]] = {}
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
         handler = getattr(self, f"_{name}", None)
@@ -408,8 +416,9 @@ class ToolBox:
             if positions:
                 brief["positions_total"] = len(positions)
                 brief["positions"] = [self._position(child) for child in positions[:MAX_POSITIONS]]
-                # Комплектация для файла — весь раздел без обрезки: в файле место есть.
-                self.kit = {
+                # Комплектация для файла — весь раздел без обрезки: в файле место есть. Какой из
+                # разобранных разделов уйдёт в файл, решает текст ответа (`kit_for`).
+                self.kit = self.kits[f"{item.doc_id}:{item.code}"] = {
                     "document": item.doc_id,
                     "code": item.code,
                     "title": item.title,
@@ -522,9 +531,28 @@ class ToolBox:
             "total": cart.total,
         }
 
+    def kit_for(self, answer: str) -> dict[str, Any] | None:
+        """Комплектация раздела, о котором ответ: первый код в тексте — сам раздел или его пункт.
+
+        Ночью 14.09 модель за один ход разобрала несколько разделов, а файл брал последний: текст про
+        технопарк, файл про ученические стулья. Не назван ни один разобранный раздел — файла нет.
+        """
+        for match in _CODE_IN_TEXT.finditer(answer or ""):
+            code = match.group(0)
+            named = [kit for kit in self.kits.values() if code == kit["code"] or code.startswith(f"{kit['code']}.")]
+            if named:
+                return max(named, key=lambda kit: len(kit["code"]))
+        return None
+
     def _handoff_to_manager(self, reason: str) -> dict[str, Any]:
         self.handoff_reason = reason
-        return {"ok": True, "contact": self.engine.settings.manager_contact}
+        # 14.09 после этого вызова модель писала «я передал ваш запрос специалисту», а не уходило ничего.
+        return {
+            "ok": True,
+            "contact": self.engine.settings.manager_contact,
+            "note": "Менеджеру ничего не отправлено. Под ответом будет кнопка «Связаться с менеджером». "
+            "Не пиши «передал» или «передам»: предложи нажать кнопку или позвонить по контакту.",
+        }
 
     def _remember_norms(self, product) -> None:  # noqa: ANN001 — catalog.models.Product
         """Основания показанного товара — то, на что модель вправе сослаться."""

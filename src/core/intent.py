@@ -253,6 +253,31 @@ def mentions_order(text: str) -> bool:
     return bool(_ORDER_REF.search(text or ""))
 
 
+# «Сформируй предзаказ», «оформи», «все найденные позиции по 1 шт.» после присланного файла (15.09).
+_ORDER_CHECKOUT = re.compile(
+    r"оформ\w*|предзаказ\w*|\bв\s+корзин\w*|\bпо\s*\d{1,4}\s*(?:шт\w*|штук\w*|единиц\w*)", re.IGNORECASE
+)
+# «по 1 шт.», «по 2 штуки» — или «все по 2», «каждой по 3». «По приказу 1057» количеством не считается.
+_EACH_QUANTITY = re.compile(
+    r"\bпо\s*(\d{1,4})\s*(?:шт\w*|штук\w*|единиц\w*)|(?:\bвсе\w*|\bкажд\w+)\D{0,40}?\bпо\s*(\d{1,4})\b(?![.,]\d)",
+    re.IGNORECASE,
+)
+
+
+def asks_order_checkout(text: str) -> bool:
+    """Просьба оформить или положить в корзину — по присланному заказу, если он есть."""
+    return bool(_ORDER_CHECKOUT.search(text or "") or _EACH_QUANTITY.search(text or ""))
+
+
+def each_quantity(text: str) -> int | None:
+    """Количество каждой позиции, названное в реплике: «все по 2» → 2."""
+    match = _EACH_QUANTITY.search(text or "")
+    if match is None:
+        return None
+    number = int(match.group(1) or match.group(2))
+    return number or None
+
+
 __all__ = [
     "GREETING",
     "NORM_CODE",
@@ -263,9 +288,11 @@ __all__ = [
     "TASK",
     "asks_for_goods",
     "asks_more",
+    "asks_order_checkout",
     "asks_to_show",
     "classify",
     "describes_task",
+    "each_quantity",
     "is_short",
     "list_size",
     "mentions_order",

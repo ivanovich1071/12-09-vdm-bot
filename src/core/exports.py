@@ -29,9 +29,10 @@ PLAIN, BOLD, NUMBER = 0, 1, 2
 
 KIT_COLUMNS = ("Пункт", "Наименование по перечню", "Кол-во по перечню", "Товар в каталоге", "Код 1С", "Цена, ₽", "Наличие")
 KIT_WIDTHS = [14, 60, 16, 60, 16, 12, 22]
-LIST_COLUMNS = ("№", "Наименование", "Код 1С", "Цена, ₽", "Наличие", "Пункт перечня")
-LIST_WIDTHS = [5, 70, 16, 12, 22, 18]
-NOTE = "Предварительный список. Цены и наличие — по каталогу на дату выгрузки; окончательно их подтверждает менеджер."
+# «Кол-во» — чтобы свой же файл, присланный обратно, читался заказом, а не «не указано количество» (15.09).
+LIST_COLUMNS = ("№", "Наименование", "Код 1С", "Кол-во", "Цена, ₽", "Наличие", "Пункт перечня")
+LIST_WIDTHS = [5, 70, 16, 10, 12, 22, 18]
+NOTE = "Предварительный список. Цены и наличие — по каталогу на дату данных выше; окончательно их подтверждает менеджер."
 
 Row = list[tuple[Any, int]]
 
@@ -73,7 +74,14 @@ def build(engine: DialogEngine, session: Session, fmt: str) -> ExportFile | None
         title, meta, header, rows, widths = _list_table(engine, session)
     else:
         return None
-    meta = [*meta, f"Каталог: версия {engine.catalog_version or 'текущая'}, выгрузка {dt.date.today():%d.%m.%Y}"]
+    # «Выгрузка 15.09» читалась как дата данных, а данные каталога были на 27.08 (разбор 15.09).
+    stamp = _data_date(engine)
+    meta = [
+        *meta,
+        f"Каталог: версия {engine.catalog_version or 'текущая'}"
+        + (f", данные на {stamp}" if stamp else "")
+        + f"; файл сформирован {dt.date.today():%d.%m.%Y}",
+    ]
 
     if fmt == WORD:
         from documents.docx import write_document
@@ -138,14 +146,35 @@ def _kit_table(engine: DialogEngine, kit: dict[str, Any]):  # noqa: ANN202
 def _list_table(engine: DialogEngine, session: Session):  # noqa: ANN202
     rows: list[Row] = []
     audience = session.profile.audience
+    quantities = _quantities(engine, session)
     for sku in session.profile.shortlist:
         product = engine.index.get(sku)
         if product is None:
             continue
         points = [ref.item_code for ref in product.norms_for(audience) if ref.item_code]
         name, code, price, stock = _product_cells(product)
-        rows.append([(len(rows) + 1, PLAIN), name, code, price, stock, (", ".join(points[:2]), PLAIN)])
+        quantity = quantities.get(product.id) or quantities.get(product.sku_1c) or "уточняется"
+        rows.append([(len(rows) + 1, PLAIN), name, code, (quantity, PLAIN), price, stock, (", ".join(points[:2]), PLAIN)])
     return "Подобранные позиции", [], LIST_COLUMNS, rows, LIST_WIDTHS
+
+
+def _quantities(engine: DialogEngine, session: Session) -> dict[str, Any]:
+    """Количество позиции списка: из присланного заказа, иначе из корзины."""
+    found: dict[str, Any] = {item.sku_1c: item.quantity for item in engine.storage.load_cart(session.user_id).items}
+    for position in (session.profile.order or {}).get("positions") or []:
+        quantity = position.get("quantity")
+        if position.get("sku") and quantity is not None:
+            found[position["sku"]] = int(quantity) if isinstance(quantity, float) and quantity.is_integer() else quantity
+    return found
+
+
+def _data_date(engine: DialogEngine) -> str | None:
+    """Дата данных каталога — самое свежее обновление товара, а не день выгрузки файла."""
+    stamps = [product.updated_at for product in engine.index.products if product.updated_at]
+    try:
+        return dt.date.fromisoformat(max(stamps)[:10]).strftime("%d.%m.%Y") if stamps else None
+    except ValueError:
+        return None
 
 
 def _catalog_by_point(engine: DialogEngine, doc_id: str) -> dict[str, list[Product]]:

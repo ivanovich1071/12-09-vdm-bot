@@ -36,6 +36,16 @@ def render(results: list[DialogResult], meta: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def goal_reached(result: DialogResult) -> bool | None:
+    """Цель достигнута — по судье и без ошибок проверок кода.
+
+    Ночью 14.09 судья засчитал 79 из 100: «файл получен» — даже когда файл был не тот (сц. 53).
+    """
+    if result.verdict.goal_reached is None:
+        return None
+    return bool(result.verdict.goal_reached) and not any(f.severity == "error" for f in result.findings)
+
+
 def _summary(results: list[DialogResult]) -> list[str]:
     turns = [turn for result in results for turn in result.turns]
     answered = [turn.seconds for turn in turns if turn.messages]
@@ -47,9 +57,13 @@ def _summary(results: list[DialogResult]) -> list[str]:
     if scores:
         lines.append(f"- Средняя оценка судьи: {statistics.mean(scores):.1f} из 5 (оценено {len(scores)})")
     if judged:
-        reached = sum(1 for result in judged if result.verdict.goal_reached)
+        reached = sum(1 for result in judged if goal_reached(result))
+        by_judge = sum(1 for result in judged if result.verdict.goal_reached)
         kept = sum(1 for result in judged if result.verdict.context_kept)
-        lines.append(f"- Цель достигнута: {reached} из {len(judged)}; контекст удержан: {kept} из {len(judged)}")
+        lines.append(
+            f"- Цель достигнута: {reached} из {len(judged)} (по судье {by_judge}, без диалогов с ошибками проверок); "
+            f"контекст удержан: {kept} из {len(judged)}"
+        )
     if answered:
         lines.append(
             f"- Первый ответ бота: в среднем {statistics.mean(answered):.0f} с, медиана {statistics.median(answered):.0f} с, "
@@ -66,8 +80,8 @@ def _table(results: list[DialogResult]) -> list[str]:
     lines = [
         "## Сводная таблица",
         "",
-        "| № | Сценарий | Вариант | Ходов | Ср. ответ, с | Макс., с | Ошибки | Предупр. | Оценка | Цель | Контекст |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| № | Сценарий | Вариант | Ходов | Ср. ответ, с | Макс., с | Ошибки | Предупр. | Оценка | Цель | Цель (судья) | Контекст |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for result in results:
         answered = [turn.seconds for turn in result.turns if turn.messages]
@@ -86,6 +100,7 @@ def _table(results: list[DialogResult]) -> list[str]:
                     str(sum(1 for f in findings if f.severity == "error")),
                     str(sum(1 for f in findings if f.severity == "warning")),
                     str(verdict.score) if verdict.score else ("ошибка" if result.error or verdict.error else "—"),
+                    _yes(goal_reached(result)),
                     _yes(verdict.goal_reached),
                     _yes(verdict.context_kept),
                 ]
@@ -133,7 +148,8 @@ def _dialog(result: DialogResult) -> list[str]:
         lines.append(f"**Прогон сорвался:** {result.error}")
     if verdict.score:
         lines.append(
-            f"**Оценка {verdict.score}/5** · цель: {_yes(verdict.goal_reached)} · контекст: {_yes(verdict.context_kept)}"
+            f"**Оценка {verdict.score}/5** · цель: {_yes(goal_reached(result))} (судья: {_yes(verdict.goal_reached)})"
+            f" · контекст: {_yes(verdict.context_kept)}"
             + (f" · ветка: {_yes(verdict.branch_handled)}" if verdict.branch_handled is not None else "")
         )
     if verdict.summary:
