@@ -101,6 +101,42 @@ _PROMISE_LATER = re.compile(r"\b(?:подберу|поищу|найду|пока
 _CONDITION = re.compile(r"\b(?:если|когда|как\s+только|после\s+того|чтобы)\b", re.IGNORECASE)
 
 
+# Вежливость в ответ на нашу же просьбу переписать: «Спасибо, что поправили», «Понял, спасибо за
+# замечание», «Вы правы. Переписываю строго по данным из инструментов». Цифр в такой фразе нет —
+# по ним отличается настоящее «Спасибо за уточнение: для 5–6 лет подойдёт раздел 1.14.5».
+_META_MARK = re.compile(
+    r"спасибо|поправил\w*|замечани\w*|перепис\w*|перепиш\w*|исправ\w*|переформулир\w*|"
+    r"вы\s+прав\w*|прошу\s+прощени\w*|извин\w*|уч(?:ё|е)л|прин(?:ял|ято)|"
+    r"по\s+данным\s+из\s+инструмент\w*|тольк\w*\s+по\s+.{0,30}инструмент\w*",
+    re.IGNORECASE,
+)
+_FIRST_SENTENCE = re.compile(r"[^.!?\n]{1,160}[.!?…]+[ \t]*")
+META_SENTENCE_CHARS = 160
+
+
+def _meta_sentence(sentence: str) -> bool:
+    return bool(_META_MARK.search(sentence)) and not re.search(r"\d", sentence)
+
+
+def without_meta(answer: str) -> str:
+    """Ответ без служебного вступления «Спасибо, что поправили. Переписываю…».
+
+    Просьбу переписать ответ модель принимает за реплику человека и отвечает на неё
+    извинением. Ночью 15.09 такие извинения ушли клиенту 26 раз в 17 диалогах из 25,
+    а в двух ходах кроме них не было ничего: человек ничего не поправлял — жалоба наша.
+    """
+    text = (answer or "").lstrip()
+    while text:
+        match = _FIRST_SENTENCE.match(text)
+        if match is None or not _meta_sentence(match.group(0)):
+            break
+        text = text[match.end() :].lstrip()
+    if "\n" not in text and len(text) <= META_SENTENCE_CHARS and _meta_sentence(text):
+        # Извинение без точки в конце — весь ответ и есть вежливость.
+        return ""
+    return text.strip()
+
+
 def invented_prices(answer: str, allowed: set[int]) -> set[int]:
     """Суммы из ответа, которых не было в результатах инструментов.
 

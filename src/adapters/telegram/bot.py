@@ -412,7 +412,9 @@ async def _send_card(  # noqa: ANN001
         if len(text) <= CAPTION_LIMIT:
             sent = await bot.send_photo(chat_id, photo, caption=text, reply_markup=markup)
         else:
-            sent = await bot.send_photo(chat_id, photo)
+            # Фото без подписи — сообщение без текста: ночью 15.09 таких пришло 33 в 11 диалогах.
+            # Подпись всегда короткая (название, цена, основание), полное описание — следующим.
+            sent = await bot.send_photo(chat_id, photo, caption=_caption(card))
             await bot.send_message(chat_id, fit(text), reply_markup=markup)
     except TelegramBadRequest as exc:
         log.warning("Фото товара %s не отправилось: %s", card.product.sku_1c, exc)
@@ -420,6 +422,14 @@ async def _send_card(  # noqa: ANN001
         return
 
     _remember_photo(storage, card, sent)
+
+
+def _caption(card: ProductCard) -> str:
+    """Короткая подпись к снимку: название, цена и наличие. Длинное описание идёт отдельно."""
+    short = render_list_item(card)
+    if len(short) <= CAPTION_LIMIT:
+        return short
+    return _escape(card.product.name)[: CAPTION_LIMIT - 1]
 
 
 def _photo(card: ProductCard, storage):  # noqa: ANN001, ANN202 — тип зависит от aiogram

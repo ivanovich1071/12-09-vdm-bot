@@ -62,17 +62,22 @@ from agent.verify import (
     promises_goods,
     section_ages,
     title_matches,
+    without_meta,
     without_promises,
     without_unverified,
 )
 from core import exports, intent, selection
 from core.profile import whole_object
-from core.ui import Button, Keyboard, Message, ProductCard, Response
+from core.ui import Button, Keyboard, Message, ProductCard, Response, price_text, stock_text
 
 log = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 MAX_TOOL_ROUNDS = 4
+# Сколько раз за ход обращаемся к модели. Ночью 15.09 ход доходил до десяти вызовов: 79 секунд
+# ожидания и 6.25 ₽ за диалог против 1.35 ₽ прежних. После лимита отвечаем тем, что уже собрано
+# и проверено: молчание превращалось в «консультант временно недоступен» на самых важных ходах.
+TURN_CALLS = 4
 HISTORY_LIMIT = 12
 # Сколько карточек прикладываем к ответу модели. Заказчик отдельно попросил
 # не больше трёх: пять карточек подряд читаются как выгрузка, а не как подбор.
@@ -300,6 +305,8 @@ class SalesAgent:
                 return self._consult_question(session, tools, decision)
             return self.engine.offer(session, text)
 
+        if show_cards:
+            answer = self._with_catalog_positions(tools, answer)
         answer = session.masker.unmask(answer)
         session.remember("assistant", answer)
         session.profile.remember_offered(_unique(tools.shown_skus))
@@ -332,6 +339,13 @@ class SalesAgent:
             product = self.engine.index.get(sku)
             if product is None or not _named_in(product.name, words, pairs):
                 continue
+            # Название в каталоге начинается с кода перечня: «2.14.106 Установка для изучения
+            # фотоэффекта». Ночью 15.09 (сц. 11) модель перечислила пункты 2.14.1–2.14.3, которых
+            # в каталоге нет, а карточки пришли от 2.14.106 и 2.14.100: совпали слова «лабораторный
+            # демонстрационный». Пункт не назван в ответе — товар не он.
+            code = _name_code(product.name)
+            if code and not names_code(answer, code):
+                continue
             # Модель бывает права, отказывая: 01.09 она сама выяснила, что код
             # 45892 — игрушечный бронемобиль, честно об этом написала, а карточка
             # бронемобиля всё равно пришла — «упомянут» и «рекомендован» тут не
@@ -344,6 +358,43 @@ class SalesAgent:
                 continue
             matched.append(sku)
         return matched
+
+    def _with_catalog_positions(self, tools: ToolBox, answer: str) -> str:
+        """Пункты перечня в ответе — не товары: дописываем позиции каталога тех же разделов.
+
+        Ночью 15.09 на «покажите первые три позиции из раздела» бот перечислил пункты приказа
+        2.14.1–2.14.3 («столов в каталоге нет»), а карточками прислал 2.14.106, 2.14.100 и 2.14.30 —
+        человек видел один список, а под ним другие товары. Теперь список и карточки собираются из
+        одних и тех же позиций: текст дописывается кодом, поэтому названия и цены — из каталога.
+        """
+        if self._mentioned_skus(tools, answer):
+            return answer
+        products = self._section_products(tools, answer)
+        if not products:
+            return answer
+        lines = [
+            f"{number}. {product.name} — {price_text(product.price)}, {stock_text(product)}"
+            for number, product in enumerate(products, 1)
+        ]
+        return answer + "\n\n" + _CATALOG_BLOCK + "\n" + "\n".join(lines)
+
+    def _section_products(self, tools: ToolBox, answer: str) -> list:
+        """Позиции каталога из тех же разделов перечня, что названы в ответе."""
+        sections = set()
+        for code, _ in listed_codes(answer):
+            parts = code.split(".")
+            section = ".".join(parts[:-1]) if len(parts) > 2 else code
+            if section.count(".") >= 1:
+                sections.add(section)
+        if not sections:
+            return []
+        products = []
+        for sku in _unique(tools.shown_skus):
+            product = self.engine.index.get(sku)
+            code = _name_code(product.name) if product is not None else ""
+            if code and not names_code(answer, code) and code.rsplit(".", 1)[0] in sections:
+                products.append(product)
+        return products[:CARDS_SHOWN]
 
     # --- Цикл вызова инструментов -------------------------------------------
 
@@ -374,7 +425,12 @@ class SalesAgent:
         schemas: list[dict] | None,
     ) -> str:
         for _ in range(MAX_TOOL_ROUNDS):
+            if tools.calls >= TURN_CALLS:
+                # Лимит хода исчерпан: дальше только просьба ответить по собранному.
+                tools.session.route["call_limit"] = tools.calls
+                break
             message = client.complete(messages, tools=schemas)
+            tools.calls += 1
             account_usage(tools.session, client, message)
             calls = message.get("tool_calls") or []
             if not calls:
@@ -401,6 +457,7 @@ class SalesAgent:
             }
         )
         final = client.complete(messages)
+        tools.calls += 1
         account_usage(tools.session, client, final)
         return (final.get("content") or "").strip()
 
@@ -411,9 +468,11 @@ class SalesAgent:
         messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
         messages.append({"role": "user", "content": _INSIST})
         try:
-            return self._ask(messages, tools, tools_for(SELL))
+            second = without_meta(self._ask(messages, tools, tools_for(SELL)))
         except LLMError:
             return answer
+        # Осталась одна вежливость — показываем прежний ответ, а не «Понял, спасибо за замечание».
+        return second or answer
 
     def _instead_of_promise(  # noqa: ANN001
         self, session, tools: ToolBox, question: str, decision: Decision, answer: str
@@ -517,28 +576,40 @@ class SalesAgent:
 
         log.warning("%s Просим переписать ответ.", complaint)
         session.route["rewritten"] = {"complaint": complaint, "answer": answer[:DISCARDED_KEPT]}
-        messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
-        messages.append({"role": "user", "content": complaint + _REWRITE_HINT})
-        try:
-            # Переписывает та же роль и с теми же инструментами: консультанту на переписывании
-            # раньше выдавался весь набор продавца, и он отвечал «уточним через инструменты».
-            second = self._ask(messages, tools, schemas if schemas is not None else TOOL_SCHEMAS)
-        except LLMError:
-            return ""
+        second = ""
+        if tools.calls < TURN_CALLS:
+            messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
+            messages.append({"role": "user", "content": complaint + _REWRITE_HINT})
+            try:
+                # Переписывает та же роль и с теми же инструментами: консультанту на переписывании
+                # раньше выдавался весь набор продавца, и он отвечал «уточним через инструменты».
+                second = self._ask(messages, tools, schemas if schemas is not None else TOOL_SCHEMAS)
+            except LLMError:
+                second = ""
+            # Просьбу переписать модель принимает за реплику человека и отвечает на неё: «Спасибо,
+            # что поправили», «Переписываю строго по данным из инструментов». Ночью 15.09 это ушло
+            # клиенту 26 раз в 17 диалогах из 25, а в двух ходах кроме извинения не было ничего.
+            second = without_meta(second)
+        else:
+            session.route["call_limit"] = tools.calls
 
         prices |= tools.prices
         refs |= tools.norm_refs
-        second_complaint = self._complaint(second, prices, refs, session)
-        if not second_complaint:
-            return second
-        session.route["discarded"] = {"complaint": second_complaint, "answer": second[:DISCARDED_KEPT]}
-        if branch == CONSULT:
-            kept = without_unverified(second, prices, refs, self._registry_problems(second, session)[1])
+        if second:
+            second_complaint = self._complaint(second, prices, refs, session)
+            if not second_complaint:
+                return second
+            session.route["discarded"] = {"complaint": second_complaint, "answer": second[:DISCARDED_KEPT]}
+        # Молчать не из чего: оставляем подтверждённые строки — сначала переписанного ответа, потом
+        # первого. Раньше так делал только консультант, а пустой ответ продавца уходил в выдачу
+        # каталога и на возражении оборачивался «консультант временно недоступен» (ночь 15.09).
+        for text in (second, answer):
+            kept = without_unverified(text, prices, refs, self._registry_problems(text, session)[1])
             if len(kept) >= MIN_KEPT:
-                log.warning("Ответ консультанта выдуман повторно — строки с неподтверждённым убраны.")
+                log.warning("Ответ выдуман повторно — строки с неподтверждённым убраны.")
                 session.route["fallback"] = "unverified_lines_removed"
                 return f"{kept}\n\n{_UNVERIFIED_NOTE}"
-        log.warning("Ответ выдуман повторно — текст модели не показываем.")
+        log.warning("Ответ выдуман повторно, подтверждённых строк не осталось — текст не показываем.")
         return ""
 
     def _complaint(
@@ -679,16 +750,30 @@ class SalesAgent:
 
     def _service_reply(self, session, text: str, decision: Decision) -> list[Response] | None:  # noqa: ANN001
         """Ответ ядра без модели: файл, список из N позиций, следующая страница подбора."""
-        if decision.intent == EXPORT_REQUEST:
-            session.route["fallback"] = "export"
-            return exports.offer(self.engine, session)
         profile = session.profile
+        if decision.intent == EXPORT_REQUEST:
+            offer = exports.offer(self.engine, session)
+            if offer is not None:
+                session.route["fallback"] = "export"
+                return offer
+            # Выгружать нечего: «Сохранять пока нечего: сначала соберём комплектацию» было ответом
+            # на «нужна спецификация в Excel и счёт» в 11 диалогах из 25 (ночь 15.09) — и разговор
+            # на этом кончался. Пусть отвечает агент: он и соберёт то, что потом уйдёт файлом.
         size = intent.list_size(text)
         # Оформление по присланному файлу — ядро, а не модель: 15.09 на «сформируй предзаказ» и «все найденные
         # по 1 шт.» модель трижды пересобрала строки файла по-разному (14 из 15, потом 4 из 15).
         if profile.order and profile.export == "order" and intent.asks_order_checkout(text):
             session.route["fallback"] = "order_cart"
             return self.engine.order_cart(session, override=intent.each_quantity(text))
+        # «Оформить», «выставьте счёт» без присланного файла: корзина и предзаказ — кодом. Ночью
+        # 15.09 на «Оформить. Согласен. Организация, контакт…» модель присылала анкету «1. Название
+        # организации…» или советовала нажать кнопку, которой под сообщением не было: за 25 диалогов
+        # ни одного предзаказа и ни одной непустой корзины.
+        if not profile.order and intent.asks_checkout(text):
+            checkout = self.engine.checkout_by_intent(session, text)
+            if checkout is not None:
+                session.route["fallback"] = "checkout"
+                return checkout
         # Присланный заказ: «подбери по этому заказу», «из наличия 30 позиций» и «а ещё» — по его строкам.
         if profile.order and (intent.mentions_order(text) or (size and profile.export == "order")):
             session.route["fallback"] = "order_list"
@@ -876,6 +961,21 @@ def _rejected(answer: str, needle: str) -> bool:
         if needle.lower() in low or all(word in low for word in words[:2]):
             mentions.append(sentence)
     return bool(mentions) and all(_REJECTION.search(sentence) for sentence in mentions)
+
+
+# Код перечня в начале названия товара: «2.14.106 Установка для изучения фотоэффекта».
+_NAME_CODE = re.compile(r"^\s*(\d{1,2}(?:\.\d{1,3}){1,5})\s")
+_CATALOG_BLOCK = "Что по этим пунктам есть в каталоге:"
+
+
+def _name_code(name: str) -> str:
+    match = _NAME_CODE.match(name or "")
+    return match.group(1) if match else ""
+
+
+def names_code(answer: str, code: str) -> bool:
+    """Назван ли в ответе именно этот пункт: 2.14.10 — не 2.14.106."""
+    return bool(re.search(rf"(?<![\d.]){re.escape(code)}(?![\d.])", answer or ""))
 
 
 def _named_in(name: str, words: list[str], pairs: set[tuple[str, str]]) -> bool:

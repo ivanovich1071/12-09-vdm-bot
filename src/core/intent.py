@@ -264,9 +264,54 @@ _EACH_QUANTITY = re.compile(
 )
 
 
+# «Оформить», «оформим», «выставьте счёт», «готовы заказать» — просьба оформить заказ словами.
+# Вопрос «как оформить доставку?» просьбой не считается, и «оформление занимает неделю» тоже:
+# ядру тут нечего делать, на такое отвечает консультант.
+_CHECKOUT = re.compile(
+    r"\bоформ(?:ить|им|ите|и|ляйте)\b|\bпредзаказ\w*|\bвыстав\w+\s+счет\w*|\bсчет\s+на\s+оплат\w*|"
+    r"\bготов\w*\s+(?:заказ\w*|оформ\w*)",
+    re.IGNORECASE,
+)
+
+
+def asks_checkout(text: str) -> bool:
+    """Просьба оформить заказ — без присланного файла (`asks_order_checkout` — по нему)."""
+    plain = (text or "").lower().replace("ё", "е")
+    return "?" not in plain and bool(_CHECKOUT.search(plain))
+
+
 def asks_order_checkout(text: str) -> bool:
     """Просьба оформить или положить в корзину — по присланному заказу, если он есть."""
     return bool(_ORDER_CHECKOUT.search(text or "") or _EACH_QUANTITY.search(text or ""))
+
+
+# Пункт перечня в реплике и количество рядом с ним: «1.5.1.6 Гимнастическая стенка — 4 шт.».
+# Дата 25.12.2024 пунктом не считается: в пункте не больше трёх цифр в группе.
+_POINT = re.compile(r"(?<![\d.,])(\d{1,2}(?:\.\d{1,3}){2,5})(?![\d.])")
+_PIECES = re.compile(r"(\d{1,4})\s*(?:шт|штук|компл|набор|ед\b|единиц)\w*", re.IGNORECASE)
+
+
+def listed_points(text: str) -> list[tuple[str, int | None]]:
+    """Пункты перечня из реплики с количеством: «1.5.1.6 Гимнастическая стенка — 4 шт.» → («1.5.1.6», 4).
+
+    Человек перечисляет комплектацию своими словами — списком, который до этого прислал бот, —
+    и добавляет «сформируй предзаказ». 16.09 такая реплика упиралась в «корзина пуста»: ядро
+    искало показанные карточки, а их в разговоре про пункты приказа не было.
+    """
+    plain = text or ""
+    points: list[tuple[str, int | None]] = []
+    seen: set[str] = set()
+    found = list(_POINT.finditer(plain))
+    for number, match in enumerate(found):
+        code = match.group(1)
+        if code in seen:
+            continue
+        seen.add(code)
+        end = found[number + 1].start() if number + 1 < len(found) else len(plain)
+        # Количество ищем до следующего пункта и не дальше строки: «4 шт.» из соседнего пункта чужое.
+        pieces = _PIECES.search(plain[match.end() : end].split("\n")[0])
+        points.append((code, int(pieces.group(1)) or None if pieces else None))
+    return points
 
 
 def each_quantity(text: str) -> int | None:
@@ -287,6 +332,7 @@ __all__ = [
     "SMALL_TALK",
     "TASK",
     "asks_for_goods",
+    "asks_checkout",
     "asks_more",
     "asks_order_checkout",
     "asks_to_show",
@@ -295,6 +341,7 @@ __all__ = [
     "each_quantity",
     "is_short",
     "list_size",
+    "listed_points",
     "mentions_order",
     "names_goods",
     "norm_code",

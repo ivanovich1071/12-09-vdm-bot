@@ -229,6 +229,9 @@ class ToolBox:
         self.kit: dict[str, Any] | None = None
         # Все разделы с составом, разобранные за ход: модель смотрит несколько, пишет об одном.
         self.kits: dict[str, dict[str, Any]] = {}
+        # Сколько раз за этот ход уже обращались к модели: по нему агент держит лимит хода
+        # (`agent.TURN_CALLS`). Ночью 15.09 один ход доходил до десяти вызовов и 79 секунд.
+        self.calls = 0
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
         handler = getattr(self, f"_{name}", None)

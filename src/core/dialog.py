@@ -14,12 +14,13 @@ import time
 from dataclasses import dataclass, field
 
 from catalog.models import Availability, Product
+from catalog.points import PointFinder
 from catalog.runtime import CatalogRuntime, CatalogRuntimeState
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
 from catalog.service import CatalogService
 from core import exports, intent, selection
 from core.config import Settings
-from core.models import CartItem, Customer
+from core.models import Cart, CartItem, Customer
 from core.profile import DialogProfile
 from core.storage import Storage
 from core.ui import (
@@ -194,6 +195,13 @@ class Session:
         self.masker = Masker()
         self.prices.clear()
         self.norm_refs.clear()
+
+
+# Сколько последних показанных позиций кладём в корзину на «оформить», когда списка не было:
+# человек видел три карточки — их и оформляем.
+OFFERED_TO_CART = 3
+# Сколько пунктов перечня разбираем за одно «оформить»: комплектация спортзала — два десятка.
+POINTS_TO_CART = 40
 
 
 class DialogEngine:
@@ -865,27 +873,9 @@ class DialogEngine:
 
     def _add_all(self, session: Session) -> list[Response]:
         """«Всё в корзину» под списком N позиций: по одной штуке каждой."""
-        cart = self.storage.load_cart(session.user_id)
-        added = 0
-        for sku in session.profile.shortlist:
-            product = self.index.get(sku)
-            if product is None:
-                continue
-            norm = product.norm_for(session.profile.audience, session.profile.room or "")
-            cart.add(
-                CartItem(
-                    sku_1c=product.sku_1c,
-                    name=product.name,
-                    price=product.price,
-                    quantity=1,
-                    url=product.url,
-                    norm_citation=norm.citation if norm else None,
-                )
-            )
-            added += 1
+        added, cart = self._add_skus(session, session.profile.shortlist, 1)
         if not added:
             return [Message("Список пуст — сначала подберём позиции.", keyboard=self._main_menu())]
-        self.storage.save_cart(cart)
         return [
             Message(
                 f"Добавил в корзину {added} {plural(added, 'позицию', 'позиции', 'позиций')}. "
@@ -893,6 +883,161 @@ class DialogEngine:
                 keyboard=Keyboard().row(Button("Моя корзина", "cart"), Button("Оформить", "checkout")),
             )
         ]
+
+    def _add_skus(self, session: Session, skus: list[str], quantity: int) -> tuple[int, Cart]:
+        """Позиции в корзину по кодам: общая часть «всё в корзину» и «оформить» словами."""
+        chosen: list[tuple[Product, int]] = []
+        for sku in skus:
+            product = self.index.get(sku)
+            if product is not None:
+                chosen.append((product, quantity))
+        return self._add_products(session, chosen)
+
+    def _add_products(self, session: Session, chosen: list[tuple[Product, int]]) -> tuple[int, Cart]:
+        """Товары в корзину, у каждого своё количество.
+
+        Что уже лежит в корзине, не удваивается: «оформить» человек пишет и после того, как
+        сам добавил позицию кнопкой.
+        """
+        cart = self.storage.load_cart(session.user_id)
+        added = 0
+        for product, quantity in chosen:
+            if cart.find(product.sku_1c) is not None:
+                continue
+            norm = product.norm_for(session.profile.audience, session.profile.room or "")
+            cart.add(
+                CartItem(
+                    sku_1c=product.sku_1c,
+                    name=product.name,
+                    price=product.price,
+                    quantity=max(1, quantity),
+                    url=product.url,
+                    norm_citation=norm.citation if norm else None,
+                )
+            )
+            added += 1
+        if added:
+            self.storage.save_cart(cart)
+        return added, cart
+
+    def _points_to_products(
+        self, session: Session, points: list[tuple[str, int | None]], each: int | None
+    ) -> tuple[list[tuple[Product, int]], list[str], list[str]]:
+        """Пункты перечня — в позиции каталога: по одному товару на пункт, в порядке перечня.
+
+        Пункт — это норма, а не товар: под ним в каталоге бывает несколько позиций. Берём ту,
+        что в наличии и дешевле, и говорим человеку, что по пункту взята одна позиция, — иначе
+        предзаказ из двадцати пунктов не собрать вовсе. Количество: названное для всех («все по
+        1 шт.»), иначе указанное у самого пункта, иначе одна штука.
+
+        Пункт без привязки в каталоге ищется по номеру в названии товара и по формулировке
+        приказа (`catalog.points`); подобранное по формулировке возвращается отдельным списком —
+        человеку такие позиции показываются как требующие проверки.
+        """
+        finder = self.point_finder(session)
+        chosen: list[tuple[Product, int]] = []
+        missing: list[str] = []
+        review: list[str] = []
+        for code, quantity in points[:POINTS_TO_CART]:
+            found = finder.find(code)
+            if found is None:
+                missing.append(code)
+                continue
+            if not found.confirmed:
+                review.append(code)
+            chosen.append((found.product, each or quantity or 1))
+        return chosen, missing, review
+
+    def point_finder(self, session: Session) -> PointFinder:
+        """Поиск товара по пункту перечня для одной операции: словарь названий строится один раз."""
+        return PointFinder(
+            self.index,
+            self.norm_texts,
+            tuple(session.profile.norm_doc_ids),
+            session.profile.audience,
+        )
+
+    def _last_answer(self, session: Session) -> str:
+        for message in reversed(session.history):
+            if message.get("role") == "assistant":
+                return message.get("content") or ""
+        return ""
+
+    def checkout_by_intent(self, session: Session, text: str = "") -> list[Response] | None:
+        """«Оформить», «сформируй предзаказ» словами: корзина и предзаказ — кодом, а не анкетой модели.
+
+        Ночью 15.09 на «Оформить. Согласен. Организация, контакт, телефон…» бот отвечал анкетой
+        «1. Название организации…» или советовал нажать кнопку, которой под сообщением не было:
+        за 25 диалогов ни одного предзаказа и ни одной непустой корзины. 16.09 человек перечислил
+        комплектацию спортзала пунктами приказа и написал «сформируй предзаказ» — ответом было
+        «корзина пуста»: ядро искало показанные карточки, а разговор шёл о пунктах перечня.
+
+        Порядок источников: пункты из самой реплики, показанные позиции, пункты из последнего
+        ответа бота (человек пишет «оформи» сразу под присланной комплектацией).
+        """
+        cart = self.storage.load_cart(session.user_id)
+        if not cart.is_empty:
+            return self._start_checkout(session)
+        profile = session.profile
+        each = intent.each_quantity(text)
+        shown = profile.shortlist or profile.offered[-OFFERED_TO_CART:]
+        points = intent.listed_points(text)
+        if not points and not shown:
+            points = intent.listed_points(self._last_answer(session))
+        missing: list[str] = []
+        review: list[str] = []
+        if points:
+            chosen, missing, review = self._points_to_products(session, points, each)
+            added, cart = self._add_products(session, chosen)
+            head = (
+                f"Оформляем. Собрал корзину по перечню: {added} "
+                f"{plural(added, 'позиция', 'позиции', 'позиций')}, по одной на пункт. "
+                f"В корзине {cart.count} шт. на {price_text(cart.total)}."
+            )
+        else:
+            added, cart = self._add_skus(session, shown, each or 1)
+            head = (
+                f"Оформляем. Положил в корзину {added} "
+                f"{plural(added, 'позицию', 'позиции', 'позиций')} из показанных, по {each or 1} шт. "
+                f"В корзине {cart.count} шт. на {price_text(cart.total)}."
+            )
+        if not added:
+            answer = self._nothing_to_checkout(missing)
+            session.remember("assistant", answer)
+            return [Message(answer, keyboard=self._offer_menu())]
+        lines = [head]
+        if review:
+            lines.append(
+                f"По пунктам {_points_line(review)} привязки в каталоге нет — подобрал ближайшее "
+                "по формулировке приказа, проверьте эти позиции."
+            )
+        if missing:
+            lines.append(_missing_points(missing))
+        lines.append(
+            "Проверьте состав и нажмите «Оформить» — дальше спрошу организацию, контакт и телефон. "
+            "Если по какому-то пункту нужен другой вариант, назовите его номер."
+        )
+        answer = " ".join(lines)
+        session.remember("assistant", answer)
+        return [
+            Message(
+                answer,
+                keyboard=Keyboard().row(Button("Моя корзина", "cart"), Button("Оформить", "checkout")),
+            )
+        ]
+
+    def _nothing_to_checkout(self, missing: list[str]) -> str:
+        """Оформлять нечего: молчать нельзя, но и общая отговорка не годится, если пункты названы."""
+        if missing:
+            return (
+                f"По этим пунктам в каталоге позиций нет: {_points_line(missing)}. "
+                f"Назовите товар словами — подберу замену, или подключим менеджера: "
+                f"{self.settings.manager_contact}."
+            )
+        return (
+            "Оформлять пока нечего: корзина пуста. Скажите, для какого помещения подбираем "
+            "или назовите пункт перечня — соберу список, и оформим его одним нажатием."
+        )
 
     def order_cart(self, session: Session, default: int | None = None, override: int | None = None) -> list[Response]:
         """Найденные позиции присланного заказа — в корзину, без модели.
@@ -1585,3 +1730,12 @@ def describe(product: Product) -> str:
     if norm:
         parts.append(norm.citation)
     return " · ".join(parts)
+
+
+def _points_line(codes: list[str]) -> str:
+    shown = ", ".join(codes[:10])
+    return shown if len(codes) <= 10 else f"{shown} и ещё {len(codes) - 10}"
+
+
+def _missing_points(missing: list[str]) -> str:
+    return f"Без позиций остались пункты {_points_line(missing)} — в каталоге по ним ничего нет."

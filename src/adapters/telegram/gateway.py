@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from core.errors import DomainError
-from core.ui import Button, Keyboard, Message, Response, price_text
+from core.ui import Button, Keyboard, Message, Response, plural, price_text
 from core_api import dto
 from core_api.facade import CoreApi
 from core_api.sessions import CoreSession
@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 
 CHANNEL = "telegram"
 PROBLEM_LINES = 10
+# Сколько позиций будущего предзаказа показываем в сообщении: остальное — в файле.
+PREVIEW_LINES = 12
 # Надписи постоянной клавиатуры и «Меню»: пока бот ждёт контакт, они сбрасывают ожидание, а не читаются как имя.
 LEAVES_CONTACT = frozenset(
     {"начать заново", "каталог", "моя корзина", "корзина", "менеджер", "связаться с менеджером", "меню", "отмена"}
@@ -171,6 +173,9 @@ class TelegramGateway:
         if evaluation.status != "REJECTED":
             matched = [item for item in evaluation.items if item.get("match_status") in MATCHED]
             if all(item.get("quantity") is not None for item in matched):
+                # Количество есть у всех найденных строк — это уже предзаказ: показываем состав
+                # с ценами, чтобы человек согласовал его до того, как отдаст контакт.
+                text += preorder_preview(matched)
                 keyboard.row(Button("Оформить предзаказ", f"po_order:{order.id}"))
             else:
                 # 15.09 свой же файл «Подобранные позиции» без количества ушёл менеджеру предзаказом на 0 ₽.
@@ -325,6 +330,32 @@ _STATUSES = {
 
 def _status(code: str) -> str:
     return _STATUSES.get(code, code)
+
+
+def preorder_preview(matched: list[dict]) -> str:
+    """Состав будущего предзаказа: позиция, количество, цена, сумма — и итог.
+
+    До 16.09 итог проверки файла был только счётом строк и общей суммой. Человек, приславший
+    заполненную выгрузку бота, соглашался вслепую: что именно и почём уходит менеджеру, он видел
+    лишь в файле предзаказа — уже после того, как оставил телефон.
+    """
+    rows = [item for item in matched if item.get("quantity")]
+    if not rows:
+        return ""
+    lines = ["", "Предзаказ на согласование:"]
+    for item in rows[:PREVIEW_LINES]:
+        name = item.get("name") or item.get("source_name") or ""
+        price, total = item.get("current_price"), item.get("current_total")
+        if price:
+            lines.append(f"{item['line_no']}. {name} — {item['quantity']} × {price_text(price)} = {price_text(total)}")
+        else:
+            lines.append(f"{item['line_no']}. {name} — {item['quantity']} шт., цена по запросу")
+    if len(rows) > PREVIEW_LINES:
+        left = len(rows) - PREVIEW_LINES
+        lines.append(f"… и ещё {left} {plural(left, 'позиция', 'позиции', 'позиций')} — весь состав в файле предзаказа.")
+    amount = sum(item.get("current_total") or 0 for item in rows)
+    lines.append(f"Итого {len(rows)} {plural(len(rows), 'позиция', 'позиции', 'позиций')} на {price_text(amount)}.")
+    return "\n".join(lines)
 
 
 def evaluation_text(order: dto.OrderOut, evaluation: dto.EvaluationOut) -> str:

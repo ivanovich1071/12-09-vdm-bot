@@ -7,6 +7,12 @@
 без модели: пункты и количество — из текста приказа, товары, цены и наличие — из каталога.
 
 Формат выбирает человек кнопками «Скачать Excel» и «Скачать Word» (решение заказчика 14.09).
+
+**Шапка таблицы — общая для всех файлов бота** (`ORDER_COLUMNS`): комплектация, список подбора и
+спецификация предзаказа называют колонки одинаково. Это не косметика: свой же файл человек
+скачивает, проставляет количество и присылает обратно, а разбор заказа узнаёт колонки по точному
+названию. До 16.09 комплектация уходила с колонками «Наименование по перечню» и «Кол-во по
+перечню», которых разбор не знал, — присланный обратно файл терял и названия, и количество.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from catalog.models import Availability, Product
+from catalog.points import REGISTRY, PointFinder, PointMatch
 from core.ui import Button, Keyboard, Message, Response, plural, stock_text
 from norms import documents as norm_docs
 
@@ -27,12 +33,33 @@ EXCEL, WORD = "xlsx", "docx"
 # Индексы стилей `documents/xlsx.py`: обычный, жирный, число с разрядами.
 PLAIN, BOLD, NUMBER = 0, 1, 2
 
-KIT_COLUMNS = ("Пункт", "Наименование по перечню", "Кол-во по перечню", "Товар в каталоге", "Код 1С", "Цена, ₽", "Наличие")
-KIT_WIDTHS = [14, 60, 16, 60, 16, 12, 22]
-# «Кол-во» — чтобы свой же файл, присланный обратно, читался заказом, а не «не указано количество» (15.09).
-LIST_COLUMNS = ("№", "Наименование", "Код 1С", "Кол-во", "Цена, ₽", "Наличие", "Пункт перечня")
-LIST_WIDTHS = [5, 70, 16, 10, 12, 22, 18]
+# Единая шапка заказа: первые восемь колонок — как в спецификации предзаказа
+# (`documents/templates/specification.json`), дальше — перечень, ради которого всё собирается.
+ORDER_COLUMNS = (
+    "№",
+    "Код 1С",
+    "Наименование",
+    "Кол-во",
+    "Ед.",
+    "Цена, ₽",
+    "Сумма, ₽",
+    "Наличие",
+    "Пункт",
+    "Наименование по перечню",
+    "Норма по перечню",
+    "Сопоставление",
+)
+ORDER_WIDTHS = [5, 16, 55, 8, 6, 12, 13, 18, 12, 50, 18, 26]
+# Номер колонки «Сумма, ₽» в строке: по ней считается итог файла.
+AMOUNT_CELL = 6
+
 NOTE = "Предварительный список. Цены и наличие — по каталогу на дату данных выше; окончательно их подтверждает менеджер."
+FILL_NOTE = (
+    "Чтобы заказать: впишите количество в колонку «Кол-во», сохраните файл и пришлите его боту — "
+    "он пересчитает цены по текущему каталогу и соберёт предзаказ. Остальные колонки не меняйте: "
+    "по коду 1С и пункту перечня бот узнаёт позицию."
+)
+NOT_IN_CATALOG = "нет в каталоге"
 
 Row = list[tuple[Any, int]]
 
@@ -50,16 +77,16 @@ def buttons(keyboard: Keyboard | None = None) -> Keyboard:
     )
 
 
-def offer(engine: DialogEngine, session: Session) -> list[Response]:
-    """Ответ на «сохрани в файл»: что будет в файле и выбор формата."""
+def offer(engine: DialogEngine, session: Session) -> list[Response] | None:
+    """Ответ на «сохрани в файл»: что будет в файле и выбор формата. `None` — выгружать нечего.
+
+    Раньше на пустом месте отвечали «Сохранять пока нечего: сначала соберём комплектацию».
+    Ночью 15.09 это пришло на «нужна спецификация в Excel и счёт» в 11 диалогах из 25, и разговор
+    кончался: спецификацию просят как раз тогда, когда список ещё не собран. Теперь отвечает агент.
+    """
     what = _subject(session)
     if what is None:
-        text = (
-            "Сохранять пока нечего: сначала соберём комплектацию или подберём позиции. "
-            "Для какого помещения подбираем?"
-        )
-        session.remember("assistant", text)
-        return [Message(text)]
+        return None
     text = f"Пришлю {what} файлом. В каком виде?"
     session.remember("assistant", text)
     return [Message(text, keyboard=buttons())]
@@ -69,9 +96,9 @@ def build(engine: DialogEngine, session: Session, fmt: str) -> ExportFile | None
     """Файл списка разговора. `None` — выгружать нечего."""
     profile = session.profile
     if _kit_first(profile):
-        title, meta, header, rows, widths = _kit_table(engine, profile.kit)
+        title, meta, rows = _kit_table(engine, session, profile.kit)
     elif profile.shortlist:
-        title, meta, header, rows, widths = _list_table(engine, session)
+        title, meta, rows = _list_table(engine, session)
     else:
         return None
     # «Выгрузка 15.09» читалась как дата данных, а данные каталога были на 27.08 (разбор 15.09).
@@ -82,12 +109,16 @@ def build(engine: DialogEngine, session: Session, fmt: str) -> ExportFile | None
         + (f", данные на {stamp}" if stamp else "")
         + f"; файл сформирован {dt.date.today():%d.%m.%Y}",
     ]
+    amount = _amount(rows)
+    if amount:
+        rows = [*rows, _totals_row(amount)]
+    header = list(ORDER_COLUMNS)
 
     if fmt == WORD:
         from documents.docx import write_document
 
-        table = [list(header), *[[_text(value) for value, _ in row] for row in rows]]
-        content = write_document(title, meta, table, "", [NOTE])
+        table = [header, *[_row_text(row) for row in rows]]
+        content = write_document(title, meta, table, "", [FILL_NOTE, NOTE])
         extension = WORD
     else:
         from documents.xlsx import write_sheets
@@ -99,11 +130,12 @@ def build(engine: DialogEngine, session: Session, fmt: str) -> ExportFile | None
             [(name, BOLD) for name in header],
             *rows,
             [],
+            [(FILL_NOTE, PLAIN)],
             [(NOTE, PLAIN)],
         ]
-        content = write_sheets([("Список", sheet, widths)])
+        content = write_sheets([("Заказ", sheet, ORDER_WIDTHS)])
         extension = EXCEL
-    return ExportFile(f"{_filename(title)}.{extension}", content, f"{title}. {NOTE}")
+    return ExportFile(f"{_filename(title)}.{extension}", content, f"{title}. {FILL_NOTE}")
 
 
 def _kit_first(profile) -> bool:  # noqa: ANN001 — core.profile.DialogProfile
@@ -122,40 +154,120 @@ def _subject(session: Session) -> str | None:
     return None
 
 
-def _kit_table(engine: DialogEngine, kit: dict[str, Any]):  # noqa: ANN202
+def _kit_table(engine: DialogEngine, session: Session, kit: dict[str, Any]):  # noqa: ANN202
     doc_id = kit.get("document") or ""
     doc = norm_docs.get(doc_id).short_name if doc_id in norm_docs.DOCUMENTS else doc_id
     title = f"Комплектация {kit.get('code', '')} {kit.get('title', '')}".strip()
     meta = [f"Основание: {doc}, раздел {kit.get('code')} «{kit.get('title')}»"]
     positions = kit.get("positions") or []
     codes = [str(position.get("code", "")) for position in positions]
-    offers = _catalog_by_point(engine, doc_id)
+    finder = PointFinder(
+        engine.index, engine.norm_texts, (doc_id,) if doc_id else (), session.profile.audience
+    )
     rows: list[Row] = []
+    number = 0
     for position in positions:
         code, name = str(position.get("code", "")), str(position.get("title", ""))
         # Раздел внутри раздела — «1.13.3.1 Рабочее место педагога» — строка-заголовок группы.
+        # Наименование у неё пустое: разбор присланного файла такую строку позицией не считает.
         if any(other.startswith(f"{code}.") for other in codes):
-            rows.append([(code, BOLD), (name, BOLD)])
+            rows.append(_group_row(code, name))
             continue
-        product = _best(offers.get(code, []))
-        cells = _product_cells(product) if product is not None else [("в каталоге не найдено", PLAIN)]
-        rows.append([(code, PLAIN), (name, PLAIN), (position.get("quantity") or "уточняется", PLAIN), *cells])
-    return title, meta, KIT_COLUMNS, rows, KIT_WIDTHS
+        number += 1
+        norm = " ".join(str(position.get("quantity") or "").split())
+        rows.append(_order_row(number, finder.find(code, name), code, name, norm))
+    return title, meta, rows
 
 
 def _list_table(engine: DialogEngine, session: Session):  # noqa: ANN202
+    """Подобранные позиции: пункт и формулировка — из оснований самого товара."""
     rows: list[Row] = []
-    audience = session.profile.audience
+    profile = session.profile
+    finder = engine.point_finder(session)
     quantities = _quantities(engine, session)
-    for sku in session.profile.shortlist:
+    for sku in profile.shortlist:
         product = engine.index.get(sku)
         if product is None:
             continue
-        points = [ref.item_code for ref in product.norms_for(audience) if ref.item_code]
-        name, code, price, stock = _product_cells(product)
-        quantity = quantities.get(product.id) or quantities.get(product.sku_1c) or "уточняется"
-        rows.append([(len(rows) + 1, PLAIN), name, code, (quantity, PLAIN), price, stock, (", ".join(points[:2]), PLAIN)])
-    return "Подобранные позиции", [], LIST_COLUMNS, rows, LIST_WIDTHS
+        points = [ref.item_code for ref in product.norms_for(profile.audience) if ref.item_code]
+        code = points[0] if points else ""
+        rows.append(
+            _order_row(
+                len(rows) + 1,
+                PointMatch(code, product, REGISTRY) if code else None,
+                code,
+                finder.title(code),
+                finder.norm_quantity(code),
+                quantity=_count(quantities.get(product.id) or quantities.get(product.sku_1c)),
+                product=product,
+            )
+        )
+    return "Подобранные позиции", [], rows
+
+
+def _order_row(  # noqa: ANN202
+    number: int,
+    match: PointMatch | None,
+    code: str,
+    norm_title: str,
+    norm_quantity: str,
+    quantity: int | None = None,
+    product=None,  # noqa: ANN001 — catalog.models.Product
+) -> Row:
+    """Строка единой таблицы заказа. Количество — заказанное, иначе норма перечня числом."""
+    found = product if product is not None else (match.product if match is not None else None)
+    count = quantity if quantity is not None else _count(norm_quantity)
+    price = found.price if found is not None else None
+    return [
+        (number, PLAIN),
+        (found.sku_1c if found is not None else "", PLAIN),
+        (found.name if found is not None else norm_title, PLAIN),
+        (count, NUMBER) if count else ("", PLAIN),
+        (_unit(norm_quantity), PLAIN),
+        (price, NUMBER) if price is not None else ("по запросу", PLAIN),
+        (price * count, NUMBER) if price is not None and count else ("", PLAIN),
+        (stock_text(found) if found is not None else "", PLAIN),
+        (code, PLAIN),
+        (norm_title, PLAIN),
+        (norm_quantity, PLAIN),
+        (match.label if match is not None else NOT_IN_CATALOG, PLAIN),
+    ]
+
+
+def _group_row(code: str, name: str) -> Row:
+    return [("", PLAIN)] * 8 + [(code, BOLD), (name, BOLD)]
+
+
+def _totals_row(amount: int) -> Row:
+    return [("", PLAIN), ("", PLAIN), ("Итого", BOLD), ("", PLAIN), ("", PLAIN), ("", PLAIN), (amount, NUMBER)]
+
+
+def _amount(rows: list[Row]) -> int:
+    total = 0
+    for row in rows:
+        value = row[AMOUNT_CELL][0] if len(row) > AMOUNT_CELL else None
+        if isinstance(value, int) and not isinstance(value, bool):
+            total += value
+    return total
+
+
+def _count(value: Any) -> int | None:
+    """Количество числом: «2 Шт.» → 2, «По количеству детей в группе» → числа нет."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value or None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value > 0 else None
+    match = re.match(r"\s*(\d{1,4})\b", str(value))
+    return (int(match.group(1)) or None) if match else None
+
+
+def _unit(norm_quantity: str) -> str:
+    """Единица из нормы перечня: «2 Шт.» → «шт.». Пусто и непонятное — штуки."""
+    match = re.search(r"([А-Яа-яA-Za-z]+\.?)\s*$", (norm_quantity or "").strip())
+    unit = match.group(1).lower() if match else ""
+    return unit if unit.startswith(("шт", "компл", "набор", "пар")) else "шт."
 
 
 def _quantities(engine: DialogEngine, session: Session) -> dict[str, Any]:
@@ -177,31 +289,10 @@ def _data_date(engine: DialogEngine) -> str | None:
         return None
 
 
-def _catalog_by_point(engine: DialogEngine, doc_id: str) -> dict[str, list[Product]]:
-    """Товары каталога по пунктам перечня — один проход по каталогу на файл."""
-    found: dict[str, list[Product]] = {}
-    for product in engine.index.products:
-        if not product.is_active:
-            continue
-        for ref in product.norms:
-            if ref.doc_id == doc_id and ref.item_code:
-                found.setdefault(ref.item_code, []).append(product)
-    return found
-
-
-def _best(products: list[Product]) -> Product | None:
-    """Сначала то, что есть в наличии и с ценой, дальше — дешевле."""
-    if not products:
-        return None
-    return min(
-        products,
-        key=lambda product: (product.availability is not Availability.AVAILABLE, product.price is None, product.price or 0),
-    )
-
-
-def _product_cells(product: Product) -> Row:
-    price = (product.price, NUMBER) if product.price is not None else ("по запросу", PLAIN)
-    return [(product.name, PLAIN), (product.sku_1c, PLAIN), price, (stock_text(product), PLAIN)]
+def _row_text(row: Row) -> list[str]:
+    """Строка для Word: все колонки, пустые в том числе, — иначе таблица разъезжается."""
+    values = [_text(value) for value, _ in row]
+    return values + [""] * (len(ORDER_COLUMNS) - len(values))
 
 
 def _text(value: Any) -> str:
