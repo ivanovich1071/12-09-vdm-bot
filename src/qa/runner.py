@@ -12,6 +12,7 @@ import json
 import os
 import time
 import urllib.request
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from qa.checks import CatalogFacts, check_turn
 from qa.judge import judge
 from qa.llm import DEFAULT_MODEL, Model, openrouter
 from qa.models import DialogResult, Turn
-from qa.persona import Move, next_move
+from qa.persona import HOLD_LIMIT, Plan, next_move
 from qa.report import append_result, load_results, render
 from qa.scenarios import Scenario, Variant, merge, parse, select, variants
 from qa.telegram import BotChat, LoginError
@@ -28,6 +29,8 @@ from qa.telegram import BotChat, LoginError
 SESSION = Path("data/qa/tester")
 # 100 сценариев заказчика — файл по умолчанию (tests/scenarios, сверен с присланными частями 14.09).
 DEFAULT_SCENARIOS = Path("tests/scenarios/vdm_100_scenarios.md")
+# Сколько ходов сверх плана даём на уточнения, возражения и доведение до корзины или заявки.
+SCRIPT_SLACK = 4
 MODES = {"main": "только основной путь", "main+1": "основной путь и одна ветка по очереди", "all": "основной путь и все ветки"}
 
 HELP_API = """Нужны TELEGRAM_API_ID и TELEGRAM_API_HASH в .env — ключи приложения для пользовательского аккаунта, не бота.
@@ -103,7 +106,8 @@ async def main(args) -> int:  # noqa: ANN001 — argparse.Namespace
     }
     if scripted:
         meta["Реплики клиента"] = (
-            f"у {scripted} из {len(scenarios)} сценариев — из файла по ходам, как написаны (лимит --turns к ним не применяется)"
+            f"живые: у {scripted} из {len(scenarios)} сценариев ходы из файла — план разговора, реплики тестировщик "
+            f"пишет сам по ответам бота (ходов не больше плана + {SCRIPT_SLACK})"
         )
 
     facts = CatalogFacts.load(settings)
@@ -204,12 +208,13 @@ async def play(
         if restart.timed_out:
             result.error = "бот не ответил на «Начать заново» — он запущен?"
             return result
-        limit = len(scenario.script) or max_turns
+        plan = Plan(scenario.script)
+        limit = len(scenario.script) + SCRIPT_SLACK if scenario.script else max_turns
+        held = 0
         for number in range(1, limit + 1):
-            if scenario.script:
-                move = Move("text", scenario.script[number - 1].client, "по сценарию")
-            else:
-                move = await asyncio.to_thread(next_move, model, scenario, variant, result.turns, number, max_turns)
+            move = await asyncio.to_thread(
+                next_move, model, scenario, variant, result.turns, number, limit, plan
+            )
             if move.kind == "end":
                 result.end_reason = move.reason
                 break
@@ -221,12 +226,17 @@ async def play(
             turn.findings = check_turn(turn, facts, history, said + ([move.text] if move.kind == "text" else []))
             history += [message.text for message in turn.messages]
             result.turns.append(turn)
+            if plan.steps:
+                # Ход ушёл на уточнение или возражение — пункт плана остаётся, но не дольше HOLD_LIMIT ходов.
+                held = held + 1 if move.hold and held < HOLD_LIMIT and not plan.done else 0
+                if not held:
+                    plan = replace(plan, index=min(plan.index + 1, len(plan.steps)))
             # Бот упал посреди разговора: остаток сценария по пять минут ожидания на реплику не гоним.
             if len(result.turns) >= 2 and not any(earlier.messages for earlier in result.turns[-2:]):
                 result.end_reason = "бот молчит два хода подряд"
                 break
         else:
-            result.end_reason = "сценарий пройден до конца" if scenario.script else f"лимит {max_turns} реплик"
+            result.end_reason = "план сценария пройден" if plan.done else f"лимит {limit} реплик"
     except LLMAuthError:
         raise
     except Exception as exc:  # noqa: BLE001 — один сорванный диалог не останавливает прогон

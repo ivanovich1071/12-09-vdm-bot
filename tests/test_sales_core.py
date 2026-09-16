@@ -141,10 +141,36 @@ def test_task_details_during_a_selection_are_left_to_the_model():
         ("Сейчас уточню, какие позиции есть в каталоге.", True),
         ("Сейчас выполню подбор массажных мячей по приказу № 1057. Один момент.", True),
         ("(Вызываю инструмент для поиска товаров.)", True),
+        # Прогон 16.09, сц. 3: четыре хода подряд пересказ вызова вместо вызова.
+        ("Для подбора оборудования для групповых комнат выполню поиск по приказу № 1057.", True),
+        ("(Вызову инструмент для подбора товаров.)", True),
+        ("Понял. Подбираю оборудование для групповых комнат по приказу № 1057.", True),
+        ("Мне нужно выполнить подбор. После этого я смогу предоставить размеры и код 1С.", True),
+        ("Что вам подбираю — мебель или игровое оборудование?", False),
+        ("Подбор идёт строго по приказу № 1057.", False),
     ],
 )
 def test_promise_of_a_selection_is_told_from_an_offer(answer_text, promised):
     assert promises_goods(answer_text) is promised
+
+
+def test_a_lone_semicolon_left_by_the_model_does_not_reach_the_client():
+    """Прогон 16.09: на месте вызова инструмента DeepSeek оставлял строку «;»."""
+    from agent.verify import without_service_marks
+
+    answer_text = "Понял. Подбираю.\n\n;\n\nПока идёт поиск:"
+    assert without_service_marks(answer_text) == "Понял. Подбираю.\n\nПока идёт поиск:"
+    assert without_service_marks("Мат детский — 8 164 ₽") == "Мат детский — 8 164 ₽"
+
+
+def test_the_words_code_and_article_survive_when_no_code_follows_them():
+    """Прогон 16.09: «или код 1С товара — отвечу» пришло клиенту как «или— отвечу»."""
+    from agent.agent import _without_codes
+
+    asked = "Напишите название или код 1С товара — отвечу, есть ли он в каталоге."
+    assert _without_codes(asked) == asked
+    assert _without_codes("Шведская стенка (код 1С 42639)") == "Шведская стенка"
+    assert _without_codes("Мат детский, артикул Д-214, 8 164 ₽") == "Мат детский, 8 164 ₽"
 
 
 def test_service_code_lines_leave_no_empty_bullets():

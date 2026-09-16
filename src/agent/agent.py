@@ -64,6 +64,7 @@ from agent.verify import (
     title_matches,
     without_meta,
     without_promises,
+    without_service_marks,
     without_unverified,
 )
 from core import exports, intent, selection
@@ -136,9 +137,13 @@ _INSIST = (
 # текстом, а перед показом человеку код вырезается — он служебный.
 _CODE_MENTION = re.compile(
     # «Артикул» — только целым словом: 14.09 «Артикуляционная моторика» превратилась в «, мимика».
-    r"[ \t]*[(\[]?[ \t]*(?:\*\*)?(?:код\s*1\s*[СCc]|артикул(?![а-яё]))[\s*:]*[A-Za-z0-9А-ЯЁа-яё\-]+[ \t]*[)\]]?",
+    # Слово после «код 1С» вырезается, только если это и правда код: с цифрой внутри.
+    # 16.09 «или код 1С товара — отвечу» превратилось в «или— отвечу».
+    r"[ \t]*[(\[]?[ \t]*(?:\*\*)?(?:код\s*1\s*[СCc]|артикул(?![а-яё]))[\s*:]*(?=[A-Za-z0-9А-ЯЁа-яё\-]*\d)[A-Za-z0-9А-ЯЁа-яё\-]+[ \t]*[)\]]?",
     re.IGNORECASE,
 )
+# Запятая от вырезанного кода: «Мат детский, артикул Д-214, 8 164 ₽» → «Мат детский,, 8 164 ₽».
+_DOUBLE_COMMA = re.compile(r",(?:\s*,)+")
 # Пункт списка, от которого после вырезания кода ничего не осталось: «- **Код 1С:** 42639» → «-».
 _EMPTY_BULLET = re.compile(r"^[ \t]*[-•][ \t]*[*:]*[ \t]*(?:\n|$)", re.MULTILINE)
 
@@ -288,8 +293,10 @@ class SalesAgent:
         if tools.norm_lookups:
             session.route["norm_lookups"] = tools.norm_lookups
 
-        answer = self._verified(
-            answer, messages, tools, text, session, tools_for(decision.branch), decision.branch
+        answer = without_service_marks(
+            self._verified(
+                answer, messages, tools, text, session, tools_for(decision.branch), decision.branch
+            )
         )
         if decision.branch == CONSULT:
             # В файл — раздел, о котором ответ, а не последний разобранный: ночью 14.09 (сц. 24) текст был
@@ -1036,4 +1043,4 @@ def _short_kit_answer(answer: str) -> str:
 
 
 def _without_codes(answer: str) -> str:
-    return _EMPTY_BULLET.sub("", _CODE_MENTION.sub("", answer))
+    return _EMPTY_BULLET.sub("", _DOUBLE_COMMA.sub(",", _CODE_MENTION.sub("", answer)))

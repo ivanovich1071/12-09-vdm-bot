@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -353,7 +354,7 @@ class FakeChat:
         return Exchange(messages=[BotMessage(id=len(self.sent), text=t) for t in texts], seconds=1, timed_out=not texts)
 
     async def click(self, label: str) -> Exchange:
-        raise AssertionError(f"по сценарию «Ход N» кнопки не нажимаются: {label}")
+        return await self.send(f"[кнопка] {label}")
 
 
 def test_turn_by_turn_scenarios_keep_the_client_script_and_merge_full_with_trimmed():
@@ -396,24 +397,84 @@ def test_fifty_customer_scenarios_of_both_files_merge_into_one_run():
     assert sum(1 for scenario in merged for step in scenario.script if step.expected) == 164
 
 
-def test_turn_by_turn_scenario_is_sent_as_written_and_judged_by_the_script():
+def move(text: str, hold: bool = False, action: str = "text") -> str:
+    """Ответ тестировщика-модели одной строкой JSON."""
+    return json.dumps({"action": action, "text": text, "hold": hold, "reason": "по плану"}, ensure_ascii=False)
+
+
+def test_the_tester_follows_the_plan_but_writes_its_own_lines():
+    """Сценарий «Ход N» — план разговора, а не текст: реплики пишет тестировщик по ответам бота."""
     (scenario,) = merge(parse(SCRIPTED), parse(FULL))
     main = variants(scenario, "main")[0]
     chat = FakeChat(["Уточните площадь"], ["Передам продажнику"], ["Храню корзину"])
+    tester = FakeModel(
+        move("шесть групп, 3–7 лет, помогите подобрать"),
+        move("мебель не нужна, она уже есть"),
+        move("а что у вас хранится обо мне?"),
+        move("", action="end"),
+    )
     judge_model = FakeModel('{"score": 4, "goal_reached": true, "context_kept": true, "summary": "ок"}')
 
-    # Лимит --turns 2 сценарий не обрезает; тестировщик-модель не вызывается (у FakeModel нет ответов).
-    result = asyncio.run(play(chat, FakeModel(), CatalogFacts([], ()), scenario, main, 2, judge_model))
+    result = asyncio.run(play(chat, tester, CatalogFacts([], ()), scenario, main, 2, judge_model))
 
-    assert chat.sent == ["Оснастить 6 групп, возраст 3-7 лет.", "без мебели.", "/my_data"]
-    assert result.error is None and result.end_reason == "сценарий пройден до конца" and result.verdict.score == 4
+    assert chat.sent == ["шесть групп, 3–7 лет, помогите подобрать", "мебель не нужна, она уже есть", "а что у вас хранится обо мне?"]
+    assert result.error is None and result.verdict.score == 4
+    # План виден тестировщику: что уже поднято, что поднимаем сейчас.
+    second = tester.requests[1][1]["content"]
+    assert "✓ Оснастить 6 групп, возраст 3-7 лет." in second and "→ сейчас: без мебели." in second
+    assert "Чего ждём от бота в ответ: предложение передать продажнику" in second
+    assert "Уточните площадь" in second, "тестировщик видит последний ответ бота"
+    # Судья знает, что реплики живые, а ходы файла — план.
     prompt = judge_model.requests[0][1]["content"]
-    assert "ход 2. Клиент: без мебели." in prompt and "ждём от бота: предложение передать продажнику" in prompt
+    assert "ход 2. План клиента: без мебели." in prompt and "ждём от бота: предложение передать продажнику" in prompt
     assert "эталонный ответ: Обещаю скидку 10 %." in prompt and "- Сохраняет спокойный тон." in prompt
 
+
+def test_a_clarifying_turn_does_not_eat_a_step_of_the_plan():
+    """«Вы мне ещё ничего не показали» — ход потрачен, пункт плана остался."""
+    (scenario,) = merge(parse(SCRIPTED), parse(FULL))
+    main = variants(scenario, "main")[0]
+    chat = FakeChat(["Уточните площадь"], ["45 метров?"], ["Передам продажнику"], ["Храню корзину"])
+    tester = FakeModel(
+        move("шесть групп, 3–7 лет"),
+        move("вы не ответили, что с мебелью", hold=True),
+        move("мебель не нужна"),
+        move("что у вас обо мне хранится?"),
+        move("", action="end"),
+    )
+
+    result = asyncio.run(play(chat, tester, CatalogFacts([], ()), scenario, main, 2, FakeModel('{"score": 3}')))
+
+    assert [turn.text for turn in result.turns] == [
+        "шесть групп, 3–7 лет",
+        "вы не ответили, что с мебелью",
+        "мебель не нужна",
+        "что у вас обо мне хранится?",
+    ]
+    held = tester.requests[2][1]["content"]
+    assert "→ сейчас: без мебели." in held, "после hold план остался на том же пункте"
+
+
+def test_the_tester_may_press_a_button_in_a_turn_by_turn_scenario():
+    (scenario,) = merge(parse(SCRIPTED), parse(FULL))
+    main = variants(scenario, "main")[0]
+    chat = FakeChat(["Уточните площадь"], ["Корзина"], ["Храню корзину"])
+    tester = FakeModel(move("шесть групп"), move("Оформить", action="button"), move("", action="end"))
+
+    asyncio.run(play(chat, tester, CatalogFacts([], ()), scenario, main, 2, FakeModel('{"score": 3}')))
+
+    assert chat.sent[1] == "[кнопка] Оформить" or chat.sent[1] == "Оформить", chat.sent
+
+
+def test_the_bot_going_silent_ends_the_dialog():
+    (scenario,) = merge(parse(SCRIPTED), parse(FULL))
+    main = variants(scenario, "main")[0]
     silent = FakeChat([], [], ["поздно"])
-    result = asyncio.run(play(silent, FakeModel(), CatalogFacts([], ()), scenario, main, 8, FakeModel('{"score": 1}')))
-    assert silent.sent == ["Оснастить 6 групп, возраст 3-7 лет.", "без мебели."]
+    tester = FakeModel(move("шесть групп"), move("без мебели"), move("/my_data"))
+
+    result = asyncio.run(play(silent, tester, CatalogFacts([], ()), scenario, main, 8, FakeModel('{"score": 1}')))
+
+    assert silent.sent == ["шесть групп", "без мебели"]
     assert result.end_reason == "бот молчит два хода подряд" and len(result.turns) == 2
 
 
