@@ -642,6 +642,9 @@ def _escape(text: str) -> str:
 
 _MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _MD_BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
+# Звёздочка без пары — та, что прижата к слову с одной стороны: «Итого:**» в конце строки
+# (ночь 16.09). Размер «146*32*132» и степень «3 ** 2» остаются как есть.
+_MD_STRAY = re.compile(r"(?<=\S)\*{2,}(?!\S)|(?<!\S)\*{2,}(?=\S)")
 _MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)\"<>]+)\)")
 
 
@@ -662,7 +665,10 @@ def render_text(text: str) -> str:
     """
     html = _MD_HEADING.sub(r"<b>\1</b>", _escape(_without_tables(text)))
     html = _MD_LINK.sub(r'<a href="\2">\1</a>', html)
-    return code_numbers(_MD_BOLD.sub(r"<b>\1</b>", html))
+    html = _MD_BOLD.sub(r"<b>\1</b>", html)
+    # Звёздочка без пары («**  » в конце строки, ночь 16.09) в жирный не превратилась и
+    # осталась бы в тексте: Telegram разметку в режиме HTML не разбирает.
+    return code_numbers(_MD_STRAY.sub("", html))
 
 
 def code_numbers(html: str) -> str:

@@ -34,6 +34,14 @@ PREVIEW_LINES = 12
 LEAVES_CONTACT = frozenset(
     {"начать заново", "каталог", "моя корзина", "корзина", "менеджер", "связаться с менеджером", "меню", "отмена"}
 )
+# Надпись кнопки, которая сама передаёт номер. Если она пришла текстом, номера в ней нет,
+# и «Не вижу телефона» человек читает как отказ: ночью 16.09 это повторилось 21 раз.
+CONTACT_BUTTON = frozenset({"отправить контакт", "поделиться контактом", "отправить номер"})
+# Вопрос или длинная фраза — человек говорит о другом, а не диктует имя (сц. 10: «когда
+# менеджер свяжется?» получило в ответ «Не вижу телефона»). Имя с телефоном — короткая
+# строка без вопроса, так что разбирать реплику по смыслу шлюзу не нужно.
+_ASKING_WORDS = ("когда", "сколько", "почему", "зачем", "какой", "какие")
+NAME_WORDS = 4
 MATCHED = frozenset({"MATCHED_EXACT", "MATCHED_HIGH", "MATCHED_REVIEW"})
 
 EVALUATION_LABELS = {
@@ -108,7 +116,13 @@ class TelegramGateway:
                 # «Начать заново» и постоянная клавиатура — не контакт. Ночью 14.09 тестовый клиент не мог
                 # сбросить разговор, и следующий сценарий начался с «Не вижу телефона».
                 self._forget_contact(user_id)
-            elif PHONE.search(stripped) or not self._contact_misses.get(user_id):
+            elif PHONE.search(stripped):
+                return self._guard(lambda: self._contact_from_text(user_id, stripped))
+            elif stripped.lower() in CONTACT_BUTTON and not self._contact_misses.get(user_id):
+                # Кнопка нажата, но номер не пришёл: у клиента запрещена передача контакта.
+                self._contact_misses[user_id] = 1
+                return [ContactRequest(_CONTACT_BY_HAND)]
+            elif not _about_something_else(stripped) and not self._contact_misses.get(user_id):
                 return self._guard(lambda: self._contact_from_text(user_id, stripped))
             else:
                 # Второй раз без телефона — человек говорит о другом: отвечаем на реплику, предзаказ ждёт.
@@ -326,6 +340,16 @@ _STATUSES = {
     "CONFIRMED": "подтверждён",
     "REJECTED": "отклонён",
 }
+_CONTACT_BY_HAND = (
+    "Кнопка «Отправить контакт» передаёт номер сама — похоже, она не сработала. "
+    "Напишите имя и телефон одним сообщением, и менеджер получит заявку."
+)
+
+
+def _about_something_else(text: str) -> bool:
+    """Реплика во время ожидания контакта — про другое, а не имя с телефоном."""
+    lowered = text.lower()
+    return "?" in text or len(text.split()) > NAME_WORDS or any(word in lowered for word in _ASKING_WORDS)
 
 
 def _status(code: str) -> str:

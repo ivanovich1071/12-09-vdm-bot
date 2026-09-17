@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
@@ -189,22 +190,23 @@ class ProcurementSelector:
             # сужает найденное, но не подменяет запрос: на «мячи» в спортзале не должны
             # приходить маты и доски только потому, что они лежат в том же разделе (NEXT-4.1).
             matched = [candidate for candidate in candidates if candidate.by_query]
-            if not matched and requirement.catalog_room is not None:
-                found = state.catalog.search(replace(query, room=None))
-                filters = tuple(_report(report) for report in found.filters)
-                matched = [
+            for wider, notice in _wider_queries(query, requirement):
+                # Слово запроса должно найтись в названии: ночью 16.09 «мольберт» у школы
+                # вернул одну игровую панель «Вышивание» — слово стояло в её описании, — и
+                # 27 мольбертов каталога педагог ИЗО не увидел вовсе (сц. 18).
+                if _named(matched, requirement.user.text):
+                    break
+                wide = state.catalog.search(wider)
+                widened = [
                     self._candidate(requirement, hit.product, position, True)
-                    for position, hit in enumerate(found.hits)
+                    for position, hit in enumerate(wide.hits)
                     if hit.product.id not in requirement.exclude and hit.reason in _RELEVANCE
                 ]
-                if matched:
-                    warnings.append(
-                        Notice(
-                            "ROOM_WIDENED",
-                            f"В разделе «{requirement.user.room}» по запросу «{requirement.user.text}» "
-                            "ничего нет — показаны позиции по запросу из всего каталога.",
-                        )
-                    )
+                if widened and (not matched or _named(widened, requirement.user.text)):
+                    found = wide
+                    filters = tuple(_report(report) for report in found.filters)
+                    matched = widened
+                    warnings.append(notice)
             candidates = matched
         ranked = self.ranker.rank(requirement, candidates)
         picked, rest = ranked[:limit], ranked[limit:]
@@ -428,3 +430,63 @@ def _report(report) -> dict[str, Any]:  # noqa: ANN001 — catalog.query.FilterR
         "unknown": report.unknown,
         "note": report.note,
     }
+
+
+# Чем шире искать, если по словам запроса ничего не нашлось: сначала без раздела помещения,
+# потом и без типа учреждения. Названный товар не должен пропадать из-за того, что в каталоге
+# он лежит в садовской части, а спрашивает школа.
+_AUDIENCE_NAMES = {"school": "школы", "preschool": "детского сада"}
+# Слова, которые в названии товара искать бессмысленно: по ним «подходит» что угодно.
+_NOT_GOODS = frozenset(
+    {
+        "нужн", "нужно", "нужны", "дете", "детей", "детск", "лет", "года", "наличи", "штук",
+        "бюджет", "каталог", "пожалуйста", "вариант", "подобра", "показа", "какие", "какой",
+        "школ", "детсад", "группа", "помещени", "кабинет", "для",
+    }
+)
+
+
+def _wider_queries(query: CatalogQuery, requirement: ProcurementRequirement):  # noqa: ANN202
+    if requirement.catalog_room is not None:
+        yield (
+            replace(query, room=None),
+            Notice(
+                "ROOM_WIDENED",
+                f"В разделе «{requirement.user.room}» по запросу «{requirement.user.text}» "
+                "ничего нет — показаны позиции по запросу из всего каталога.",
+            ),
+        )
+    if query.institution_type:
+        yield (
+            replace(query, room=None, institution_type=None),
+            Notice(
+                "AUDIENCE_WIDENED",
+                f"По запросу «{requirement.user.text}» среди позиций для "
+                f"{_AUDIENCE_NAMES.get(query.institution_type, 'этого типа учреждений')} "
+                "ничего нет — показаны позиции из всего каталога.",
+            ),
+        )
+
+
+def _named(candidates: list[Candidate], text: str) -> bool:
+    """Стоит ли слово запроса в названии хотя бы одной найденной позиции."""
+    stems = _stems(text)
+    if not stems:
+        return bool(candidates)
+    return any(
+        any(stem in _plain(candidate.product.name) for stem in stems) for candidate in candidates
+    )
+
+
+def _stems(text: str) -> list[str]:
+    """Основы слов запроса: «мольберты» → «мольбер», чтобы совпасть с «Мольберт настенный»."""
+    stems = []
+    for word in re.findall(r"[а-яa-z0-9]{4,}", _plain(text)):
+        stem = word[: max(4, len(word) - 2)]
+        if not any(stem.startswith(skip) or skip.startswith(stem) for skip in _NOT_GOODS):
+            stems.append(stem)
+    return stems
+
+
+def _plain(text: str) -> str:
+    return (text or "").lower().replace("ё", "е")

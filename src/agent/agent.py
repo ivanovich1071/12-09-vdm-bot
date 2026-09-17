@@ -52,6 +52,7 @@ from agent.routing import (
 )
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from agent.verify import (
+    claims_handoff,
     client_ages,
     describe_refs,
     foreign_script,
@@ -65,6 +66,7 @@ from agent.verify import (
     without_meta,
     without_promises,
     without_service_marks,
+    without_tool_calls,
     without_unverified,
 )
 from core import exports, intent, selection
@@ -103,6 +105,27 @@ _UNVERIFIED_NOTE = (
     "Часть пунктов по тексту приказа не подтвердилась — их я не привожу. Назовите номер раздела "
     "перечня, и я сверю состав по нему."
 )
+# Срок до счёта, график поставок и дату отгрузки бот не знает: этих данных нет ни в каталоге,
+# ни в перечнях. Ночью 16.09 такой вопрос остался без ответа в семи диалогах.
+_DEADLINE_ANSWER = (
+    "Срок от оформления до счёта и график поставок по этапам называет менеджер: "
+    "у бота таких данных нет — ни в каталоге, ни в перечнях приказов."
+)
+_DEADLINE_WITH_CART = (
+    "\n\nНажмите «Оформить» — соберу спецификацию и предзаказ, а после имени и телефона "
+    "менеджер увидит заявку со всеми позициями и основаниями и назовёт срок."
+)
+_DEADLINE_WITHOUT_CART = (
+    "\n\nНажмите «Связаться с менеджером» и оставьте имя и телефон — он ответит по срокам, "
+    "этапам поставки и оплате. Могу пока подобрать позиции, чтобы в заявке был состав."
+)
+
+
+def _about_goods(text: str) -> bool:
+    """Просят ли в той же реплике товары: тогда срок — не единственное, о чём спросили."""
+    return bool(intent.asks_to_show(text) or intent.names_goods(text) or intent.asks_for_goods(text))
+
+
 # Вопрос консультанта, когда подтвердить не удалось ничего. Выдачу каталога вместо консультации
 # не показываем: 14.09 на «дай консультацию… кабинет логопеда» пришли фитбол и мячики.
 _CONSULT_RETRY = (
@@ -293,9 +316,14 @@ class SalesAgent:
         if tools.norm_lookups:
             session.route["norm_lookups"] = tools.norm_lookups
 
-        answer = without_service_marks(
-            self._verified(
-                answer, messages, tools, text, session, tools_for(decision.branch), decision.branch
+        # Ночью 16.09 клиенту ушёл голый JSON вызова handoff_to_manager (сц. 50) и «Функция
+        # вызывается:» с тремя блоками (сц. 47). Проверка цен такой текст пропускает — она
+        # ищет выдуманные числа, а не пересказ работы, которой не было.
+        answer = without_tool_calls(
+            without_service_marks(
+                self._verified(
+                    answer, messages, tools, text, session, tools_for(decision.branch), decision.branch
+                )
             )
         )
         if decision.branch == CONSULT:
@@ -629,6 +657,13 @@ class SalesAgent:
             parts.append(
                 "слова не на русском: " + ", ".join(f"«{word}»" for word in sorted(foreign)) + " — замени их русскими"
             )
+        if claims_handoff(answer):
+            # Ночью 16.09 шесть диалогов из пятидесяти кончились словами «всё передал
+            # менеджеру» — при том, что заявка уходит только с контактом человека.
+            parts.append(
+                "слова о том, что заявка менеджеру уже передана, — бот сам ничего не передаёт: "
+                "напиши, что менеджер получит заявку, когда человек оставит имя и телефон"
+            )
         parts.extend(self._registry_problems(answer, session)[0])
         invented = invented_prices(answer, prices)
         if invented:
@@ -758,14 +793,22 @@ class SalesAgent:
     def _service_reply(self, session, text: str, decision: Decision) -> list[Response] | None:  # noqa: ANN001
         """Ответ ядра без модели: файл, список из N позиций, следующая страница подбора."""
         profile = session.profile
+        # Срока от оформления до счёта и графика поставок нет ни в каталоге, ни в приказах —
+        # их называет менеджер. Ночью 16.09 этот вопрос остался без ответа в семи диалогах,
+        # а в сц. 3 трижды подряд получил «Пришлю комплектацию файлом. В каком виде?».
+        deadline = intent.asks_deadline(text)
         if decision.intent == EXPORT_REQUEST:
             offer = exports.offer(self.engine, session)
             if offer is not None:
                 session.route["fallback"] = "export"
-                return offer
+                # Файл просили вместе со сроком — отвечаем и на то, и на другое.
+                return [*self._deadline_note(session), *offer] if deadline else offer
             # Выгружать нечего: «Сохранять пока нечего: сначала соберём комплектацию» было ответом
             # на «нужна спецификация в Excel и счёт» в 11 диалогах из 25 (ночь 15.09) — и разговор
             # на этом кончался. Пусть отвечает агент: он и соберёт то, что потом уйдёт файлом.
+        if deadline and not _about_goods(text):
+            session.route["fallback"] = "deadline"
+            return self._deadline_note(session, self._manager_keyboard(session))
         size = intent.list_size(text)
         # Оформление по присланному файлу — ядро, а не модель: 15.09 на «сформируй предзаказ» и «все найденные
         # по 1 шт.» модель трижды пересобрала строки файла по-разному (14 из 15, потом 4 из 15).
@@ -801,6 +844,19 @@ class SalesAgent:
                 session.route["fallback"] = "object_rooms"
                 return rooms
         return None
+
+    def _deadline_note(self, session, keyboard: Keyboard | None = None) -> list[Response]:  # noqa: ANN001
+        """Честный ответ о сроке: данных нет, называет менеджер по заявке."""
+        cart = self.engine.storage.load_cart(session.user_id).count
+        text = _DEADLINE_ANSWER + (_DEADLINE_WITH_CART if cart else _DEADLINE_WITHOUT_CART)
+        session.remember("assistant", text)
+        return [Message(text, keyboard=keyboard)]
+
+    def _manager_keyboard(self, session) -> Keyboard | None:  # noqa: ANN001
+        keyboard = Keyboard().row(Button("Связаться с менеджером", "manager"))
+        if self.engine.storage.load_cart(session.user_id).count:
+            keyboard.row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
+        return keyboard
 
     def _consult_question(self, session, tools: ToolBox, decision: Decision) -> list[Response]:  # noqa: ANN001
         session.route["fallback"] = "consult_question"

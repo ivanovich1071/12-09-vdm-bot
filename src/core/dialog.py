@@ -484,7 +484,7 @@ class DialogEngine:
             case "restart_yes":
                 return self._restart(session)
             case "manager":
-                return self._manager()
+                return self._manager(session)
             case "noop":
                 # Надпись с количеством — не кнопка. Telegram всё равно требует
                 # у неё действие, поэтому действие есть, а ответа на него нет.
@@ -1701,15 +1701,31 @@ class DialogEngine:
         self._remember(session)
         return [Message(GREETING, keyboard=self._main_menu())]
 
-    def _manager(self) -> list[Response]:
+    def _manager(self, session: Session | None = None) -> list[Response]:
+        """Контакты менеджера — и путь к заявке, если корзина уже собрана.
+
+        Ночью 16.09 пять диалогов кончились этим сообщением: человек нажимал кнопку,
+        получал телефон и уходил, а заявки с составом корзины менеджер не видел.
+        Подсказка «/order» текстом в Telegram не нажимается — теперь это кнопка.
+        """
+        cart = self.storage.load_cart(session.user_id).count if session is not None else 0
+        keyboard = self._main_menu()
+        if cart:
+            keyboard.row(Button("Оформить заявку", "checkout"))
         return [
             Message(
                 "Менеджер ЭЛТИ-КУДИЦ ответит на вопросы по срокам, документам и "
                 "нестандартной комплектации.\n\n"
                 f"{self.settings.manager_contact}\n\n"
-                "Если корзина собрана, отправьте заявку — менеджер увидит её со "
-                "всеми позициями и основаниями: /order",
-                keyboard=self._main_menu(),
+                + (
+                    f"В корзине {cart} {plural(cart, 'позиция', 'позиции', 'позиций')} — нажмите "
+                    "«Оформить заявку», оставьте имя и телефон, "
+                    "и менеджер получит её со всеми позициями и основаниями."
+                    if cart
+                    else "Соберём корзину — и менеджер получит заявку со всеми позициями и "
+                    "основаниями. Скажите, что подобрать."
+                ),
+                keyboard=keyboard,
             )
         ]
 

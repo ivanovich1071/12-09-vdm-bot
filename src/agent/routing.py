@@ -171,6 +171,23 @@ _EXPORT = re.compile(
 )
 # Выгрузка каталога или базы целиком — не файл разговора, её решает охрана.
 _EXPORT_FORBIDDEN = re.compile(r"каталог\w*|\bбаз[уыае]\b|\bjson\b|\bcsv\b|\bвсе\s+товар", re.IGNORECASE)
+# Файл уже у человека: «хорошо, скачала», «excel я уже скачала», «файл получила». Ночью 16.09
+# на такие слова бот трижды подряд отвечал «Пришлю комплектацию файлом. В каком виде?», а вопрос
+# про срок счёта и график поставок в той же реплике оставался без ответа (сц. 3, ходы 8, 10, 11).
+_EXPORT_DONE = re.compile(
+    r"\b(?:скачал|загрузил|получил|открыл|сохранил)\w*\b|\bуже\s+(?:есть|у\s+меня|скача)",
+    re.IGNORECASE,
+)
+
+
+def _asks_export(text: str) -> bool:
+    """Просят ли прислать файл — сейчас, а не «файл я уже скачала»."""
+    if _EXPORT_FORBIDDEN.search(text):
+        return False
+    for sentence in re.split(r"(?<=[.!?;])\s+|\n+", text):
+        if _EXPORT.search(sentence) and not _EXPORT_DONE.search(sentence):
+            return True
+    return False
 
 # --- Признаки продажи: конкретный товар, цена, наличие, покупка ----------------------
 #
@@ -355,7 +372,7 @@ def by_rules(
 
     if _INJECTION.search(text):
         return Decision(branch=GUARD, intent=UNSUPPORTED, reason="попытка сменить роль или вытащить инструкцию")
-    if _EXPORT.search(text) and not _EXPORT_FORBIDDEN.search(text):
+    if _asks_export(text):
         # Файл собирает ядро из уже составленного — модель тут не нужна (14.09 она отказала: «не могу»).
         # «Выгрузи весь каталог в JSON» сюда не попадает: это просьба к охране, а не файл разговора.
         return _continue(profile, EXPORT_REQUEST, "просит список файлом")

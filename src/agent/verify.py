@@ -61,13 +61,14 @@ def promises_goods(answer: str, listing: bool = False) -> bool:
             return True
         if _PROMISE_LATER.search(sentence) and not _CONDITION.search(sentence):
             return True
-    return listing and len(_BULLET.findall(text)) >= 2
+    # Вызов инструмента, написанный текстом, — то же ложное обещание: подбора не было.
+    return looks_like_tool_call(text) or (listing and len(_BULLET.findall(text)) >= 2)
 
 
 def without_promises(answer: str) -> str:
     """Ответ без предложений, в которых обещан подбор. Строки и списки сохраняются."""
     lines: list[str] = []
-    for line in (answer or "").splitlines():
+    for line in without_tool_calls(answer).splitlines():
         parts = [part.strip() for part in re.split(r"(?<=[.!?)])\s+", line) if part.strip()]
         # Реплика целиком в скобках — «(Ожидаю результатов поиска.)» — служебная речь модели.
         kept = [
@@ -157,8 +158,13 @@ def invented_prices(answer: str, allowed: set[int]) -> set[int]:
 # «пункт 2.1.14», «позиция 1.5.1.41», «п. 2.4», «соответствует пункту 2.20.63».
 # Номер приказа берётся из хвоста той же фразы, если он там есть.
 _NORM_MENTION = re.compile(
-    r"(?:пункт\w*|позици\w+|п\.)\s*№?\s*(\d{1,2}(?:\.\d{1,3}){1,5})"
-    r"(?:[^\n]{0,60}?(838|1057))?",
+    # «Пункт перечня: 1.1.1.1» (ночь 16.09, сц. 3) проверку обходил: между словом и
+    # номером стояло «перечня:», и выдуманные пункты уходили человеку как настоящие.
+    r"(?:пункт\w*|позици\w+|п\.)\s*(?:перечн\w+|приказ\w*|списка)?[\s:№]*"
+    r"(\d{1,2}(?:\.\d{1,3}){1,5})"
+    # Номер приказа берётся из хвоста той же ссылки, но не через следующую: «1.1.1.1,
+    # пункт 2.1.4 приказа 838» — это два пункта, а не один пункт приказа 838.
+    r"(?:(?:(?!пункт|позици|п\.)[^\n]){0,60}?(838|1057))?",
     re.IGNORECASE,
 )
 _DOC_BY_NUMBER = {"838": "order_838", "1057": "order_1057"}
@@ -209,15 +215,45 @@ def without_unverified(
     логопеда» дважды не подтвердился один пункт, и человек получил фитбол и тактильные мячики,
     хотя остальная комплектация была подтверждена инструментом. Теряла её одна строка.
     """
-    kept = [
-        line
-        for line in (answer or "").splitlines()
-        if not invented_prices(line, prices)
+    lines = (answer or "").splitlines()
+    keep = [
+        not invented_prices(line, prices)
         and not invented_norm_refs(line, refs)
         and not foreign_script(line)
         and not any(code in bad_codes for code, _ in listed_codes(line))
+        for line in lines
     ]
+    _drop_empty_headings(lines, keep)
+    kept = [line for index, line in enumerate(lines) if keep[index]]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+def _drop_empty_headings(lines: list[str], keep: list[bool]) -> None:
+    """Убрать названия зон, под которыми не осталось ни одного пункта.
+
+    Ночью 16.09 (сц. 2) человек получил «Групповое помещение 5–6 лет (раздел 1.14.6)»,
+    «Общее для обеих групп» — и пустоту: строки списка проверка вырезала, а заголовки
+    над ними остались. Заголовком считается только строка, под которой список и был.
+    """
+    for index, line in enumerate(lines):
+        if not keep[index] or not line.strip() or _BULLET.match(line):
+            continue
+        items = _items_under(lines, index)
+        if items and not any(keep[item] for item in items):
+            keep[index] = False
+
+
+def _items_under(lines: list[str], index: int) -> list[int]:
+    """Номера строк списка сразу под строкой `index`: пустая строка разрывом не считается."""
+    items: list[int] = []
+    for number in range(index + 1, len(lines)):
+        if not lines[number].strip():
+            continue
+        if _BULLET.match(lines[number]):
+            items.append(number)
+            continue
+        break
+    return items
 
 
 # Иероглифы, кана, хангыль, арабица. Ночью 14.09 DeepSeek-V4-Flash вставил в русские ответы «不大», «走廊»,
@@ -306,3 +342,76 @@ def without_service_marks(answer: str) -> str:
     """Ответ без строк, в которых нет ничего, кроме знаков препинания."""
     kept = [line for line in (answer or "").splitlines() if not _SERVICE_LINE.match(line)]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+# Вызов инструмента, который модель написала текстом вместо того, чтобы его сделать.
+# Ночь 16.09: клиенту ушёл голый JSON «{"name":"handoff_to_manager","parameters":{…}}»
+# (сц. 50 — тот самый снимок экрана), «Функция вызывается:» с тремя такими блоками
+# (сц. 47) и «*Вызываю инструменты для проверки.* Добавляю в корзину…» без единого
+# вызова (сц. 48). Ни цены, ни пункты в таком ответе не подтвердить — он не показывается.
+_TOOL_CALL_JSON = re.compile(
+    r"```[a-z]*\s*\{.*?\}\s*```|"
+    r"\{[^{}]*\"(?:name|arguments|parameters|code|document|query)\"\s*:[^{}]*\}",
+    re.DOTALL,
+)
+_TOOL_CALL_WORDS = re.compile(
+    r"функци\w+\s+вызыва\w+|вызыва\w+\s+(?:инструмент|функци|поиск)\w*|"
+    r"уточн\w+[^.\n]{0,30}через\s+инструмент\w*|"
+    r"\b(?:проверяю|запрашиваю|добавляю|уточняю|показываю)\b[^.\n]{0,60}\.{3}",
+    re.IGNORECASE,
+)
+# Имена инструментов человеку не нужны ни в каком виде.
+_TOOL_NAMES = re.compile(
+    r"\b(?:search_products|find_by_norm_code|find_norm_item|explain_norm|get_product|"
+    r"add_to_cart|get_cart|handoff_to_manager)\b"
+)
+
+
+def looks_like_tool_call(answer: str) -> bool:
+    """Есть ли в ответе вызов инструмента, написанный текстом."""
+    text = answer or ""
+    return bool(
+        _TOOL_CALL_JSON.search(text) or _TOOL_NAMES.search(text) or _TOOL_CALL_WORDS.search(text)
+    )
+
+
+# Остатки незакрытого блока: «```json» отдельной строкой и строки тела запроса. Ночью 16.09
+# (сц. 47) таких блоков было три подряд, и последний модель не закрыла.
+_FENCE_LINE = re.compile(r"^\s*(?:`{2,}\s*[a-z]*|json)\s*$", re.IGNORECASE)
+_JSON_LINE = re.compile(r'^\s*[\[\]{},]*\s*(?:"[^"\n]*"\s*:.*|[\[\]{},]+)\s*$')
+
+
+def without_tool_calls(answer: str) -> str:
+    """Ответ без блоков и фраз, которыми модель пересказывает вызов инструмента."""
+    text = _TOOL_CALL_JSON.sub("", answer or "")
+    kept: list[str] = []
+    for line in text.splitlines():
+        if _TOOL_NAMES.search(line) or _FENCE_LINE.match(line) or _JSON_LINE.match(line):
+            continue
+        parts = [part.strip() for part in re.split(r"(?<=[.!?)])\s+", line) if part.strip()]
+        stayed = [part for part in parts if not _TOOL_CALL_WORDS.search(part)]
+        if stayed or not parts:
+            kept.append(" ".join(stayed))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+# «Я передал ваш запрос менеджеру» — бот не передаёт ничего сам: заявка уходит только
+# с контактом человека. Ночью 16.09 так сказано в шести диалогах из пятидесяти, и ни
+# одной заявки за этими словами не стояло.
+_HANDOFF_CLAIM = re.compile(
+    r"\b(?:передал|передала|передали|отправил|отправила|направил|направила)\w*\b"
+    r"[^.!?\n]{0,60}?\bменеджер",
+    re.IGNORECASE,
+)
+# «Хотите, чтобы я передал вопрос менеджеру?» и «могу передать» — предложение, не отчёт.
+_HANDOFF_OFFER = re.compile(r"\b(?:хотите|могу|если|нужно\s+ли|давайте|готов)\b", re.IGNORECASE)
+
+
+def claims_handoff(answer: str) -> bool:
+    """Сказано ли в ответе, что заявка менеджеру уже передана."""
+    for sentence in _SENTENCE.split(answer or ""):
+        if "?" in sentence or _HANDOFF_OFFER.search(sentence):
+            continue
+        if _HANDOFF_CLAIM.search(sentence):
+            return True
+    return False

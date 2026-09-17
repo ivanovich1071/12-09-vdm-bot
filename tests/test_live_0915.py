@@ -88,10 +88,10 @@ def test_second_message_without_a_phone_is_answered_and_the_preorder_waits(env):
     api, gateway = env
     _preorder_waiting_for_contact(api, gateway)
 
-    [again] = gateway.text(USER, "а сроки поставки какие?")
-    note, *answered = gateway.text(USER, "Школа, кабинет информатики")
+    # 17.09: вопрос во время ожидания контакта отвечается сразу. Ночью 16.09 «когда менеджер
+    # свяжется?» получало «Не вижу телефона» — человек читал это как отказ (21 раз за прогон).
+    note, *answered = gateway.text(USER, "а сроки поставки какие?")
 
-    assert isinstance(again, ContactRequest)
     assert "без телефона менеджеру не ушёл" in note.text and answered
     assert USER not in gateway._awaiting_contact and api.notifier.sent == []
 
