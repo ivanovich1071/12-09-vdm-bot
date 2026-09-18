@@ -1,4 +1,4 @@
-# Развёртывание прототипа на виртуальной машине Cloud.ru.
+# Развёртывание прототипа на виртуальной машине (Selectel, Cloud.ru — любая Ubuntu).
 #
 # Виджет и Telegram-бот подняты отдельными сервисами: у них разный режим работы
 # (HTTP против long polling), и падение одного не должно ронять другой.
@@ -11,6 +11,14 @@
 # Каталог ведётся версиями (EPIC 4): виджет и Telegram сами подхватывают новую
 # версию по указателю data/kb/current, перезапуск не нужен.
 
+# Журнал контейнера растёт без границ и на диске в 20 ГБ это заканчивается
+# остановкой всего. Держим три файла по 10 МБ на сервис.
+x-logs: &logs
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   widget:
     build: .
@@ -22,11 +30,15 @@ services:
       - ./data:/app/data
       - ./secrets:/app/secrets:ro
     restart: unless-stopped
+    logging: *logs
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
+      # Старт занимает под минуту: разбор каталога (5918 позиций) и проба провайдеров
+      # модели. До истечения этого времени неудачная проверка контейнер не роняет.
+      start_period: 120s
 
   telegram:
     build: .
@@ -36,6 +48,7 @@ services:
       - ./data:/app/data
       - ./secrets:/app/secrets:ro
     restart: unless-stopped
+    logging: *logs
     depends_on:
       - widget
 
