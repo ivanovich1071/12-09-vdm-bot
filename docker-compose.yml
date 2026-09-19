@@ -25,7 +25,9 @@ services:
     command: python run.py widget
     env_file: .env
     ports:
-      - "8000:8000"
+      # Только на localhost: наружу виджет отдаёт nginx по 443, а Docker публикует
+      # порты в обход ufw, поэтому «0.0.0.0:8000» открыть и закрыть через ufw нельзя.
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/app/data
       - ./secrets:/app/secrets:ro
