@@ -1137,7 +1137,15 @@ class DialogEngine:
         return Keyboard().row(
             Button("Каталог", "catalog"),
             Button("Связаться с менеджером", "manager"),
-        )
+        ).row(*self._manager_row())
+
+    def _manager_row(self) -> list[Button]:
+        # «Задать вопрос» открывает онлайн-чат заказчика в браузере клиента;
+        # ядро по нажатию ничего не делает ("noop") — ссылку открывает сам Telegram.
+        row = [Button("Связаться с менеджером", "manager")]
+        if self.settings.support_chat_url:
+            row.append(Button("Задать вопрос", "noop", url=self.settings.support_chat_url))
+        return row
 
     def _more(self, session: Session, offset: int) -> list[Response]:
         hits = session.last_hits
@@ -1666,13 +1674,14 @@ class DialogEngine:
         «Связаться с менеджером» — исключение, и стоит отдельной строкой. Заказчик
         просил не спрашивать контакты в начале разговора, но дать возможность
         оставить их в любой момент; в виджете командного меню нет, и без этой
-        кнопки уйти к человеку было неоткуда.
+        кнопки уйти к человеку было неоткуда. Рядом — «Задать вопрос» (онлайн-чат),
+        если SUPPORT_CHAT_URL задан: ссылка открывается в браузере клиента.
         """
         return Keyboard().row(
             Button("Каталог", "catalog"),
             Button("Подбор по приказу", "norms"),
             Button("Начать заново", "restart"),
-        ).row(Button("Связаться с менеджером", "manager"))
+        ).row(*self._manager_row())
 
     def _confirm_restart(self) -> list[Response]:
         return [

@@ -107,6 +107,10 @@ class Settings:
     max_token: str = ""
     site_url: str = "https://vdm.ru"
     manager_contact: str = "+7 (495) 646-01-40, elti@vdm.ru"
+    # Онлайн-чат заказчика (Bitrix24). Кнопка «Задать вопрос» открывает его прямо
+    # в браузере клиента — самый быстрый путь от вопроса до менеджера. Пусто —
+    # кнопки в меню нет.
+    support_chat_url: str = ""
     # Условия доставки на сайте заказчика. Бот стоимость и сроки не считает и не
     # называет: лестница тарифов зависит от региона и от того, частное лицо или
     # учреждение, — ошибиться легко, а обещание уже прозвучит. Отвечаем ссылкой
@@ -217,6 +221,7 @@ class Settings:
             max_token=env.get("MAX_TOKEN", ""),
             site_url=env.get("SITE_URL", cls.site_url),
             manager_contact=env.get("MANAGER_CONTACT", cls.manager_contact),
+            support_chat_url=env.get("SUPPORT_CHAT_URL", "").strip(),
             delivery_url=env.get("DELIVERY_URL", cls.delivery_url),
             min_delivery_rub=int(env.get("MIN_DELIVERY_RUB", cls.min_delivery_rub)),
             qa_user_ids=frozenset(part.strip() for part in env.get("QA_USER_IDS", "").split(",") if part.strip()),

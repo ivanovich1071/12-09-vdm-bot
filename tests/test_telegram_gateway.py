@@ -10,7 +10,7 @@ import pytest
 pytest.importorskip("aiogram")
 pytest.importorskip("fastapi")
 
-from adapters.telegram.bot import build_dispatcher, send  # noqa: E402
+from adapters.telegram.bot import build_dispatcher, send, to_markup  # noqa: E402
 from adapters.telegram.gateway import ContactRequest, FileReply, TelegramGateway  # noqa: E402
 from core.models import Cart, CartItem  # noqa: E402
 from core.ui import Button, Keyboard, Message, OrderSummary, ProductList  # noqa: E402
@@ -199,6 +199,46 @@ ALLOWED = {
     "core.errors", "core.ui", "core_api", "core_api.facade", "core_api.sessions",
     "privacy.consent", "privacy.masking",
 }
+
+
+# --- Кнопка «Задать вопрос» (онлайн-чат заказчика, SUPPORT_CHAT_URL) ------------
+
+CHAT_URL = "https://vdmmsk.bitrix24.ru/online/chat"
+
+
+def test_support_chat_button_in_main_menu(tmp_path):
+    """URL задан — в главном меню появляется кнопка со ссылкой на чат."""
+    api = build(tmp_path, support_chat_url=CHAT_URL)
+    gateway = TelegramGateway(api.core, 20 * 1024 * 1024)
+    [reply] = gateway.action(USER, "menu")
+    chat = [
+        button
+        for row in reply.keyboard.rows
+        for button in row
+        if button.title == "Задать вопрос"
+    ]
+    assert chat and chat[0].url == CHAT_URL and chat[0].action == "noop"
+
+
+def test_support_chat_button_hidden_without_url(env):
+    """URL пуст (как по умолчанию) — меню в точности прежнее, лишней кнопки нет."""
+    _, gateway = env
+    [reply] = gateway.action(USER, "menu")
+    assert all(
+        button.title != "Задать вопрос"
+        for row in reply.keyboard.rows
+        for button in row
+    )
+
+
+def test_support_chat_button_renders_as_url_button(tmp_path):
+    """Telegram получает кнопку-ссылку: открытие чата делает клиент, не бот."""
+    api = build(tmp_path, support_chat_url=CHAT_URL)
+    gateway = TelegramGateway(api.core, 20 * 1024 * 1024)
+    [reply] = gateway.action(USER, "menu")
+    markup = to_markup(reply.keyboard)
+    urls = [button.url for row in markup.inline_keyboard for button in row if button.url]
+    assert CHAT_URL in urls
 
 
 def test_gateway_has_no_business_logic_dependencies():
