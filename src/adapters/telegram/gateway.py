@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -153,7 +154,31 @@ class TelegramGateway:
         replies = self.core.message_primitives(self.session(user_id), text)
         if command == "/delete_data":
             self._sessions.pop(user_id, None)
-        return list(replies)
+        return [*replies, *self._take_widget_cart(user_id, command, stripped)]
+
+    def _take_widget_cart(self, user_id: str, command: str, text: str) -> list[TelegramReply]:
+        """Deep-link из виджета: «Продолжить в Telegram» ведёт на /start <сессия сайта>.
+
+        Посетитель собрал корзину в виджете на сайте — анонимная сессия там без
+        канала в Telegram. Корзина привязана к пользователю без канала
+        (`core.models.Cart`), поэтому переносим её в чат бота и показываем.
+        """
+        if command != "/start" or " " not in text:
+            return []
+        payload = text.split(None, 1)[1].strip()
+        if not re.fullmatch(r"[0-9a-f]{32}", payload) or payload == user_id:
+            return []
+        cart = self.storage.load_cart(payload)
+        if cart.is_empty:
+            return []
+        cart.user_id = user_id
+        self.storage.save_cart(cart)
+        head = Message(
+            "Перенёс корзину из виджета на сайте: "
+            f"{cart.count} {plural(cart.count, 'позиция', 'позиции', 'позиций')} "
+            f"на {price_text(cart.total)}. Продолжим здесь — файлы и оформление работают."
+        )
+        return [head, *self.core.action_primitives(self.session(user_id), "cart")]
 
     def action(self, user_id: str, data: str) -> list[TelegramReply]:
         verb, _, arg = data.partition(":")

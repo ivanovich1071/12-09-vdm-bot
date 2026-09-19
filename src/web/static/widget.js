@@ -14,7 +14,7 @@
   var BASE = (script && script.dataset.base) || new URL(script.src).origin;
   var STORAGE_KEY = "vdm_widget_session";
 
-  var state = { sessionId: null, open: false, busy: false };
+  var state = { sessionId: null, open: false, busy: false, telegramUrl: "" };
 
   // --- Разметка ------------------------------------------------------------
 
@@ -27,8 +27,11 @@
     "border-radius:14px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.28);",
     "font:14px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#1c2430}",
     ".vdm-panel.vdm-open{display:flex}",
-    ".vdm-head{background:#0b6ab0;color:#fff;padding:12px 16px;font-weight:600}",
+    ".vdm-head{background:#0b6ab0;color:#fff;padding:12px 16px;font-weight:600;",
+    "display:flex;align-items:center;justify-content:space-between;gap:8px}",
     ".vdm-head small{display:block;font-weight:400;opacity:.85;font-size:12px}",
+    ".vdm-head a{color:#fff;font-size:12px;font-weight:400;text-decoration:underline;",
+    "opacity:.9;white-space:nowrap}",
     ".vdm-log{flex:1;overflow-y:auto;padding:14px;background:#f5f7fa}",
     ".vdm-msg{margin-bottom:12px;padding:10px 12px;border-radius:10px;background:#fff;",
     "box-shadow:0 1px 3px rgba(0,0,0,.08);white-space:pre-wrap;word-wrap:break-word}",
@@ -47,8 +50,9 @@
     ".vdm-btn-flat{border-color:#d6dee7;color:#5a6a7d;cursor:default}",
     ".vdm-btn-flat:hover{background:#fff;color:#5a6a7d}",
     ".vdm-form{display:flex;border-top:1px solid #e3e8ee;background:#fff}",
-    ".vdm-form input{flex:1;border:0;padding:14px;font-size:14px;outline:none}",
+    ".vdm-form input{flex:1;border:0;padding:14px;font-size:14px;outline:none;min-width:0}",
     ".vdm-form button{border:0;background:#0b6ab0;color:#fff;padding:0 18px;cursor:pointer}",
+    ".vdm-attach{border:0;background:none;font-size:18px;cursor:pointer;padding:0 10px}",
     ".vdm-typing{color:#7d8b9c;font-style:italic}",
     ".vdm-total{margin-top:8px;font-weight:600}",
     ".vdm-photo{display:block;width:100%;max-width:220px;border-radius:8px;margin:6px 0}",
@@ -74,17 +78,36 @@
   launcher.setAttribute("aria-label", "Открыть чат подбора оборудования");
 
   var panel = el("div", "vdm-panel");
-  var head = el("div", "vdm-head", "Подбор оборудования");
-  head.appendChild(el("small", null, "ЭЛТИ-КУДИЦ · консультант"));
+  var head = el("div", "vdm-head");
+  var headTitle = el("div", null, "Подбор оборудования");
+  headTitle.appendChild(el("small", null, "ЭЛТИ-КУДИЦ · консультант"));
+  head.appendChild(headTitle);
   var log = el("div", "vdm-log");
   var form = el("form", "vdm-form");
+  // Заказ файлом (xlsx/docx/pdf/csv) — тот же разбор, что в чате бота.
+  var fileInput = el("input");
+  fileInput.type = "file";
+  fileInput.accept = ".xlsx,.docx,.pdf,.csv";
+  fileInput.style.display = "none";
+  var attach = el("button", "vdm-attach", "📎");
+  attach.type = "button";
+  attach.setAttribute("aria-label", "Прикрепить файл заказа");
+  attach.onclick = function () {
+    fileInput.click();
+  };
   var input = el("input");
   input.placeholder = "Что нужно подобрать?";
   input.autocomplete = "off";
   var submit = el("button", null, "→");
   submit.type = "submit";
+  form.appendChild(attach);
   form.appendChild(input);
   form.appendChild(submit);
+  form.appendChild(fileInput);
+  fileInput.onchange = function () {
+    if (fileInput.files.length) uploadFile(fileInput.files[0]);
+    fileInput.value = "";
+  };
   panel.appendChild(head);
   panel.appendChild(log);
   panel.appendChild(form);
@@ -132,6 +155,16 @@
         if (item.role === "user") log.lastChild.classList.add("vdm-me");
       });
       render(data.responses);
+      // Кнопка в шапке: посетитель продолжает разговор и корзину в Telegram,
+      // где бот присылает файлы и берёт контакт.
+      if (data.telegram_url && !state.telegramUrl) {
+        state.telegramUrl = data.telegram_url;
+        var link = el("a", null, "Открыть в Telegram");
+        link.href = data.telegram_url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        head.appendChild(link);
+      }
       return data.session_id;
     });
   }
@@ -156,7 +189,20 @@
         } else {
           node.onclick = function () {
             if (button.url) {
-              window.open(button.url, "_blank", "noopener");
+              // Адрес сервера виджета может не совпадать с адресом сайта, где
+              // виджет открыт: относительный путь ведём от BASE.
+              var href = button.url.charAt(0) === "/" ? BASE + button.url : button.url;
+              // Файл приходит с заголовком «вложение» — страница остаётся на
+              // месте, поэтому качаем в этой же вкладке, а не в пустой новой.
+              if (button.url.indexOf("/widget/download/") === 0) {
+                var anchor = document.createElement("a");
+                anchor.href = href;
+                document.body.appendChild(anchor);
+                anchor.click();
+                anchor.remove();
+              } else {
+                window.open(href, "_blank", "noopener");
+              }
             } else {
               sendAction(button.action);
             }
@@ -294,6 +340,36 @@
 
   function sendAction(action) {
     call("/widget/action", { action: action });
+  }
+
+  // Заказ файлом: тот же путь, что «скрепка» в чате бота. Ответ — отчёт проверки
+  // ядра обычными сообщениями виджета.
+  function uploadFile(file) {
+    if (state.busy) return;
+    state.busy = true;
+    render([{ type: "text", text: "📎 " + file.name }]);
+    log.lastChild.classList.add("vdm-me");
+    typing(true);
+    ensureSession()
+      .then(function (sessionId) {
+        var body = new FormData();
+        body.append("session_id", sessionId);
+        body.append("file", file);
+        return fetch(BASE + "/widget/upload", { method: "POST", body: body }).then(function (response) {
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          return response.json();
+        });
+      })
+      .then(function (data) {
+        render(data.responses);
+      })
+      .catch(function (error) {
+        render([{ type: "text", text: "Файл не отправился: " + error.message }]);
+      })
+      .finally(function () {
+        typing(false);
+        state.busy = false;
+      });
   }
 
   form.onsubmit = function (event) {

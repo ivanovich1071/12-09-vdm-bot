@@ -19,6 +19,7 @@ WORKDIR /app
 #   aiohttp-socks        — транзит до Telegram (TELEGRAM_PROXY); без него aiogram
 #                          с заданным транзитом падает на импорте;
 #   fastapi, uvicorn     — виджет, Mini App и Core API;
+#   python-multipart     — приём файла заказа в виджете (/widget/upload);
 #   pydantic             — схемы Core API;
 #   pypdf                — реестр приказов и заказ клиента, присланный в PDF;
 #   gspread, google-auth — только при ORDER_SINK=google_sheets.
@@ -31,6 +32,7 @@ RUN pip install --no-cache-dir \
     "aiohttp-socks>=0.9,<1" \
     "fastapi>=0.115,<1" \
     "uvicorn[standard]>=0.30,<1" \
+    "python-multipart>=0.0.9" \
     "pydantic>=2.8,<3" \
     "pypdf>=5.0,<7" \
     "gspread>=6.1,<7" \

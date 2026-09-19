@@ -12,7 +12,8 @@ pytest.importorskip("fastapi")
 
 from adapters.telegram.bot import build_dispatcher, send  # noqa: E402
 from adapters.telegram.gateway import ContactRequest, FileReply, TelegramGateway  # noqa: E402
-from core.ui import Button, Keyboard, Message, ProductList  # noqa: E402
+from core.models import Cart, CartItem  # noqa: E402
+from core.ui import Button, Keyboard, Message, OrderSummary, ProductList  # noqa: E402
 from test_core_api import build  # noqa: E402
 from test_order_core import HEADER, xlsx  # noqa: E402
 
@@ -162,8 +163,39 @@ def test_dispatcher_handles_text_files_and_contacts_through_gateway(env):
     assert len(dispatcher.message.handlers) == 3 and len(dispatcher.callback_query.handlers) == 1
 
 
+def test_deeplink_from_widget_transfers_cart(env):
+    """«Продолжить в Telegram»: /start <сессия сайта> переносит корзину из виджета в чат."""
+    api, gateway = env
+    widget_session = "a" * 32
+    api.storage.save_cart(
+        Cart(
+            user_id=widget_session,
+            items=[CartItem(sku_1c="B1", name="Мяч баскетбольный № 3", price=908, quantity=2)],
+        )
+    )
+
+    replies = gateway.text(USER, f"/start {widget_session}")
+
+    texts = [reply.text for reply in replies if isinstance(reply, Message)]
+    assert any("виджета" in text for text in texts), texts
+    cart = api.storage.load_cart(USER)
+    assert cart.count == 2 and cart.items[0].sku_1c == "B1"
+    # Корзина в чате показана сразу — тот же вид, что по кнопке «Корзина».
+    assert any(isinstance(reply, OrderSummary) or "Корзина" in getattr(reply, "text", "") for reply in replies)
+
+
+def test_deeplink_with_foreign_payload_does_not_touch_cart(env):
+    api, gateway = env
+    unknown = "b" * 32  # такой сессии нет — корзину не переносим
+
+    replies = gateway.text(USER, f"/start {unknown}")
+
+    assert api.storage.load_cart(USER).is_empty
+    assert not any("виджета" in getattr(reply, "text", "") for reply in replies)
+
+
 ALLOWED = {
-    "__future__", "logging", "collections.abc", "dataclasses",
+    "__future__", "logging", "collections.abc", "dataclasses", "re",
     "core.errors", "core.ui", "core_api", "core_api.facade", "core_api.sessions",
     "privacy.consent", "privacy.masking",
 }

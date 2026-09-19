@@ -96,6 +96,10 @@ class Settings:
     # зашифрованный трафик: переписку он не видит и расшифровать TLS не может.
     # Пусто — бот идёт к Telegram напрямую, как и раньше.
     telegram_proxy: str = ""
+    # Адрес бота для кнопки «Продолжить в Telegram» в виджете: https://t.me/<имя_бота>.
+    # Пусто — кнопки в виджете нет. /start с идентификатором сессии сайта переносит
+    # корзину из виджета в чат (`TelegramGateway._take_widget_cart`).
+    telegram_bot_url: str = ""
     # Устаревшие переменные, заданные в окружении, — чтобы сказать о них при запуске.
     ignored_env: list[str] = field(default_factory=list)
     # Публичный HTTPS-адрес Mini App (…/miniapp). Задан — бот ставит кнопку меню «Приложение».
@@ -207,6 +211,7 @@ class Settings:
             openrouter_price_out=float(env.get("OPENROUTER_PRICE_OUT", cls.openrouter_price_out)),
             telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
             telegram_proxy=env.get("TELEGRAM_PROXY", "").strip(),
+            telegram_bot_url=env.get("TELEGRAM_BOT_URL", "").strip(),
             ignored_env=[name for name in LEGACY_ENV if env.get(name)],
             telegram_miniapp_url=env.get("TELEGRAM_MINIAPP_URL", ""),
             max_token=env.get("MAX_TOKEN", ""),

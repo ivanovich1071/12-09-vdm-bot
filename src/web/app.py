@@ -13,17 +13,22 @@
 from __future__ import annotations
 
 import logging
+import secrets
+import threading
+import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response as HttpResponse
 from pydantic import BaseModel, Field
 
 from core.app import build_engine
 from core.config import Settings
-from core.ui import Message
+from core.errors import DomainError
+from core.ui import Button, Keyboard, Message, Response
 from web.render import to_json
 
 log = logging.getLogger(__name__)
@@ -41,6 +46,32 @@ CONTINUED = "С возвращением. Переписка и корзина �
 # пользователя Telegram можно было очистить его корзину, дать за него согласие
 # или стереть его данные.
 SESSION_ID = r"^[0-9a-f]{32}$"
+
+# --- Файлы в виджете ---------------------------------------------------------
+# Спецификацию и список разговора виджет отдаёт одноразовой ссылкой, как Mini App
+# через Core API (`facade.export_link`): анонимной сессии выдавать ключи нельзя,
+# а токен-адрес сам себе ключ — живёт DOWNLOAD_TTL секунд и срабатывает один раз.
+DOWNLOAD_TTL = 300
+_FILE_MEDIA = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pdf": "application/pdf",
+    ".csv": "text/csv",
+}
+# token -> (истекает, имя файла, содержимое). В памяти процесса: файл и так
+# собран ядром заново при каждом экспорте, хранить его дольше ссылки незачем.
+_downloads: dict[str, tuple[float, str, bytes]] = {}
+_downloads_lock = threading.Lock()
+
+
+def _remember_download(filename: str, content: bytes) -> str:
+    token = secrets.token_urlsafe(24)
+    now = time.monotonic()
+    with _downloads_lock:
+        for key in [k for k, (expires, _, _) in _downloads.items() if expires <= now]:
+            del _downloads[key]
+        _downloads[token] = (now + DOWNLOAD_TTL, filename, content)
+    return token
 
 
 class SessionIn(BaseModel):
@@ -70,7 +101,7 @@ def create_app(
     settings = settings or Settings.from_env()
     engine = engine or build_engine(settings, warm_llm=warm_llm)
     app = FastAPI(title="ЭЛТИ-КУДИЦ · бот-консультант", docs_url=None, redoc_url=None)
-    _install_core_api(app, settings, engine, core, verifiers)
+    get_core = _install_core_api(app, settings, engine, core, verifiers)
 
     # Виджет ставится на сайт заказчика, поэтому список источников задаётся явно:
     # открывать его всему интернету незачем.
@@ -111,8 +142,19 @@ def create_app(
         cart = engine.storage.load_cart(session_id)
         if not cart.is_empty:
             responses += engine.handle_action(session_id, CHANNEL, "cart")
+        # Кнопка «Продолжить в Telegram»: /start с этим идентификатором переносит
+        # корзину из виджета в чат бота (`TelegramGateway._take_widget_cart`).
+        telegram_url = ""
+        if settings.telegram_bot_url:
+            separator = "&" if "?" in settings.telegram_bot_url else "?"
+            telegram_url = f"{settings.telegram_bot_url}{separator}start={session_id}"
         return JSONResponse(
-            {"session_id": session_id, "history": history, "responses": to_json(responses)}
+            {
+                "session_id": session_id,
+                "history": history,
+                "responses": to_json(responses),
+                "telegram_url": telegram_url,
+            }
         )
 
     @app.post("/widget/message")
@@ -122,7 +164,53 @@ def create_app(
 
     @app.post("/widget/action")
     def action(payload: ActionIn) -> JSONResponse:
-        responses = engine.handle_action(payload.session_id, CHANNEL, payload.action)
+        verb, _, arg = payload.action.partition(":")
+        if verb == "export" and arg in {"xlsx", "docx"}:
+            # Раньше сюда приходила заглушка ядра «пришлю в Telegram-боте» — анонимной
+            # сессии боту писать некуда. Теперь файл уходит ссылкой прямо в браузер.
+            responses = _export_file(engine, payload.session_id, arg)
+        else:
+            responses = engine.handle_action(payload.session_id, CHANNEL, payload.action)
+        return JSONResponse({"responses": to_json(responses)})
+
+    @app.get("/widget/download/{token}")
+    def widget_download(token: str) -> HttpResponse:
+        """Одноразовая выдача файла: токен гасится первым же запросом."""
+        with _downloads_lock:
+            entry = _downloads.pop(token, None)
+        if entry is None or entry[0] < time.monotonic():
+            raise HTTPException(status_code=404, detail="Ссылка недействительна или истекла.")
+        _, filename, content = entry
+        media_type = _FILE_MEDIA.get(Path(filename).suffix.lower(), "application/octet-stream")
+        return HttpResponse(
+            content,
+            media_type=media_type,
+            headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)},
+        )
+
+    @app.post("/widget/upload")
+    async def widget_upload(
+        session_id: str = Form(..., pattern=SESSION_ID),
+        file: UploadFile = File(...),
+    ) -> JSONResponse:
+        """Заказ файлом прямо в виджете — тот же разбор, что в Telegram и Mini App.
+
+        Проверку делает ядро (`CoreApi.upload_order` + оценка), отчёт — тот же, что
+        в чате бота. Сессия создаётся в хранилище сессий при первом файле: user_ref
+        совпадает с идентификатором виджета, корзина и профиль общие.
+        """
+        content = await file.read()
+        filename = (file.filename or "").strip() or "файл"
+        limit = settings.order_upload_max_mb * 1024 * 1024
+        if not content:
+            raise HTTPException(status_code=400, detail="Файл пустой.")
+        if len(content) > limit:
+            raise HTTPException(status_code=413, detail=f"Файл больше {settings.order_upload_max_mb} МБ.")
+        try:
+            responses = _check_uploaded_order(get_core(), session_id, filename, content)
+        except DomainError as exc:
+            # Ядро отказывает по делу (не тот файл, слишком большой) — говорим прямо.
+            raise HTTPException(status_code=400, detail=exc.message) from exc
         return JSONResponse({"responses": to_json(responses)})
 
     @app.get("/media/{sku_1c}")
@@ -162,6 +250,66 @@ def create_app(
     return app
 
 
+def _export_file(engine, session_id: str, fmt: str) -> list[Response]:  # noqa: ANN001 — core.dialog.DialogEngine
+    """Файл списка разговора или комплектации одноразовой ссылкой — как в Telegram."""
+    from core import exports
+
+    file = exports.build(engine, engine.session(session_id, CHANNEL), fmt)
+    if file is None:
+        return [
+            Message(
+                "Сохранять пока нечего: сначала соберём комплектацию или подберём позиции.",
+                keyboard=Keyboard().row(Button("Меню", "menu")),
+            )
+        ]
+    token = _remember_download(file.filename, file.content)
+    # Действие-заполнитель — по образцу «Открыть на сайте»: файл живёт только в
+    # веб-канале, ссылка открывается браузером.
+    keyboard = Keyboard().row(Button("Скачать файл", "noop", url=f"/widget/download/{token}"))
+    return [Message(file.caption, keyboard=keyboard)]
+
+
+def _check_uploaded_order(core, session_id: str, filename: str, content: bytes) -> list[Response]:
+    """Проверка файла заказа: те же слова, что в Telegram (`TelegramGateway._upload`).
+
+    Кнопки согласованы с каналом: предзаказ по загруженному файлу в виджете идёт
+    через корзину и обычное оформление, файлы скачиваются здесь же.
+    """
+    from adapters.telegram.gateway import MATCHED, evaluation_text, preorder_preview
+    from core_api import dto
+
+    opened = core.open_session(channel=CHANNEL, user_ref=session_id, trusted=True)
+    session = core.session(opened.session_id or "")
+    order = core.upload_order(session, filename, content, core.order_context(session)).data
+    assert isinstance(order, dto.OrderOut)
+    menu = Keyboard().row(Button("Меню", "menu"))
+    if order.status == "FAILED":
+        return [Message(f"Файл «{order.source_file['filename']}» не удалось прочитать: {order.error}", keyboard=menu)]
+    evaluation = core.evaluate_order(session, order.id).data
+    assert isinstance(evaluation, dto.EvaluationOut)
+    text = evaluation_text(order, evaluation)
+    keyboard = Keyboard()
+    if evaluation.status != "REJECTED":
+        matched = [item for item in evaluation.items if item.get("match_status") in MATCHED]
+        if all(item.get("quantity") is not None for item in matched):
+            text += preorder_preview(matched)
+        else:
+            # Как в Telegram (15.09): файл без количества ушёл менеджеру предзаказом на 0 ₽ —
+            # здесь сначала количество, потом корзина.
+            text += (
+                "\n\nКоличество указано не у всех позиций. Напишите, например, «все по 2», "
+                "или добавьте найденное в корзину по 1 шт."
+            )
+        keyboard.row(Button("Найденные в корзину по 1 шт.", "order_cart:1"))
+        keyboard.row(Button("Скачать Excel", "export:xlsx"), Button("Скачать Word", "export:docx"))
+    keyboard.row(Button("Меню", "menu"))
+    if not evaluation.summary.get("checked") and order.warnings:
+        text = f"{order.warnings[0].message}\n\n{text}"
+    # Итог проверки — в разговор: иначе «подбери по этому заказу» ни к чему не привязано.
+    core.note_dialog(session, text, order, evaluation)
+    return [Message(text, keyboard=keyboard)]
+
+
 def _history(session) -> list[dict[str, str]]:  # noqa: ANN001 — core.dialog.Session
     """Переписка для окна виджета: только реплики человека и бота.
 
@@ -182,7 +330,13 @@ def _history(session) -> list[dict[str, str]]:  # noqa: ANN001 — core.dialog.S
     ]
 
 
-def _install_core_api(app: FastAPI, settings: Settings, engine, core, verifiers) -> None:  # noqa: ANN001
+def _install_core_api(app: FastAPI, settings: Settings, engine, core, verifiers):  # noqa: ANN001
+    """Core API на `/api` в том же процессе, что виджет: одна версия каталога, одно хранилище.
+
+    Ядро собирается при первом обращении к `/api`: запуск виджета и существующие
+    ручки от этого не зависят и базу ядра не трогают. Возвращает фабрику ядра —
+    ею пользуется и приём файлов в виджете (`/widget/upload`).
+    """
     """Core API на `/api` в том же процессе, что виджет: одна версия каталога, одно хранилище.
 
     Ядро собирается при первом обращении к `/api`: запуск виджета и существующие
@@ -217,6 +371,7 @@ def _install_core_api(app: FastAPI, settings: Settings, engine, core, verifiers)
         engine.procurement_provider = get_core
 
     install(app, get_core, settings)
+    return get_core
 
 
 app = create_app() if __name__ != "__main__" else None
