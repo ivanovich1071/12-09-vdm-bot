@@ -103,7 +103,7 @@ def test_preorders_of_the_test_account_do_not_reach_the_manager(env):
 
     [done] = gateway.text(USER, "Иван Тестов, +7 900 111-22-33")
 
-    assert "передан менеджеру" in done.text and api.notifier.sent == []
+    assert "Менеджер свяжется" in done.text and api.notifier.sent == []
 
 
 # --- Заказ файлом: корзина вместо предзаказа на 0 ₽ ----------------------------------------------

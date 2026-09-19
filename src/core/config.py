@@ -91,6 +91,11 @@ class Settings:
     # TELEGRAM_TOKEN не читается: под ним в старых .env лежит токен прежнего бота,
     # и новый бот не должен молча запуститься с ним.
     telegram_token: str = ""
+    # Транзит до api.telegram.org: `socks5://логин:пароль@хост:1080` либо `http://…`.
+    # Нужен там, где сеть сервера до Telegram не доходит. Транзит передаёт уже
+    # зашифрованный трафик: переписку он не видит и расшифровать TLS не может.
+    # Пусто — бот идёт к Telegram напрямую, как и раньше.
+    telegram_proxy: str = ""
     # Устаревшие переменные, заданные в окружении, — чтобы сказать о них при запуске.
     ignored_env: list[str] = field(default_factory=list)
     # Публичный HTTPS-адрес Mini App (…/miniapp). Задан — бот ставит кнопку меню «Приложение».
@@ -98,17 +103,34 @@ class Settings:
     max_token: str = ""
     site_url: str = "https://vdm.ru"
     manager_contact: str = "+7 (495) 646-01-40, elti@vdm.ru"
+    # Условия доставки на сайте заказчика. Бот стоимость и сроки не считает и не
+    # называет: лестница тарифов зависит от региона и от того, частное лицо или
+    # учреждение, — ошибиться легко, а обещание уже прозвучит. Отвечаем ссылкой
+    # и передаём менеджеру.
+    delivery_url: str = "https://vdm.ru/usloviya-raboty-/dostavka/"
+    # Сумма, с которой заказчик оформляет доставку. Это не порог заказа: заявка
+    # уходит менеджеру при любой сумме, а ниже порога к подтверждению добавляется
+    # строка про самовывоз и варианты доставки.
+    min_delivery_rub: int = 3000
     # Telegram id тестовых аккаунтов автотеста: их предзаказы менеджеру не отправляются.
     qa_user_ids: frozenset[str] = frozenset()
 
     # Заказы
-    order_sink: str = "jsonl"  # jsonl | google_sheets | bitrix24
+    order_sink: str = "jsonl"  # jsonl | google_sheets | bitrix24 | smtp
     google_sheets_id: str = ""
     google_credentials_file: str = "secrets/google-service-account.json"
     orders_jsonl_path: str = "data/orders.jsonl"
     # Куда кладётся спецификация заказа в Excel — то, что менеджер заводит в 1С
     # руками, пока интеграции нет.
     orders_xlsx_dir: str = "data/orders"
+    # Заявка письмом. Ящик-отправитель заводит заказчик, пароль живёт только в .env
+    # на сервере. Получатель — рабочий ящик, куда менеджеры смотрят каждый день.
+    smtp_host: str = ""
+    smtp_port: int = 465
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    order_email_to: str = ""
 
     # Фотографии товаров с сайта заказчика.
     # Сайт принадлежит заказчику, бот делается для него же, поэтому сбор включён.
@@ -184,11 +206,14 @@ class Settings:
             openrouter_price_in=float(env.get("OPENROUTER_PRICE_IN", cls.openrouter_price_in)),
             openrouter_price_out=float(env.get("OPENROUTER_PRICE_OUT", cls.openrouter_price_out)),
             telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
+            telegram_proxy=env.get("TELEGRAM_PROXY", "").strip(),
             ignored_env=[name for name in LEGACY_ENV if env.get(name)],
             telegram_miniapp_url=env.get("TELEGRAM_MINIAPP_URL", ""),
             max_token=env.get("MAX_TOKEN", ""),
             site_url=env.get("SITE_URL", cls.site_url),
             manager_contact=env.get("MANAGER_CONTACT", cls.manager_contact),
+            delivery_url=env.get("DELIVERY_URL", cls.delivery_url),
+            min_delivery_rub=int(env.get("MIN_DELIVERY_RUB", cls.min_delivery_rub)),
             qa_user_ids=frozenset(part.strip() for part in env.get("QA_USER_IDS", "").split(",") if part.strip()),
             order_sink=env.get("ORDER_SINK", cls.order_sink),
             google_sheets_id=env.get("GOOGLE_SHEETS_ID", ""),
@@ -197,6 +222,12 @@ class Settings:
             ),
             orders_jsonl_path=env.get("ORDERS_JSONL_PATH", cls.orders_jsonl_path),
             orders_xlsx_dir=env.get("ORDERS_XLSX_DIR", cls.orders_xlsx_dir),
+            smtp_host=env.get("SMTP_HOST", ""),
+            smtp_port=int(env.get("SMTP_PORT", cls.smtp_port)),
+            smtp_user=env.get("SMTP_USER", ""),
+            smtp_password=env.get("SMTP_PASSWORD", ""),
+            smtp_from=env.get("SMTP_FROM", ""),
+            order_email_to=env.get("ORDER_EMAIL_TO", ""),
             media_enabled=env.get("MEDIA_ENABLED", "1") not in {"0", "false", "no"},
             media_dir=env.get("MEDIA_DIR", cls.media_dir),
             media_min_interval=float(env.get("MEDIA_MIN_INTERVAL", cls.media_min_interval)),
@@ -220,6 +251,10 @@ class Settings:
             self.core_manager_key,
             self.cloudru_api_key,
             self.openrouter_api_key,
+            self.smtp_password,
+            # В адресе транзита стоит пароль, а сам адрес попадает в текст сетевой
+            # ошибки aiohttp — значит, и в журнал, если его не скрыть.
+            self.telegram_proxy,
         )
         return tuple(value for value in values if value)
 

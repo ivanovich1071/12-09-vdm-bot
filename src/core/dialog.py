@@ -32,6 +32,8 @@ from core.ui import (
     ProductCard,
     ProductList,
     Response,
+    delivery_note,
+    order_accepted,
     plural,
     price_text,
     stock_text,
@@ -913,6 +915,7 @@ class DialogEngine:
                     quantity=max(1, quantity),
                     url=product.url,
                     norm_citation=norm.citation if norm else None,
+                    in_stock=product.quantity_available,
                 )
             )
             added += 1
@@ -1099,6 +1102,7 @@ class DialogEngine:
                         quantity=count,
                         url=product.url,
                         norm_citation=norm.citation if norm else None,
+                        in_stock=product.quantity_available,
                     )
                 )
             self.storage.save_cart(cart)
@@ -1435,6 +1439,7 @@ class DialogEngine:
                 quantity=quantity,
                 url=product.url,
                 norm_citation=norm.citation if norm else None,
+                in_stock=product.quantity_available,
             )
         )
         self.storage.save_cart(cart)
@@ -1607,19 +1612,12 @@ class DialogEngine:
             return [Message(str(exc), keyboard=self._main_menu())]
 
         session.customer = Customer()
-        delivered = order.status == "sent"
-        tail = (
-            "Менеджер свяжется с вами в рабочее время."
-            if delivered
-            else "Заказ сохранён, менеджер получит его чуть позже — мы повторим отправку."
-        )
-        return [
-            Message(
-                f"Заказ {order.id} принят на {price_text(order.total)}. {tail}\n"
-                f"Связаться напрямую: {self.settings.manager_contact}",
-                keyboard=self._main_menu(),
-            )
-        ]
+        lines = [order_accepted(order.id, order.total, delivered=order.status == "sent")]
+        note = delivery_note(order.total, self.settings.min_delivery_rub, self.settings.delivery_url)
+        if note:
+            lines.append(note)
+        lines.append(f"Связаться напрямую: {self.settings.manager_contact}")
+        return [Message("\n".join(lines), keyboard=self._main_menu())]
 
     # --- Права субъекта ПДн ------------------------------------------------------
 
@@ -1664,12 +1662,17 @@ class DialogEngine:
         Корзина, оформление, помощь и «начать заново» переехали в командное меню
         Telegram: постоянные четыре кнопки под каждым ответом загромождали окно
         диалога, а нажать их всё равно можно было только у последнего сообщения.
+
+        «Связаться с менеджером» — исключение, и стоит отдельной строкой. Заказчик
+        просил не спрашивать контакты в начале разговора, но дать возможность
+        оставить их в любой момент; в виджете командного меню нет, и без этой
+        кнопки уйти к человеку было неоткуда.
         """
         return Keyboard().row(
             Button("Каталог", "catalog"),
             Button("Подбор по приказу", "norms"),
             Button("Начать заново", "restart"),
-        )
+        ).row(Button("Связаться с менеджером", "manager"))
 
     def _confirm_restart(self) -> list[Response]:
         return [

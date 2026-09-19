@@ -23,11 +23,16 @@ from pydantic import BaseModel, Field
 
 from core.app import build_engine
 from core.config import Settings
+from core.ui import Message
 from web.render import to_json
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).parent / "static"
 CHANNEL = "web"
+# Сколько реплик показываем вернувшемуся. Больше окно виджета всё равно не вмещает,
+# а тянуть весь разговор в браузер незачем.
+HISTORY_SHOWN = 30
+CONTINUED = "С возвращением. Переписка и корзина на месте — продолжим?"
 
 # Идентификатор посетителя выдаёт сервер — `uuid4().hex`, — и формат сверяется на
 # каждом запросе, а не только при открытии сессии. Корзина, согласие и удаление
@@ -94,15 +99,21 @@ def create_app(
         """Анонимный идентификатор посетителя: до согласия никаких персональных данных.
 
         Прежний идентификатор переиспользуется — иначе вернувшийся посетитель теряет
-        собранную корзину, — но приветствие отдаётся всегда, чтобы окно не открывалось
-        пустым.
+        собранную корзину и переписку. Вернувшемуся отдаётся его разговор, и вместо
+        приветствия он видит короткую строку о продолжении: поздороваться второй раз
+        с тем, кто уже полчаса выбирает мячи, — худшее, что может сделать виджет.
         """
         session_id = (payload.session_id if payload else None) or uuid.uuid4().hex
         responses = engine.start(session_id, CHANNEL)
+        history = _history(engine.session(session_id, CHANNEL))
+        if history and isinstance(responses[0], Message):
+            responses[0] = Message(CONTINUED, keyboard=responses[0].keyboard)
         cart = engine.storage.load_cart(session_id)
         if not cart.is_empty:
             responses += engine.handle_action(session_id, CHANNEL, "cart")
-        return JSONResponse({"session_id": session_id, "responses": to_json(responses)})
+        return JSONResponse(
+            {"session_id": session_id, "history": history, "responses": to_json(responses)}
+        )
 
     @app.post("/widget/message")
     def message(payload: MessageIn) -> JSONResponse:
@@ -149,6 +160,26 @@ def create_app(
         return HTMLResponse(html.replace("__BASE_URL__", str(request.base_url).rstrip("/")))
 
     return app
+
+
+def _history(session) -> list[dict[str, str]]:  # noqa: ANN001 — core.dialog.Session
+    """Переписка для окна виджета: только реплики человека и бота.
+
+    В истории лежат ещё служебные записи (просьбы к модели, следы инструментов) —
+    их посетителю показывать нечего. Хранится история маскированной, поэтому перед
+    показом метки раскрываются тем же `Masker`, что и ответы модели; после
+    перезапуска сервера соответствие меток потеряно, и нераскрытая метка
+    заменяется нейтральным словом, а не телефоном.
+    """
+    kept = [
+        item
+        for item in session.history
+        if item.get("role") in {"user", "assistant"} and item.get("content")
+    ]
+    return [
+        {"role": item["role"], "text": session.masker.unmask(item["content"])}
+        for item in kept[-HISTORY_SHOWN:]
+    ]
 
 
 def _install_core_api(app: FastAPI, settings: Settings, engine, core, verifiers) -> None:  # noqa: ANN001
@@ -208,6 +239,13 @@ def main() -> None:
         create_app(settings, warm_llm=True),
         host=settings.widget_host,
         port=settings.widget_port,
+        # За nginx приложение видит только адрес контейнера, а не схему страницы.
+        # Без доверия к X-Forwarded-Proto `request.base_url` остаётся http, и на
+        # https-странице браузер блокирует и скрипт виджета, и ссылки на файлы.
+        # Список адресов открыт: до порта приложения снаружи не достучаться —
+        # наружу смотрит только nginx.
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
 
 

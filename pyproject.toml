@@ -5,6 +5,9 @@ description = "Диалоговый бот-магазин для vdm.ru: Telegra
 requires-python = ">=3.12"
 dependencies = [
     "aiogram>=3.13",
+    # Транзит до api.telegram.org (TELEGRAM_PROXY): коннектор для него aiogram
+    # собирает этим пакетом, без него запуск с заданным транзитом падает.
+    "aiohttp-socks>=0.9",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "sqlalchemy[asyncio]>=2.0",

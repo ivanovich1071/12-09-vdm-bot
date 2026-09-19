@@ -64,6 +64,8 @@ fi
 # ----------------------------------------------------------------------------
 log "3/6 ufw"
 ufw allow 22/tcp comment 'SSH' >/dev/null
+# Порт приложения открыт, пока перед ним нет nginx. После deploy/https.sh наружу
+# смотрит только он, и тот же скрипт этот порт закрывает.
 ufw allow "${WIDGET_PORT}/tcp" comment 'vdm widget' >/dev/null
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null

@@ -15,6 +15,10 @@ class CartItem:
     quantity: int
     url: str | None = None
     norm_citation: str | None = None
+    # Остаток на момент, когда позицию положили в корзину: в заявке менеджер видит
+    # то же наличие, что видел клиент. None — склад по этой позиции неизвестен.
+    # Корзины, сохранённые до появления поля, читаются со значением по умолчанию.
+    in_stock: int | None = None
 
     @property
     def total(self) -> int:
@@ -120,6 +124,7 @@ class Order:
                     quantity=item.quantity,
                     url=item.url,
                     norm_citation=item.norm_citation,
+                    in_stock=item.in_stock,
                 )
                 for item in cart.items
             ],

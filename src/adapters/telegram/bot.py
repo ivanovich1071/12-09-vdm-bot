@@ -725,7 +725,15 @@ async def main() -> None:
     if not settings.telegram_token:
         raise SystemExit("Не задан TELEGRAM_BOT_TOKEN — бот не запускается.")
 
-    bot = Bot(settings.telegram_token, default=_default_properties(), session=_session())
+    if settings.telegram_proxy:
+        # Адрес печатаем без логина и пароля: строка целиком маскируется в журнале,
+        # но в неё стоит смотреть глазами при разборе связи.
+        log.info("Telegram — через транзит %s", _proxy_label(settings.telegram_proxy))
+    bot = Bot(
+        settings.telegram_token,
+        default=_default_properties(),
+        session=_session(settings.telegram_proxy),
+    )
     bot.session.middleware(RetryOnNetworkError())
     # Бот получает готовый Core API и сам не собирает ни движок, ни хранилище.
     gateway = TelegramGateway(
@@ -797,20 +805,31 @@ def _default_properties():  # noqa: ANN202 — тип зависит от вер
     return DefaultBotProperties(parse_mode="HTML")
 
 
-def _session():  # noqa: ANN202 — тип зависит от версии aiogram
-    """Сессия, принудительно работающая по IPv4.
+def _proxy_label(proxy: str) -> str:
+    """Адрес транзита без логина и пароля — то, что можно показать в журнале."""
+    head, _, tail = proxy.rpartition("@")
+    return tail if head else proxy
+
+
+def _session(proxy: str = ""):  # noqa: ANN202 — тип зависит от версии aiogram
+    """Сессия, принудительно работающая по IPv4, и при необходимости — через транзит.
 
     api.telegram.org резолвится и в IPv6, но на сетях без реальной IPv6-связности
     соединение просто виснет до таймаута, и бот падает при старте. Оставляем IPv4:
     он доступен везде, где доступен Telegram.
+
+    Транзит нужен там, где до Telegram не доходит сама сеть сервера. aiogram
+    собирает для него коннектор из `aiohttp_socks` (пакет стоит в образе), и
+    TLS при этом остаётся сквозным: транзит видит зашифрованные байты, а не
+    переписку. Пусто — соединение прямое, как и было.
     """
     import socket
 
     from aiogram.client.session.aiohttp import AiohttpSession
 
-    session = AiohttpSession()
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
     # aiogram собирает коннектор из этого словаря — добавляем семейство адресов,
-    # не трогая остальную его настройку (TLS, лимиты, кэш DNS).
+    # не трогая остальную его настройку (TLS, лимиты, кэш DNS, параметры транзита).
     session._connector_init["family"] = socket.AF_INET
     return session
 

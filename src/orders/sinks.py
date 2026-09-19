@@ -10,12 +10,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from core.models import Order
+from core.ui import plural, price_text
 
 HEADERS = [
     "Дата",
@@ -29,12 +31,22 @@ HEADERS = [
     "Код 1С",
     "Наименование",
     "Кол-во",
+    # Наличие на момент заявки: менеджер должен видеть то же, что видел клиент.
+    # Заказ на «в наличии» и «под заказ» при этом не делится — так решил заказчик.
+    "Наличие",
     "Цена",
     "Сумма",
     "Нормативное основание",
     "Ссылка на товар",
     "Комментарий",
 ]
+
+
+def stock_text(in_stock: int | None) -> str:
+    """Наличие так же, как его видел клиент (`core.ui.stock_text`)."""
+    if in_stock is None:
+        return "нет данных"
+    return f"в наличии {in_stock} шт." if in_stock > 0 else "под заказ"
 
 
 def order_rows(order: Order) -> list[list[str]]:
@@ -60,6 +72,7 @@ def order_rows(order: Order) -> list[list[str]]:
             item.sku_1c,
             item.name,
             str(item.quantity),
+            stock_text(item.in_stock),
             "" if item.price is None else str(item.price),
             str(item.total),
             item.norm_citation or "",
@@ -115,7 +128,18 @@ class XlsxSink:
         _write_xlsx(target, HEADERS, order_rows(order))
 
 
-def _write_xlsx(path: Path, headers: list[str], rows: list[list[str]]) -> None:
+def order_xlsx(order: Order) -> bytes:
+    """Та же спецификация, что кладётся в `data/orders`, но в памяти.
+
+    Нужна письму: вложение собирается из заказа, а не читается из файла, — иначе
+    оно зависело бы от того, успел ли отработать соседний приёмник.
+    """
+    buffer = io.BytesIO()
+    _write_xlsx(buffer, HEADERS, order_rows(order))
+    return buffer.getvalue()
+
+
+def _write_xlsx(path: Path | io.BytesIO, headers: list[str], rows: list[list[str]]) -> None:
     import zipfile
     from xml.sax.saxutils import escape
 
@@ -200,6 +224,101 @@ class GoogleSheetsSink:
             return book.worksheet(self.worksheet)
         except Exception:
             return book.add_worksheet(self.worksheet, rows=1000, cols=len(HEADERS))
+
+
+@dataclass
+class SmtpSink:
+    """Заявка письмом на рабочий ящик менеджеров.
+
+    CRM у заказчика пока нет, а почту менеджеры смотрят каждый день — это самый
+    короткий путь от бота до человека. Письмо не единственная копия заказа: оно
+    идёт в `CompositeSink` вместе с jsonl и Excel, поэтому упавший почтовый сервер
+    заявку не теряет.
+
+    Пароль ящика живёт только в `.env` на сервере и в журнал не попадает
+    (`Settings.secret_values` → `observability/redact.py`).
+    """
+
+    host: str
+    port: int = 465
+    user: str = ""
+    password: str = ""
+    sender: str = ""
+    to: str = ""
+    timeout: float = 30.0
+    name: str = "smtp"
+
+    def push(self, order: Order) -> None:
+        if not self.host or not self.to:
+            raise RuntimeError("Почтовый приёмник не настроен: нужны SMTP_HOST и ORDER_EMAIL_TO")
+        self._send(self.message(order))
+
+    def message(self, order: Order):  # noqa: ANN201 — email.message.EmailMessage
+        from email.message import EmailMessage
+
+        count = len(order.items)
+        message = EmailMessage()
+        message["Subject"] = (
+            f"Заявка {order.id} · {count} {plural(count, 'позиция', 'позиции', 'позиций')} "
+            f"· {price_text(order.total)}"
+        )
+        message["From"] = self.sender or self.user
+        message["To"] = self.to
+        message.set_content(self._body(order))
+        message.add_attachment(
+            order_xlsx(order),
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"{order.id}.xlsx",
+        )
+        return message
+
+    @staticmethod
+    def _body(order: Order) -> str:
+        customer = order.customer
+        # Состав — коротко: подробности со всеми полями лежат во вложении.
+        items = "\n".join(
+            f"  {item.quantity} × {item.name} ({item.sku_1c}) — {price_text(item.total)}"
+            for item in order.items[:20]
+        )
+        if len(order.items) > 20:
+            items += f"\n  … ещё {len(order.items) - 20} — во вложении"
+        contacts = "\n".join(
+            f"{title}: {value}"
+            for title, value in (
+                ("Контактное лицо", customer.name),
+                ("Телефон", customer.phone),
+                ("E-mail", customer.email),
+                ("Организация", customer.organization),
+                ("Регион", customer.region),
+                ("Комментарий", customer.comment),
+            )
+            if value
+        )
+        return (
+            f"Заявка {order.id} из бота, канал {order.channel}, {order.created_at}.\n\n"
+            f"{contacts}\n\n"
+            f"Состав ({len(order.items)} поз., {price_text(order.total)}):\n{items}\n\n"
+            "Полная спецификация — во вложении.\n"
+        )
+
+    def _send(self, message) -> None:  # noqa: ANN001 — email.message.EmailMessage
+        import smtplib
+
+        # 465 — SSL с первого байта, 587 — обычное соединение с переходом на TLS.
+        # Без шифрования не отправляем: в письме персональные данные клиента.
+        if self.port == 465:
+            with smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout) as server:
+                self._login_and_send(server, message)
+        else:
+            with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as server:
+                server.starttls()
+                self._login_and_send(server, message)
+
+    def _login_and_send(self, server, message) -> None:  # noqa: ANN001 — smtplib.SMTP
+        if self.user:
+            server.login(self.user, self.password)
+        server.send_message(message)
 
 
 @dataclass

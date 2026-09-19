@@ -60,7 +60,7 @@ def test_preorder_with_consent_and_contact_text(env):
     [again] = gateway.text(USER, "меня зовут Иван")
     assert isinstance(again, ContactRequest) and "телефон" in again.text
     [done] = gateway.text(USER, "Иван Петров, +7 900 111-22-33")
-    assert "передан менеджеру" in done.text and len(api.notifier.sent) == 1
+    assert "Менеджер свяжется" in done.text and len(api.notifier.sent) == 1
     preorder = api.core.services.preorders.get(api.notifier.sent[0], USER)
     assert preorder.customer["name"] == "Иван Петров" and preorder.customer["phone"].endswith("22-33")
 
@@ -72,7 +72,7 @@ def test_contact_button_path(env):
     _, ask = gateway.action(USER, next(a for a in actions(evaluation) if a.startswith("po_order:")))
     assert isinstance(ask, ContactRequest)
     [done] = gateway.contact(USER, "Иван", "+79001112233")
-    assert "передан менеджеру" in done.text
+    assert "Менеджер свяжется" in done.text
 
 
 def test_spec_command_sends_excel_and_word(env):

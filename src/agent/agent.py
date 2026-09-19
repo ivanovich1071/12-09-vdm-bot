@@ -141,11 +141,20 @@ _OBJECTION_QUESTIONS = {
         "складывается цена? От этого зависит, что предложить."
     ),
     "norm": "Понимаю сомнение. По какому пункту перечня нужно подтверждение? Сверю с текстом приказа.",
+    # Стоимость и срок доставки бот не называет: тариф зависит от региона и от того,
+    # частное лицо это или учреждение, а сроки заказчик просил не обещать. Отдаём
+    # условия ссылкой и передаём разговор менеджеру.
     "logistics": (
-        "Сроки и доставку подтверждает менеджер. Что важнее — успеть к дате или взять всё одной поставкой?"
+        "Сроки и доставку подтверждает менеджер, условия — на странице {delivery_url}. "
+        "Что важнее — успеть к дате или взять всё одной поставкой?"
     ),
     "none": "Подскажите, что именно смущает — цена, соответствие перечню или сроки?",
 }
+
+
+def _objection_question(objection: str, delivery_url: str) -> str:
+    text = _OBJECTION_QUESTIONS.get(objection, _OBJECTION_QUESTIONS["none"])
+    return text.format(delivery_url=delivery_url)
 
 # Просьба к продавцу, который пообещал подбор и не вызвал его.
 _INSIST = (
@@ -536,7 +545,7 @@ class SalesAgent:
                 "назовите её — характеристики, цену и наличие возьму из каталога."
             )
         elif profile.objection != "none" and not profile.objection_handled:
-            text = kept or _OBJECTION_QUESTIONS.get(profile.objection, _OBJECTION_QUESTIONS["none"])
+            text = kept or _objection_question(profile.objection, self.engine.settings.delivery_url)
         elif not profile.task_known and not decision.precise:
             text = selection.question(_missing(profile))
         else:

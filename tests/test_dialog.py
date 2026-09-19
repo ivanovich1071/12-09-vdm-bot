@@ -286,3 +286,40 @@ def test_norm_menu_offers_every_document_within_the_button_limit(engine):
 
     assert any(b.action == "norm_doc:order_1057" for b in buttons)
     assert all(len(b.action.encode()) <= 64 for b in buttons)
+
+
+def _order(engine, sku):
+    engine.handle_action(USER, CHANNEL, f"add:{sku}")
+    engine.handle_action(USER, CHANNEL, "checkout")
+    engine.handle_action(USER, CHANNEL, "consent_yes")
+    fill_contacts(engine)
+    return engine.handle_action(USER, CHANNEL, "confirm_order")[0].text
+
+
+def test_order_confirmation_names_working_hours_and_no_deadline(engine):
+    """Формулировку и часы работы согласовал заказчик; сроки бот не называет."""
+    text = _order(engine, "S1")
+    assert "принят" in text and "Менеджер свяжется с вами в ближайшее время." in text
+    assert "10:00–18:00 МСК" in text
+    assert "рабочих дней" not in text
+
+
+def test_small_order_warns_about_delivery_but_still_reaches_the_manager(engine):
+    """3000 ₽ — порог доставки, а не заказа: заявка уходит при любой сумме."""
+    text = _order(engine, "S2")  # мяч за 908 ₽
+
+    assert "Доставка оформляется от 3 000 ₽" in text
+    assert "самовывоз" in text and "vdm.ru/usloviya-raboty-/dostavka/" in text
+    assert len(engine.storage.orders_of(USER)) == 1
+
+
+def test_big_order_says_nothing_about_the_delivery_threshold(engine):
+    text = _order(engine, "S1")  # станок за 253 000 ₽
+    assert "Доставка оформляется" not in text
+
+
+def test_manager_button_is_always_within_reach(engine):
+    """Контакты в начале чата не спрашиваем — но уйти к человеку можно с первого экрана."""
+    keyboard = engine.start(USER, CHANNEL)[0].keyboard
+    actions = [button.action for row in keyboard.rows for button in row]
+    assert "manager" in actions

@@ -57,11 +57,18 @@ nano /opt/vdm-bot/.env
 | Ключ | Значение |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | токен от @BotFather |
+| `TELEGRAM_PROXY` | транзит до api.telegram.org, если прямого выхода нет (см. ниже) |
 | `CLOUDRU_API_KEY` | ключ Foundation Models (основной провайдер) |
-| `OPENROUTER_API_KEY` | запасной; с российского адреса может не открыться |
-| `LLM_PROVIDER` | `auto` — сначала Cloud.ru, при отказе OpenRouter |
+| `LLM_PROVIDER` | на российском сервере — `cloudru` |
+| `OPENROUTER_API_KEY` | не заполнять для контура заказчика: с российского адреса даёт 403, а в перечне получателей данных он лишний |
 | `WIDGET_ALLOWED_ORIGINS` | адрес сайта, если виджет встраивается на vdm.ru |
+| `ORDER_SINK` | `smtp`, чтобы заявка уходила письмом менеджерам |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | ящик-отправитель; 465 — SSL, 587 — STARTTLS |
+| `ORDER_EMAIL_TO` | рабочий ящик менеджеров |
 | `QA_USER_IDS` | id тестового аккаунта, если на сервере гоняется автотест |
+
+Письмо — не единственная копия заявки: jsonl и спецификация в Excel пишутся всегда,
+и упавший почтовый сервер заказ не теряет.
 
 `TELEGRAM_MINIAPP_URL` оставить пустым: Mini App требует HTTPS и домена, по HTTP
 Telegram кнопку не откроет.
@@ -83,6 +90,44 @@ docker compose logs -f --tail=100 telegram
 ```
 
 Демо-страница виджета: `http://<адрес>:8000/demo`.
+
+### Если с сервера не открывается api.telegram.org
+
+Признак: `curl -s -o /dev/null -w '%{http_code} %{time_total}\n' https://api.telegram.org/`
+отдаёт `000` через десяток секунд, а Cloud.ru с того же сервера отвечает за пару
+секунд. Разбирается по шагам:
+
+```bash
+getent hosts api.telegram.org                 # резолвится ли имя
+curl -v --max-time 10 https://api.telegram.org/   # где встаёт: DNS, TCP или TLS
+```
+
+Дальше — по порядку, от дешёвого к дорогому:
+
+1. запрос в поддержку хостинга: постоянное ли это ограничение для пула и есть ли
+   пул, откуда Telegram доступен;
+2. проба второго российского провайдера — часовая ВМ и один `curl`;
+3. если прямого выхода нет — транзит: SOCKS5 (`dante`, `3proxy`) на отдельной ВМ,
+   вход разрешён только с адреса этого сервера, исходящие — только на 443,
+   журналы без тела запросов. Адрес вписывается в `TELEGRAM_PROXY`:
+
+```bash
+TELEGRAM_PROXY=socks5://логин:пароль@хост:1080
+```
+
+TLS при этом остаётся сквозным: транзит передаёт зашифрованные байты и переписки
+не видит — подробнее в [docs/ПДн_КОНТУР.md](../docs/ПДн_КОНТУР.md). Telegram-модуль
+за границу **не выносится**: иностранный узел, разбирающий `update`, — это уже
+обработчик персональных данных.
+
+Проверка после правки `.env`:
+
+```bash
+cd /opt/vdm-bot
+docker compose run --rm telegram python run.py telegram --check   # покажет хост транзита без пароля
+docker compose restart telegram
+docker compose logs -f --tail=50 telegram
+```
 
 ### Один токен — один опрашивающий процесс
 

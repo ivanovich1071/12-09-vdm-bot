@@ -428,7 +428,7 @@ def test_checkout_goes_to_the_core_preorder_not_the_old_form(env):
     assert isinstance(ask, ContactRequest)
 
     [done] = gateway.contact(USER, "Проверка", "+7 900 000-00-01")
-    assert "передан менеджеру" in done.text
+    assert "Менеджер свяжется" in done.text
     [preorder] = api.core.services.preorders.of_owner(USER)
     assert str(preorder.status) == "SENT_TO_MANAGER" and api.notifier.sent == [preorder.id]
 

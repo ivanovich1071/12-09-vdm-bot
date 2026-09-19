@@ -82,3 +82,35 @@ def test_widget_js_is_revalidated(client):
     response = client.get("/widget.js")
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-cache"
+
+
+def test_demo_page_loads_the_widget_by_a_relative_path(client):
+    """Регрессия: на https-странице скрипт подключался по http и не выполнялся."""
+    html = client.get("/demo").text
+    assert '<script src="/widget.js" defer></script>' in html
+    # Абсолютный адрес остаётся только в примере встраивания на чужой сайт —
+    # внутри <pre>, а не тегом страницы.
+    assert 'src="http' not in html.split("<pre>")[0]
+
+
+def test_returning_visitor_sees_the_conversation_and_no_second_greeting(client):
+    session_id = client.post("/widget/session").json()["session_id"]
+    greeting = client.post("/widget/session", json={"session_id": session_id}).json()["responses"][0]["text"]
+    client.post("/widget/message", json={"session_id": session_id, "text": "нужен мяч"})
+
+    body = client.post("/widget/session", json={"session_id": session_id}).json()
+
+    said = [item["text"] for item in body["history"] if item["role"] == "user"]
+    assert "нужен мяч" in said
+    assert body["responses"][0]["text"] != greeting
+    assert "С возвращением" in body["responses"][0]["text"]
+
+
+def test_history_shows_no_masking_labels(client):
+    """История хранится маскированной; посетителю метки показывать нельзя."""
+    session_id = client.post("/widget/session").json()["session_id"]
+    client.post("/widget/message", json={"session_id": session_id, "text": "звоните +7 900 111-22-33"})
+
+    body = client.post("/widget/session", json={"session_id": session_id}).json()
+    said = " ".join(item["text"] for item in body["history"])
+    assert "[ТЕЛЕФОН" not in said and "[ИМЯ" not in said

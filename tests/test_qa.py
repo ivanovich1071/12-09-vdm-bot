@@ -276,7 +276,7 @@ def test_night_problems_are_caught_by_code():
     zero = _turn("Предварительный заказ PO-20260915-CDE760: позиций 15 на 0 ₽ по текущим ценам.")
     assert [f.code for f in check_turn(zero, facts, [])] == ["ZERO_PREORDER"]
     assert [f.code for f in check_turn(_turn("Я передал ваш запрос специалисту."), facts, [])] == ["FALSE_HANDOFF"]
-    sent = _turn("Предварительный заказ PO-20260915-F39948 передан менеджеру.")
+    sent = _turn("Ваш заказ PO-20260915-F39948 принят. Менеджер свяжется с вами в ближайшее время.")
     assert check_turn(sent, facts, []) == []
 
     cards = Turn(

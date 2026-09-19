@@ -17,7 +17,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from core.errors import DomainError
-from core.ui import Button, Keyboard, Message, Response, plural, price_text
+from core.ui import (
+    Button,
+    Keyboard,
+    Message,
+    Response,
+    delivery_note,
+    order_accepted,
+    plural,
+    price_text,
+)
 from core_api import dto
 from core_api.facade import CoreApi
 from core_api.sessions import CoreSession
@@ -295,14 +304,15 @@ class TelegramGateway:
         customer = dto.CustomerIn(name=name[:200], phone=phone[:50])
         sent = self.core.send_preorder(self.session(user_id), preorder_id, customer).data
         assert isinstance(sent, dto.PreorderOut)
-        if sent.status == "SENT_TO_MANAGER":
-            return [
-                Message(
-                    f"Предварительный заказ {sent.id} передан менеджеру. Он свяжется с вами и "
-                    "подтвердит наличие, срок и окончательную цену."
-                )
-            ]
-        return [Message(f"Предзаказ {sent.id} сохранён, но передать менеджеру пока не удалось — повторим отправку.")]
+        # Текст приёма заявки — общий для всех каналов (`core.ui.order_accepted`):
+        # клиент, написавший и в Telegram, и на сайте, должен видеть одно и то же.
+        settings = self.core.services.settings
+        amount = sent.totals.get("amount")
+        lines = [order_accepted(sent.id, amount, delivered=sent.status == "SENT_TO_MANAGER")]
+        note = delivery_note(amount, settings.min_delivery_rub, settings.delivery_url)
+        if note:
+            lines.append(note)
+        return [Message("\n".join(lines))]
 
     def _history(self, user_id: str) -> list[TelegramReply]:
         data = self.core.history(self.session(user_id)).data

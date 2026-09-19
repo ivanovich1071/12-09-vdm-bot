@@ -51,6 +51,11 @@ def settings_checks(settings: Settings) -> list[Check]:
         )
     token = bool(settings.telegram_token)
     checks.append(Check("TELEGRAM_BOT_TOKEN", token, "задан" if token else "не задан"))
+    if settings.telegram_proxy:
+        from adapters.telegram.bot import _proxy_label
+
+        # Логин и пароль транзита не печатаем — только хост и порт.
+        checks.append(Check("Транзит до Telegram", True, _proxy_label(settings.telegram_proxy)))
     checks.append(
         Check(
             "Модель",
@@ -63,7 +68,7 @@ def settings_checks(settings: Settings) -> list[Check]:
     return checks
 
 
-async def bot_checks(token: str) -> list[Check]:
+async def bot_checks(token: str, proxy: str = "") -> list[Check]:
     from aiogram import Bot
     from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
     from aiogram.utils.token import TokenValidationError
@@ -71,7 +76,7 @@ async def bot_checks(token: str) -> list[Check]:
     from adapters.telegram.bot import _session
 
     try:
-        bot = Bot(token, session=_session())
+        bot = Bot(token, session=_session(proxy))
     except TokenValidationError:
         return [Check("Токен", False, "не похож на токен от @BotFather")]
     try:
@@ -144,7 +149,7 @@ def miniapp_checks(url: str, fetch: Fetch | None = None) -> list[Check]:
 async def run(settings: Settings, fetch: Fetch | None = None) -> list[Check]:
     checks = settings_checks(settings)
     if settings.telegram_token:
-        checks += await bot_checks(settings.telegram_token)
+        checks += await bot_checks(settings.telegram_token, settings.telegram_proxy)
     checks += miniapp_checks(settings.telegram_miniapp_url, fetch)
     return checks
 

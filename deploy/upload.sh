@@ -20,6 +20,11 @@ HOST="${1:-${VDM_HOST:-}}"
 SSH_USER="${SSH_USER:-root}"
 APP_DIR="${APP_DIR:-/opt/vdm-bot}"
 BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
+# Отдельный ключ для сервера (у рабочего ключа разработчика бывает парольная фраза,
+# и тогда каждый scp останавливается на её вводе).
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/vdm_deploy}"
+SSH_ARGS=()
+[[ -f "$SSH_KEY" ]] && SSH_ARGS=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
 
 if [[ -z "$HOST" ]]; then
   echo "Укажите адрес сервера: bash deploy/upload.sh 135.106.222.191" >&2
@@ -68,11 +73,11 @@ if [[ -n "${DRY_RUN:-}" ]]; then
 fi
 
 echo "[3/4] копирование на ${SSH_USER}@${HOST} (спросит пароль)"
-ssh "${SSH_USER}@${HOST}" "mkdir -p '${APP_DIR}'"
-scp "${WORK}/code.tgz" "${WORK}/catalog.tgz" "${SSH_USER}@${HOST}:${APP_DIR}/"
+ssh ${SSH_ARGS[@]+"${SSH_ARGS[@]}"} "${SSH_USER}@${HOST}" "mkdir -p '${APP_DIR}'"
+scp ${SSH_ARGS[@]+"${SSH_ARGS[@]}"} "${WORK}/code.tgz" "${WORK}/catalog.tgz" "${SSH_USER}@${HOST}:${APP_DIR}/"
 
 echo "[4/4] распаковка и установка на сервере"
-ssh "${SSH_USER}@${HOST}" "bash -s" <<EOF
+ssh ${SSH_ARGS[@]+"${SSH_ARGS[@]}"} "${SSH_USER}@${HOST}" "bash -s" <<EOF
 set -Eeuo pipefail
 cd '${APP_DIR}'
 tar -xzf code.tgz && rm -f code.tgz

@@ -313,3 +313,51 @@ async def test_hopeless_link_gives_up_instead_of_retrying_forever():
 
     with pytest.raises(TelegramNetworkError):
         await middleware(always_broken, None, object())
+
+
+# --- Транзит до Telegram ------------------------------------------------------
+
+
+def test_direct_session_stays_direct():
+    from adapters.telegram.bot import _session
+
+    session = _session()
+    assert session._connector_init["family"] != 0  # принудительный IPv4 на месте
+    assert "proxy_type" not in session._connector_init
+
+
+def test_session_goes_through_the_transit_when_it_is_set():
+    pytest.importorskip("aiohttp_socks")
+    from adapters.telegram.bot import _session
+
+    session = _session("socks5://bot:s3cret@transit.example:1080")
+
+    # Коннектор транзита aiogram собирает из этих полей; IPv4 при этом не теряется.
+    assert session._connector_init["host"] == "transit.example"
+    assert session._connector_init["port"] == 1080
+    assert session._connector_init["family"] != 0
+
+
+def test_transit_address_is_shown_without_the_password():
+    from adapters.telegram.bot import _proxy_label
+
+    assert _proxy_label("socks5://bot:s3cret@transit.example:1080") == "transit.example:1080"
+    assert _proxy_label("http://transit.example:3128") == "http://transit.example:3128"
+
+
+def test_preflight_names_the_transit_but_not_its_password():
+    from adapters.telegram.preflight import settings_checks
+    from core.config import Settings
+
+    settings = Settings(telegram_token="1:x", telegram_proxy="socks5://bot:s3cret@transit.example:1080")
+    line = " ".join(check.line() for check in settings_checks(settings))
+
+    assert "transit.example:1080" in line and "s3cret" not in line
+
+
+def test_transit_address_is_a_secret_for_the_log():
+    """В адресе стоит пароль, а адрес попадает в текст сетевой ошибки aiohttp."""
+    from core.config import Settings
+
+    settings = Settings(telegram_proxy="socks5://bot:s3cret@transit.example:1080")
+    assert settings.telegram_proxy in settings.secret_values

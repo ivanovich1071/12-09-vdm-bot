@@ -14,6 +14,7 @@ from orders.sinks import (
     GoogleSheetsSink,
     JsonlSink,
     OrderSink,
+    SmtpSink,
     XlsxSink,
 )
 
@@ -25,9 +26,9 @@ MAX_ATTEMPTS = 5
 def build_sink(settings: Settings) -> OrderSink:
     """Приёмник по конфигурации. Локальный файл всегда включён как дубль.
 
-    Пока CRM недоступна, единственный внешний приёмник — Google Sheets. Если он
-    отвалится, заказ всё равно окажется в файле и в базе, и его не придётся искать
-    по логам.
+    Пока CRM недоступна, внешних приёмников два: почта менеджеров (`smtp`) и
+    Google Sheets. Любой из них может отвалиться — заказ всё равно окажется в файле
+    и в базе, и его не придётся искать по логам.
     """
     # Спецификация в Excel идёт всегда: пока интеграции с 1С нет, это тот вид, в
     # котором заказ можно передать менеджеру и завести руками.
@@ -52,6 +53,26 @@ def build_sink(settings: Settings) -> OrderSink:
         )
     if settings.order_sink == "bitrix24":
         return CompositeSink([Bitrix24Sink(webhook_url=""), fallback])
+    if settings.order_sink == "smtp":
+        if not settings.smtp_host or not settings.order_email_to:
+            log.warning("ORDER_SINK=smtp, но SMTP_HOST или ORDER_EMAIL_TO пуст — пишем в файл")
+            return fallback
+        # Письмо первым, файлы следом: даже если почта отвалится, заявка останется
+        # в jsonl и в Excel — `CompositeSink` считает заказ доставленным по любому
+        # сработавшему приёмнику и пишет в журнал, что именно не прошло.
+        return CompositeSink(
+            [
+                SmtpSink(
+                    host=settings.smtp_host,
+                    port=settings.smtp_port,
+                    user=settings.smtp_user,
+                    password=settings.smtp_password,
+                    sender=settings.smtp_from,
+                    to=settings.order_email_to,
+                ),
+                fallback,
+            ]
+        )
     return fallback
 
 

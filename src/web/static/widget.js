@@ -116,7 +116,7 @@
       saved = null;
     }
     // Даже с сохранённым идентификатором обращаемся к серверу: он вернёт
-    // приветствие и текущую корзину, иначе окно откроется пустым.
+    // переписку, приветствие и текущую корзину, иначе окно откроется пустым.
     return post("/widget/session", saved ? { session_id: saved } : {}).then(function (data) {
       state.sessionId = data.session_id;
       try {
@@ -124,6 +124,13 @@
       } catch (e) {
         /* приватный режим — просто не запоминаем */
       }
+      // Переписка прошлого визита — обычными сообщениями, свои справа, как при
+      // отправке. Разговор хранится на сервере, а не в браузере: закрытая
+      // вкладка и другое устройство его не теряют.
+      (data.history || []).forEach(function (item) {
+        render([{ type: "text", text: item.text }]);
+        if (item.role === "user") log.lastChild.classList.add("vdm-me");
+      });
       render(data.responses);
       return data.session_id;
     });
