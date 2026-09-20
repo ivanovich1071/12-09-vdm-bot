@@ -22,7 +22,8 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response as HttpResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import Response as HttpResponse
 from pydantic import BaseModel, Field
 
 from core.app import build_engine
@@ -191,7 +192,7 @@ def create_app(
     @app.post("/widget/upload")
     async def widget_upload(
         session_id: str = Form(..., pattern=SESSION_ID),
-        file: UploadFile = File(...),
+        file: UploadFile = File(...),  # noqa: B008 — так объявляется загрузка в FastAPI
     ) -> JSONResponse:
         """Заказ файлом прямо в виджете — тот же разбор, что в Telegram и Mini App.
 

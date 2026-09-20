@@ -51,12 +51,15 @@ class FetchResult:
 @dataclass
 class PageFetcher:
     user_agent: str = DEFAULT_USER_AGENT
-    timeout: float = 20.0
+    # Восемь секунд, а не двадцать: страница карточки отдаётся за доли секунды,
+    # и если сайт молчит дольше, ждать смысла нет — фоновый сборщик вернётся
+    # к товару при следующем показе.
+    timeout: float = 8.0
     # Минимальный промежуток между запросами. Значение по умолчанию — один запрос
     # в секунду: столько выдержит любой сайт, а согласованный лимит выставляется
     # в настройках.
     min_interval: float = 1.0
-    retries: int = 2
+    retries: int = 1
     respect_robots: bool = False
 
     _last_request: float = field(default=0.0, init=False)

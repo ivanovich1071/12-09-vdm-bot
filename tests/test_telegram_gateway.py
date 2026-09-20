@@ -160,7 +160,9 @@ async def test_renderer_sends_files_and_contact_button():
 def test_dispatcher_handles_text_files_and_contacts_through_gateway(env):
     _, gateway = env
     dispatcher = build_dispatcher(gateway)
-    assert len(dispatcher.message.handlers) == 3 and len(dispatcher.callback_query.handlers) == 1
+    # Текст, документ, контакт и перехватчик всего остального (фото, голосовое,
+    # стикер): без последнего бот на такое сообщение молчал.
+    assert len(dispatcher.message.handlers) == 4 and len(dispatcher.callback_query.handlers) == 1
 
 
 def test_deeplink_from_widget_transfers_cart(env):

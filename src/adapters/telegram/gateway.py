@@ -109,6 +109,11 @@ class TelegramGateway:
     def storage(self):  # noqa: ANN201 — кэш file_id снимков у рендера
         return self.core.storage
 
+    @property
+    def miniapp_url(self) -> str:
+        """Адрес Mini App для кнопки над полем ввода. Пусто — кнопки нет."""
+        return self.core.services.settings.telegram_miniapp_url
+
     def session(self, user_id: str) -> CoreSession:
         cached = self._sessions.get(user_id)
         if cached is None:

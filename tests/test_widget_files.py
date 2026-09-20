@@ -10,10 +10,9 @@ from __future__ import annotations
 import pytest
 
 pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
 
-from test_order_core import HEADER, xlsx  # noqa: E402
 from test_core_api import build  # noqa: E402
+from test_order_core import HEADER, xlsx  # noqa: E402
 
 
 def _buttons(body: dict) -> list[dict]:

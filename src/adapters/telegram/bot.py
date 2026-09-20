@@ -15,10 +15,16 @@ import asyncio
 import logging
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -60,6 +66,19 @@ CAPTION_LIMIT = 1024
 # и тогда бот молча перестанет отвечать по части товаров.
 MESSAGE_LIMIT = 4096
 TRUNCATED_TAIL = "\n\n… полное описание на сайте"
+
+# Сколько ходов бот считает одновременно. Ход ждёт ответа модели, а не
+# процессора, поэтому потоков нужно больше, чем ядер.
+TURN_WORKERS = 16
+
+# Всплывающая подсказка на повторное нажатие, пока считается предыдущий ход.
+BUSY_HINT = "Ещё думаю над прошлым нажатием — секунду."
+
+# Ответ на то, чего бот разобрать не умеет: фото, голосовое, видео, стикер.
+UNSUPPORTED = (
+    "Такое я пока не разбираю. Напишите словами, что нужно подобрать, "
+    "или пришлите список файлом — .xlsx, .docx или .pdf."
+)
 
 
 def fit(text: str) -> str:
@@ -174,9 +193,21 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 PERSISTENT_BUTTONS: tuple[tuple[str, ...], ...] = (("Каталог", "Моя корзина"), ("Менеджер", "Начать заново"))
 
 
-def persistent_keyboard() -> ReplyKeyboardMarkup:
+def persistent_keyboard(miniapp_url: str = "") -> ReplyKeyboardMarkup:
+    """Постоянные кнопки над полем ввода.
+
+    Отдельной строкой — «Приложение», если Mini App настроен. Telegram открывает
+    его окном поверх чата, корзина и согласие у бота и у приложения общие
+    (вход — по подписанным данным Telegram, `miniapp_auth.py`). По HTTP Telegram
+    Mini App не открывает, поэтому кнопку ставим только для https.
+    """
+    rows = [[KeyboardButton(text=title) for title in row] for row in PERSISTENT_BUTTONS]
+    if miniapp_url.startswith("https://"):
+        from aiogram.types import WebAppInfo
+
+        rows.append([KeyboardButton(text="Приложение", web_app=WebAppInfo(url=miniapp_url))])
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=title) for title in row] for row in PERSISTENT_BUTTONS],
+        keyboard=rows,
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Напишите, что нужно подобрать",
@@ -293,6 +324,7 @@ async def send(
     origin: TgMessage | None = None,
     persistent: bool = False,
     edit_cards: bool = False,
+    miniapp_url: str = "",
 ) -> None:
     for response in responses:
         markup = to_markup(getattr(response, "keyboard", None))
@@ -301,7 +333,7 @@ async def send(
         # только один раз: дальше она держится сама, под какими бы сообщениями ни
         # приходили инлайн-кнопки. Ставим её на приветствие и больше не трогаем.
         if persistent and isinstance(response, Message):
-            markup = persistent_keyboard()
+            markup = persistent_keyboard(miniapp_url)
             persistent = False
 
         # Изменение количества правит то сообщение, под которым нажали кнопку.
@@ -360,12 +392,18 @@ async def _edit(bot: Bot, origin: TgMessage, text: str, markup) -> bool:  # noqa
     Не получиться может по-разному: сообщение слишком старое, это подпись к фото,
     или текст не изменился вовсе. Ни один из случаев не повод потерять ответ —
     поэтому при неудаче вызывающая сторона просто отправляет новое сообщение.
+
+    `getattr`, а не `origin.photo`: кнопка под сообщением старше двух суток
+    приходит с `InaccessibleMessage`, у которого из полей только чат, номер и
+    дата. Раньше на этом месте был `AttributeError`, ответ уже был посчитан — и
+    пропадал целиком.
     """
-    if origin.photo and len(text) > CAPTION_LIMIT:
+    photo = getattr(origin, "photo", None)
+    if photo and len(text) > CAPTION_LIMIT:
         # Подпись к фото длиннее не бывает, а обрезанная карточка хуже новой.
         return False
     try:
-        if origin.photo:
+        if photo:
             await bot.edit_message_caption(
                 chat_id=origin.chat.id,
                 message_id=origin.message_id,
@@ -470,38 +508,55 @@ def build_dispatcher(gateway: TelegramGateway) -> Dispatcher:
     обойти Core API, даже случайно.
     """
     dispatcher = Dispatcher()
+    turns = TurnLocks()
 
     @dispatcher.message(F.text)
     async def on_text(message: TgMessage, bot: Bot) -> None:
         # Команды разбирает ядро: /start одинаково начинает разговор заново и в
         # Telegram, и в виджете, и правило это должно жить в одном месте.
         user, chat, text = str(message.from_user.id), message.chat.id, message.text
-        await _reply(
-            bot,
-            chat,
-            gateway,
-            lambda: gateway.text(user, text),
-            # Строка кнопок ставится на приветствие: /start человек зовёт и в
-            # начале разговора, и когда хочет начать заново.
-            persistent=text.strip().lower().startswith("/start"),
-        )
+        # Текст ждёт своей очереди: человек дописал мысль — это не дубль,
+        # ответить надо на оба сообщения и по порядку.
+        async with turns.wait(user):
+            await _reply(
+                bot,
+                chat,
+                gateway,
+                lambda: gateway.text(user, text),
+                # Строка кнопок ставится на приветствие: /start человек зовёт и в
+                # начале разговора, и когда хочет начать заново.
+                persistent=text.strip().lower().startswith("/start"),
+            )
 
     @dispatcher.callback_query(F.data)
     async def on_callback(query: CallbackQuery, bot: Bot) -> None:
-        user, chat, data = str(query.from_user.id), query.message.chat.id, query.data
+        origin = query.message
+        chat = getattr(origin, "chat", None)
+        if chat is None:
+            # Кнопка без сообщения (инлайн-режим): отвечать нечему и некуда.
+            await _quietly(query.answer())
+            return
+        user, data = str(query.from_user.id), query.data
+        if turns.busy(user):
+            # Второе нажатие, пока первое считается. Раньше оно запускало второй
+            # ход того же человека: два обращения к модели, две записи в одну
+            # сессию — и ответы вразнобой. Теперь подсказка вместо работы.
+            await _quietly(query.answer(BUSY_HINT))
+            return
         await _quietly(query.answer())
-        await _reply(
-            bot,
-            chat,
-            gateway,
-            lambda: gateway.action(user, data),
-            origin=query.message,
-            # «Начать заново» кнопкой возвращает то же приветствие, что и /start,
-            # — и строку кнопок вместе с ним.
-            persistent=data == "restart_yes",
-            # «Подробнее» раскрывает карточку на месте: 14.09 три нажатия дали три одинаковые карточки.
-            edit_cards=data.startswith("card:"),
-        )
+        async with turns.wait(user):
+            await _reply(
+                bot,
+                chat.id,
+                gateway,
+                lambda: gateway.action(user, data),
+                origin=origin,
+                # «Начать заново» кнопкой возвращает то же приветствие, что и /start,
+                # — и строку кнопок вместе с ним.
+                persistent=data == "restart_yes",
+                # «Подробнее» раскрывает карточку на месте: 14.09 три нажатия дали три одинаковые карточки.
+                edit_cards=data.startswith("card:"),
+            )
 
     @dispatcher.message(F.document)
     async def on_document(message: TgMessage, bot: Bot) -> None:
@@ -514,12 +569,13 @@ def build_dispatcher(gateway: TelegramGateway) -> Dispatcher:
         buffer = await bot.download(document)
         content = buffer.read() if buffer is not None else b""
         name = document.file_name or "order"
-        await _reply(bot, chat, gateway, lambda: gateway.upload(user, name, content))
-        # Подпись к файлу — такая же реплика, как текст: 14.09 «подбери из наличия 30 позиций и дай
-        # списком» пришло подписью к docx и потерялось.
-        caption = (message.caption or "").strip()
-        if caption:
-            await _reply(bot, chat, gateway, lambda: gateway.text(user, caption))
+        async with turns.wait(user):
+            await _reply(bot, chat, gateway, lambda: gateway.upload(user, name, content))
+            # Подпись к файлу — такая же реплика, как текст: 14.09 «подбери из наличия 30 позиций и дай
+            # списком» пришло подписью к docx и потерялось.
+            caption = (message.caption or "").strip()
+            if caption:
+                await _reply(bot, chat, gateway, lambda: gateway.text(user, caption))
 
     @dispatcher.message(F.contact)
     async def on_contact(message: TgMessage, bot: Bot) -> None:
@@ -530,11 +586,47 @@ def build_dispatcher(gateway: TelegramGateway) -> Dispatcher:
             await _reply(bot, chat, gateway, lambda: [Message("Пришлите, пожалуйста, свой контакт.")])
             return
         name = " ".join(filter(None, (contact.first_name, contact.last_name)))
-        await _reply(
-            bot, chat, gateway, lambda: gateway.contact(user, name, contact.phone_number), persistent=True
-        )
+        async with turns.wait(user):
+            await _reply(
+                bot, chat, gateway, lambda: gateway.contact(user, name, contact.phone_number), persistent=True
+            )
+
+    @dispatcher.message()
+    async def on_anything_else(message: TgMessage, bot: Bot) -> None:
+        """Фото, голосовое, видео, стикер, геометка.
+
+        Обработчика на них не было вовсе, и бот на такое сообщение молчал —
+        снаружи это ничем не отличается от зависания.
+        """
+        await _quietly(bot.send_message(message.chat.id, _escape(UNSUPPORTED)))
 
     return dispatcher
+
+
+class TurnLocks:
+    """Один ход на пользователя.
+
+    Апдейты aiogram обрабатывает параллельными задачами, а ход диалога меняет
+    одну и ту же `Session` и одну и ту же строку `dialog_state`. Без этого замка
+    два быстрых нажатия считались одновременно, писали друг поверх друга и
+    стоили двух обращений к модели.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock(self, user: str) -> asyncio.Lock:
+        lock = self._locks.get(user)
+        if lock is None:
+            lock = self._locks[user] = asyncio.Lock()
+        return lock
+
+    def busy(self, user: str) -> bool:
+        return self._lock(user).locked()
+
+    def wait(self, user: str) -> asyncio.Lock:
+        """Замок как контекст: `async with turns.wait(user):`."""
+        return self._lock(user)
 
 
 async def _reply(  # noqa: ANN001
@@ -557,58 +649,90 @@ async def _reply(  # noqa: ANN001
 
     Индикатор «печатает» Telegram гасит через пять секунд, поэтому его приходится
     повторять всё время ожидания. Иначе три минуты тишины выглядят как зависание,
-    чем они, собственно, и выглядели.
+    чем они, собственно, и выглядели. Гасим его после отправки, а не до неё:
+    три фотографии с повторами уходят не мгновенно, и в эту паузу «печатает»
+    нужно не меньше, чем во время счёта.
     """
     typing = asyncio.create_task(_keep_typing(bot, chat_id))
     try:
-        responses = await asyncio.to_thread(work)
-    except Exception:
-        log.exception("Ход диалога не отработал")
-        responses = [
-            Message("Что-то пошло не так на моей стороне. Повторите, пожалуйста, вопрос.")
-        ]
+        try:
+            responses = await asyncio.to_thread(work)
+        except Exception:
+            log.exception("Ход диалога не отработал")
+            responses = [
+                Message("Что-то пошло не так на моей стороне. Повторите, пожалуйста, вопрос.")
+            ]
+
+        if not responses:
+            # Нажали надпись, а не кнопку — отвечать нечем и не нужно.
+            return
+
+        try:
+            await send(
+                bot, chat_id, responses, source.storage, origin,
+                persistent=persistent, edit_cards=edit_cards,
+                miniapp_url=getattr(source, "miniapp_url", ""),
+            )
+        except TelegramAPIError as exc:
+            # Ответ уже посчитан, но доставить его не вышло: оборвалась связь,
+            # сообщение оказалось недоступно, лимит не дождался повтора. Молчим
+            # в чат и остаёмся живыми — опрос продолжится. Ловим всё семейство,
+            # а не только сетевые ошибки: раньше остальное уносило обработчик,
+            # и человек не получал ничего.
+            log.warning("Ответ не доставлен (%s)", exc)
     finally:
         typing.cancel()
 
-    if not responses:
-        # Нажали надпись, а не кнопку — отвечать нечем и не нужно.
-        return
-
-    try:
-        await send(bot, chat_id, responses, source.storage, origin, persistent=persistent, edit_cards=edit_cards)
-    except TelegramNetworkError as exc:
-        # Ответ уже посчитан, но связь оборвалась. Молчим в чат и остаёмся живыми:
-        # опрос продолжится, а человек повторит вопрос.
-        log.warning("Ответ не доставлен (%s)", exc)
-
 
 class RetryOnNetworkError(BaseRequestMiddleware):
-    """Повтор запроса к Telegram при обрыве связи.
+    """Повтор запроса к Telegram при обрыве связи и при лимите частоты.
 
     Канал до api.telegram.org с машины разработки рвётся регулярно, и до сих пор
     это било по самому больному месту: бот получал сообщение, считал ответ — и не
     мог его отправить. С точки зрения человека бот молчал, хотя работал.
 
-    Повторяем всё, что уходит наружу, включая отправку сообщений и фотографий.
-    Ошибки самого Telegram (неверный запрос, лимиты) сюда не попадают — их
-    повторять бессмысленно, они не про связь.
+    Второй случай — `TelegramRetryAfter` (429). Один ход уходит в чат пятью
+    сообщениями подряд (заголовок выдачи, три карточки, «Что дальше?»), и на
+    середине Telegram вполне может попросить подождать. Раньше это не
+    повторялось, и хвост ответа пропадал; теперь ждём ровно столько, сколько
+    просят, — но не дольше получаса ожидания в сумме: три попытки и предел на
+    каждую паузу.
+
+    Остальные ошибки Telegram (неверный запрос, нет прав) сюда не попадают —
+    повторять их бессмысленно.
+
+    Служебные вызовы — подтверждение нажатия и «печатает» — повторять не нужно:
+    они устаревают быстрее, чем дойдёт повтор, а место в очереди занимают.
     """
+
+    # Имена методов aiogram, которые повторять не надо.
+    SKIP = ("AnswerCallbackQuery", "SendChatAction")
+    # Дольше этого ждать по просьбе Telegram не станем: человек уже не дождётся.
+    MAX_RETRY_AFTER = 30
 
     def __init__(self, attempts: int = 3, pause: float = 2.0) -> None:
         self.attempts = attempts
         self.pause = pause
 
     async def __call__(self, make_request, bot, method):  # noqa: ANN001 — тип из aiogram
+        name = type(method).__name__
+        if name in self.SKIP:
+            return await make_request(bot, method)
         pause = self.pause
         for attempt in range(1, self.attempts + 1):
             try:
                 return await make_request(bot, method)
+            except TelegramRetryAfter as exc:
+                if exc.retry_after > self.MAX_RETRY_AFTER or attempt == self.attempts:
+                    raise
+                log.info("%s: Telegram просит подождать %s с", name, exc.retry_after)
+                await asyncio.sleep(exc.retry_after)
             except TelegramNetworkError:
                 if attempt == self.attempts:
                     raise
                 log.info(
                     "%s не прошёл (попытка %s из %s), повтор через %.0f с",
-                    type(method).__name__,
+                    name,
                     attempt,
                     self.attempts,
                     pause,
@@ -725,6 +849,7 @@ async def main() -> None:
     if not settings.telegram_token:
         raise SystemExit("Не задан TELEGRAM_BOT_TOKEN — бот не запускается.")
 
+    _widen_thread_pool()
     if settings.telegram_proxy:
         # Адрес печатаем без логина и пароля: строка целиком маскируется в журнале,
         # но в неё стоит смотреть глазами при разборе связи.
@@ -744,6 +869,20 @@ async def main() -> None:
     await _publish_miniapp(bot, settings.telegram_miniapp_url)
     log.info("Telegram-бот запущен")
     await _poll_forever(dispatcher, bot)
+
+
+def _widen_thread_pool(workers: int = TURN_WORKERS) -> None:
+    """Свой пул потоков под ходы диалога.
+
+    `asyncio.to_thread` берёт стандартный executor, а в нём `min(32, ядра + 4)`
+    потоков — на двухъядерной ВМ ровно шесть. Ход ждёт не процессор, а сеть:
+    модель отвечает десятками секунд. Седьмой одновременный разговор просто
+    стоял в очереди executor'а — нажатие подтверждено, «печатает» идёт, ответа
+    нет. Снаружи это неотличимо от зависшей кнопки.
+    """
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="turn")
+    )
 
 
 async def _publish_commands(bot: Bot) -> None:

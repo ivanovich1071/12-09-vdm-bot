@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -97,12 +99,82 @@ class UserDataHook(Protocol):
     def delete(self, user_id: str) -> None: ...
 
 
+class _Rows:
+    """Готовый результат запроса: курсор наружу не отдаём.
+
+    Курсор жив, пока жив замок, а вызывающая сторона читает его когда угодно —
+    поэтому строки забираются сразу.
+    """
+
+    __slots__ = ("rows", "rowcount")
+
+    def __init__(self, rows: list, rowcount: int) -> None:
+        self.rows = rows
+        self.rowcount = rowcount
+
+    def fetchone(self):  # noqa: ANN201 — sqlite3.Row или None
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self) -> list:
+        return self.rows
+
+    def __iter__(self):  # noqa: ANN204
+        return iter(self.rows)
+
+
+class _Guarded:
+    """Соединение SQLite под замком.
+
+    Соединение одно на процесс, а ходов много: aiogram обрабатывает апдейты
+    параллельными задачами, ядро считается в потоках, и через это соединение
+    ходят все. Само по себе `sqlite3` потокобезопасно, но `execute` одного
+    потока и `commit` другого свободно перемежаются — и на диск уезжает чужая
+    половина записи. Замок делает пару «запрос — фиксация» неделимой.
+    """
+
+    def __init__(self, db: sqlite3.Connection) -> None:
+        self._db = db
+        self._lock = threading.RLock()
+
+    def execute(self, sql: str, parameters: tuple = ()) -> _Rows:
+        with self._lock:
+            cursor = self._db.execute(sql, parameters)
+            return _Rows(cursor.fetchall(), cursor.rowcount)
+
+    def executescript(self, script: str) -> None:
+        with self._lock:
+            self._db.executescript(script)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._db.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+    @contextmanager
+    def transaction(self):  # noqa: ANN201
+        """Несколько запросов и фиксация одним куском, без чужого `commit` внутри."""
+        with self._lock:
+            yield
+            self._db.commit()
+
+
 class Storage:
     def __init__(self, path: str | Path = "data/vdm.sqlite3") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(self.path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        db = sqlite3.connect(self.path, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+        # В один файл пишут два процесса — бот и веб (виджет с Mini App). В
+        # журнале по умолчанию запись блокирует чтение, и второй процесс ждёт
+        # до `busy_timeout`, а потом получает «database is locked». WAL их
+        # разводит: читающий не ждёт пишущего.
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=5000")
+        db.execute("PRAGMA synchronous=NORMAL")
+        self._db = _Guarded(db)
         self._db.executescript(SCHEMA)
         self._db.commit()
         self._user_data_hooks: list[UserDataHook] = []
@@ -422,16 +494,17 @@ class Storage:
         Переписка и профиль разговора удаляются целиком и по всем каналам: в
         отличие от заказа, для учёта они не нужны.
         """
-        for order in self.orders_of(user_id):
-            order.customer = Customer()
-            order.user_id = "deleted"
-            self._db.execute(
-                "UPDATE orders SET user_id = 'deleted', payload = ? WHERE id = ?",
-                (json.dumps(asdict(order), ensure_ascii=False), order.id),
-            )
-        self._db.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
-        self._db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))
-        self._db.commit()
+        # Одним куском: половинчатое удаление — это оставленные контакты.
+        with self._db.transaction():
+            for order in self.orders_of(user_id):
+                order.customer = Customer()
+                order.user_id = "deleted"
+                self._db.execute(
+                    "UPDATE orders SET user_id = 'deleted', payload = ? WHERE id = ?",
+                    (json.dumps(asdict(order), ensure_ascii=False), order.id),
+                )
+            self._db.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
+            self._db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))
         for hook in self._user_data_hooks:
             hook.delete(user_id)
         self.record_consent(user_id, channel, "n/a", "revoked")

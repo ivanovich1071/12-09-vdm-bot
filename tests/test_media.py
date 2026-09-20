@@ -573,3 +573,60 @@ def test_local_photo_needs_no_network(storage, tmp_path):
 
     assert service.local_photo(product()).endswith("1.jpg")
     assert dead.calls == 0
+
+# --- Ход диалога в сеть не ходит -----------------------------------------------
+
+
+def test_turn_uses_only_what_is_collected(storage):
+    """Показ карточки не обращается к сайту: иначе одна позиция стоит до минуты."""
+    from media.prefetch import MediaPrefetcher
+
+    dead = StubFetcher(error=FetchError("сайт не отвечает"))
+    service = MediaService(storage, dead, enabled=True)
+    service.prefetch = MediaPrefetcher(service)
+
+    assert service.images_for(product(), allow_fetch=False) == []
+    assert dead.calls == 0, "ход диалога сходил на сайт"
+    assert service.prefetch.pending == 1, "товар без снимка должен уйти в очередь"
+
+
+def test_prefetcher_collects_the_missing_photo(storage):
+    """Следующий показ того же товара уже со снимком — его добрал фоновый сборщик."""
+    from media.prefetch import MediaPrefetcher
+
+    page = b'<meta property="og:image" content="https://vdm.ru/a/1200_1200_h/1.jpg" />'
+    fetcher = StubFetcher(FetchResult(body=page, status=200))
+    service = MediaService(storage, fetcher, enabled=True)
+    service.prefetch = MediaPrefetcher(service)
+
+    service.images_for(product(), allow_fetch=False)
+    assert service.prefetch.drain() == 1
+
+    assert service.images_for(product(), allow_fetch=False) == ["https://vdm.ru/a/1200_1200_h/1.jpg"]
+    assert fetcher.calls == 1
+
+
+def test_queue_does_not_grow_on_every_show(storage):
+    """Один и тот же товар не должен копиться в очереди при каждом показе."""
+    from media.prefetch import MediaPrefetcher
+
+    service = MediaService(storage, StubFetcher(error=FetchError("нет связи")), enabled=True)
+    service.prefetch = MediaPrefetcher(service)
+
+    for _ in range(5):
+        service.images_for(product(), allow_fetch=False)
+
+    assert service.prefetch.pending == 1
+
+
+def test_failing_site_does_not_break_the_prefetcher(storage):
+    """Сборщик работает в фоне: его падение не должно ронять процесс."""
+    from media.prefetch import MediaPrefetcher
+
+    service = MediaService(storage, StubFetcher(error=FetchError("нет связи")), enabled=True)
+    prefetch = MediaPrefetcher(service)
+    service.prefetch = prefetch
+
+    service.images_for(product(), allow_fetch=False)
+    assert prefetch.drain() == 1
+    assert prefetch.pending == 0

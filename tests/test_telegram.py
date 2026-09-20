@@ -4,14 +4,20 @@ pytest.importorskip("aiogram")
 
 import asyncio  # noqa: E402
 
-from aiogram.exceptions import TelegramNetworkError  # noqa: E402
+from aiogram.exceptions import (  # noqa: E402
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 
 from adapters.telegram.bot import (  # noqa: E402
     CALLBACK_LIMIT,
     MESSAGE_LIMIT,
     RetryOnNetworkError,
+    TurnLocks,
     _reply,
     fit,
+    persistent_keyboard,
     render_card,
     render_list_item,
     render_text,
@@ -313,6 +319,86 @@ async def test_hopeless_link_gives_up_instead_of_retrying_forever():
 
     with pytest.raises(TelegramNetworkError):
         await middleware(always_broken, None, object())
+
+
+# --- Зависания: повторное нажатие, недоступное сообщение, лимит частоты -------
+
+
+async def test_second_tap_does_not_start_a_second_turn():
+    """Два нажатия подряд считались одновременно и писали в одну сессию поверх друг друга."""
+    turns = TurnLocks()
+
+    async with turns.wait("42"):
+        assert turns.busy("42") is True
+        assert turns.busy("43") is False, "чужой разговор ждать не должен"
+
+    assert turns.busy("42") is False
+
+
+async def test_undeliverable_answer_does_not_lose_the_handler():
+    """Кнопка под сообщением старше двух суток: ответ посчитан, отправка не вышла.
+
+    Раньше `_reply` ловил вокруг отправки только сетевой обрыв, и всё остальное
+    уносило обработчик — человек не получал ничего и не узнавал почему.
+    """
+
+    class Unavailable(FakeBot):
+        async def send_message(self, chat_id, text, reply_markup=None):  # noqa: ANN001
+            raise TelegramBadRequest(method=None, message="message to edit not found")
+
+    await _reply(Unavailable(), 1, FakeEngine(), lambda: [Message("Ответ")])
+
+
+async def test_rate_limit_is_waited_out_not_dropped():
+    """429 на середине ответа: раньше хвост выдачи пропадал молча."""
+    calls = 0
+
+    async def make_request(bot, method):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TelegramRetryAfter(method=None, message="Flood control exceeded", retry_after=0)
+        return "доставлено"
+
+    middleware = RetryOnNetworkError(attempts=3, pause=0.01)
+
+    assert await middleware(make_request, None, object()) == "доставлено"
+    assert calls == 2
+
+
+async def test_service_calls_are_not_retried():
+    """Подтверждение нажатия и «печатает» устаревают быстрее, чем дойдёт повтор."""
+    calls = 0
+
+    class AnswerCallbackQuery:
+        pass
+
+    async def make_request(bot, method):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        raise TelegramNetworkError(method=None, message="ClientConnectorError")
+
+    middleware = RetryOnNetworkError(attempts=3, pause=0.01)
+
+    with pytest.raises(TelegramNetworkError):
+        await middleware(make_request, None, AnswerCallbackQuery())
+    assert calls == 1
+
+
+# --- Mini App в постоянной клавиатуре -----------------------------------------
+
+
+def test_miniapp_button_appears_only_for_https():
+    """Telegram открывает Mini App только по HTTPS — по http кнопка бесполезна."""
+    titles = lambda markup: [b.text for row in markup.keyboard for b in row]  # noqa: E731
+
+    assert "Приложение" not in titles(persistent_keyboard())
+    assert "Приложение" not in titles(persistent_keyboard("http://127.0.0.1:8000/miniapp"))
+
+    markup = persistent_keyboard("https://bot.example/miniapp")
+    button = [b for row in markup.keyboard for b in row if b.text == "Приложение"][0]
+    assert button.web_app.url == "https://bot.example/miniapp"
+
 
 
 # --- Транзит до Telegram ------------------------------------------------------

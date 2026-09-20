@@ -323,3 +323,36 @@ def test_manager_button_is_always_within_reach(engine):
     keyboard = engine.start(USER, CHANNEL)[0].keyboard
     actions = [button.action for row in keyboard.rows for button in row]
     assert "manager" in actions
+
+# --- Показ карточки не ходит на сайт -------------------------------------------
+
+
+def test_card_never_touches_the_site(engine, tmp_path):
+    """Регрессия 19.09: «Подробнее» подвисала на десятки секунд.
+
+    `_image()` и `photo_path()` шли на vdm.ru прямо в ходе диалога — с таймаутом,
+    повторами и общим для процесса шлагбаумом в один запрос в секунду. Теперь
+    снимка ждёт фоновый сборщик, а ход отвечает сразу.
+    """
+    from core.ui import ProductCard
+    from media.fetcher import PageFetcher
+    from media.files import PhotoStore
+    from media.prefetch import MediaPrefetcher
+    from media.service import MediaService
+
+    class Tripwire(PageFetcher):
+        def get(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+            raise AssertionError("ход диалога сходил на сайт")
+
+    fetcher = Tripwire()
+    media = MediaService(
+        engine.storage, fetcher, enabled=True, photos=PhotoStore(fetcher, tmp_path / "media")
+    )
+    media.prefetch = MediaPrefetcher(media)
+    engine.media = media
+
+    responses = engine.handle_action(USER, CHANNEL, "card:S2")
+
+    card = [r for r in responses if isinstance(r, ProductCard)][0]
+    assert card.product.sku_1c == "S2"
+    assert media.prefetch.pending == 1, "товар без снимка должен уйти фоновому сборщику"

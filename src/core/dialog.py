@@ -236,8 +236,6 @@ class DialogEngine:
         self.procurement = None
         self.procurement_provider = None
         self._sessions: dict[str, Session] = {}
-        # Товары, фото которых скачать не удалось: второй раз на сайт за ними не ходим.
-        self._photo_misses: set[str] = set()
         # Пункты приказов с формулировками и поиском по словам. Файла может не
         # быть — тогда бот называет номер пункта без текста, как и раньше.
         self.norm_texts = norm_items.ItemIndex(norm_items.load())
@@ -1248,10 +1246,16 @@ class DialogEngine:
         return lines
 
     def photo_path(self, product: Product) -> str | None:
-        """Снимок, лежащий у нас на диске.
+        """Снимок, лежащий у нас на диске. Сеть здесь не трогаем.
 
         Telegram не может забрать картинку с vdm.ru сам — отвечает «failed to get
         HTTP URL content». Поэтому файл для него важнее адреса.
+
+        Скачивать файл прямо здесь бот перестал 20.09: `PhotoStore` ходит на сайт
+        тем же `PageFetcher`, и на медленной странице «Подробнее» подвисала на
+        десятки секунд — вместе со всеми, кто в это время писал боту. Недостающий
+        файл забирает фоновый сборщик (`media/prefetch.py`), снимок появляется
+        со следующего показа.
         """
         if self.media is None:
             return None
@@ -1260,35 +1264,19 @@ class DialogEngine:
         except Exception as exc:  # фото не должно ломать ответ
             log.warning("Локальное фото для %s не найдено: %s", product.sku_1c, exc)
             return None
-        if path or self.media.photos is None or product.sku_1c in self._photo_misses:
-            return path
-        # Файла нет — скачиваем сами (бот работает под VPN РФ): 14.09 фото фитбола не пришло, потому
-        # что Telegram пошёл за ним на vdm.ru по адресу. Неудачу запоминаем, чтобы не ходить снова.
-        try:
-            url = self._image(product)
-            if url:
-                self.media.photos.download(product.sku_1c, [url])
-            path = self.media.local_photo(product)
-        except Exception as exc:  # фото не должно ломать ответ
-            log.warning("Фото для %s не скачано: %s", product.sku_1c, exc)
-            path = None
         if not path:
-            self._photo_misses.add(product.sku_1c)
+            self.media.want(product)
         return path
 
     def _image(self, product: Product) -> str | None:
-        """Фото только для подробной карточки.
-
-        В списках выдачи их не запрашиваем: пять позиций — это пять обращений
-        к сайту заказчика на каждый запрос, а пользы от превью в списке мало.
-        """
+        """Адрес снимка из уже собранного. За новым идёт фоновый сборщик."""
         # Собранная база знаний уже содержит снимки — тогда на сайт идти незачем.
         if product.images:
             return product.images[0]
         if self.media is None:
             return None
         try:
-            return self.media.main_image(product)
+            return self.media.main_image(product, allow_fetch=False)
         except Exception as exc:  # фото не должно ломать ответ
             log.warning("Фото для %s не получено: %s", product.sku_1c, exc)
             return None

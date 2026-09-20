@@ -2,9 +2,11 @@
 
 Две стратегии, обе нужны.
 
-**Лениво.** Фото подтягивается при первом показе карточки и кладётся в кэш.
+**Лениво.** Фото подтягивается после первого показа карточки и кладётся в кэш.
 Ходить за 5 936 изображениями заранее незачем: показывают единицы, а нагрузка
-на сайт заказчика вполне реальная.
+на сайт заказчика вполне реальная. Сам показ при этом в сеть не идёт: товар
+без снимка уходит в очередь `media/prefetch.py`, и фотография появляется со
+следующего раза. Раньше ходил — и карточка стоила до минуты ожидания.
 
 **Заранее, пакетом.** Перед демонстрацией удобно прогреть популярные разделы.
 Здесь выгоднее страницы списков: одна отдаёт до трёх десятков превью сразу,
@@ -18,12 +20,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from catalog.models import Product
 from core.storage import Storage
 from media.extract import decode, extract_attributes, extract_from_card, extract_from_listing
 from media.fetcher import FetchError, PageFetcher
 from media.files import PhotoStore
+
+if TYPE_CHECKING:  # pragma: no cover — сборщик знает о службе, а не наоборот
+    from media.prefetch import MediaPrefetcher
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +48,9 @@ class MediaService:
     photos: PhotoStore | None = None
     # Скачивать ли файл снимка при обходе каталога.
     download_files: bool = False
+    # Фоновый сборщик недостающих снимков. Без него режим «только кэш» просто
+    # отдаёт пустой список: показ карточки в сеть не ходит ни при каких условиях.
+    prefetch: MediaPrefetcher | None = None
 
     # Сколько загрузок подряд закончились ошибкой сети. Отличает «у этого товара
     # нет фото» от «сайт не отвечает»: снаружи и то и другое выглядит как пустой
@@ -49,8 +58,12 @@ class MediaService:
     consecutive_errors: int = 0
     fetches: int = 0
 
-    def images_for(self, product: Product) -> list[str]:
-        """Адреса фотографий товара. Пустой список — фото нет, и это нормально."""
+    def images_for(self, product: Product, *, allow_fetch: bool = True) -> list[str]:
+        """Адреса фотографий товара. Пустой список — фото нет, и это нормально.
+
+        `allow_fetch=False` — режим хода диалога: отдаём только собранное, а товар
+        без снимка откладываем фоновому сборщику. Сеть в ходе не трогаем вовсе.
+        """
         if not self.enabled:
             return []
 
@@ -63,12 +76,28 @@ class MediaService:
             return cached["images"]
         if not product.url:
             return cached["images"] if cached else []
+        if not allow_fetch:
+            self.want(product)
+            return cached["images"] if cached else []
 
         return self._fetch_card(product, cached)
 
-    def main_image(self, product: Product) -> str | None:
-        images = self.images_for(product)
+    def main_image(self, product: Product, *, allow_fetch: bool = True) -> str | None:
+        images = self.images_for(product, allow_fetch=allow_fetch)
         return images[0] if images else None
+
+    def want(self, product: Product) -> bool:
+        """Отложить товар фоновому сборщику. Возвращает, попал ли он в очередь."""
+        if not self.enabled or self.prefetch is None:
+            return False
+        return self.prefetch.want(product)
+
+    def fetch_now(self, product: Product) -> list[str]:
+        """Сходить за снимком и положить файл на диск — работа фонового сборщика."""
+        images = self.images_for(product)
+        if images and self.photos is not None:
+            self.photos.download(product.sku_1c, images)
+        return images
 
     def collect(self, product: Product) -> list[str]:
         """Полный сбор по одному товару — для обхода каталога.

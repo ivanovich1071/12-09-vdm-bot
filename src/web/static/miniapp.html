@@ -107,11 +107,37 @@
   }
   function on(selector, handler) {
     screen.querySelectorAll(selector).forEach(function (node) {
-      node.addEventListener("click", function () { handler(node.dataset, node); });
+      // Кнопка на время работы выключается: ответ модели идёт десятками секунд,
+      // и без этого второе нажатие запускало второй такой же запрос.
+      node.addEventListener("click", function () { busy(node, function () { return handler(node.dataset, node); }); });
     });
   }
   async function guard(work) {
     try { await work(); } catch (error) { screen.insertAdjacentHTML("afterbegin", '<div class="error">' + esc(error.message) + "</div>"); }
+  }
+  async function busy(node, work) {
+    if (node.disabled) return;
+    var title = node.textContent;
+    node.disabled = true;
+    node.textContent = "…";
+    try { await work(); }
+    finally {
+      // Экран мог перерисоваться целиком — тогда возвращать нечего и некому.
+      if (node.isConnected) { node.disabled = false; node.textContent = title; }
+    }
+  }
+
+  // Кнопки ядра — те же, что в чате: «Оформить», «Моя корзина», «Связаться с
+  // менеджером», «Задать вопрос». Своего списка текстов у приложения нет.
+  function actionsRow(rows) {
+    var html = (rows || []).map(function (row) {
+      return row.map(function (b) {
+        return b.url
+          ? '<button data-link="' + esc(b.url) + '">' + esc(b.title) + "</button>"
+          : '<button data-action="' + esc(b.action) + '">' + esc(b.title) + "</button>";
+      }).join("");
+    }).join("");
+    return html ? '<div class="row">' + html + "</div>" : "";
   }
 
   function productRow(item) {
@@ -124,11 +150,53 @@
       (state.task ? '<button data-choose="' + esc(item.product_id) + '">Выбрать</button><button data-reject="' + esc(item.product_id) + '">Не подходит</button>' : "") +
       "</div></div>";
   }
+  // Корзина как её вернуло ядро в ответе диалога — строками, без кнопок:
+  // кнопки придут отдельно, в `actions` того же ответа.
+  function cartRows(response) {
+    if (!response.lines.length) return '<div class="card">Корзина пуста.</div>';
+    return '<div class="card">' + response.lines.map(function (line) {
+      return "<b>" + esc(line.name) + '</b><div class="meta">' + line.quantity + " × " + money(line.price) + "</div>";
+    }).join("") + '<div class="total">Итого: ' + money(response.total) + "</div>" +
+      (response.note ? '<div class="meta">' + esc(response.note) + "</div>" : "") + "</div>";
+  }
+
+  // Ответ диалога рисуется в «AI-подборе»; если нажали с другого экрана —
+  // возвращаемся туда, иначе рисовать было бы некуда.
+  function answerBox() {
+    var box = document.getElementById("answer");
+    if (!box) {
+      screen.innerHTML = "<h2>AI-подбор</h2><div id=\"answer\"></div>";
+      nav("pick");
+      box = document.getElementById("answer");
+    }
+    return box;
+  }
+
+  // Ответ диалога: реплики, карточки и кнопки ядра под ними.
+  function showReplies(reply) {
+    var html = "";
+    reply.data.responses.forEach(function (r) {
+      if (r.type === "text") html += '<div class="card"><pre>' + esc(r.text) + "</pre></div>";
+      if (r.type === "product_list") {
+        html += "<h2>" + esc(r.title) + "</h2>";
+        r.items.forEach(function (i) { html += productRow(Object.assign({ product_id: i.product.id }, i.product)); });
+      }
+      if (r.type === "product") html += productRow(Object.assign({ product_id: r.product.id }, r.product));
+      if (r.type === "cart") html += cartRows(r);
+      html += actionsRow(r.actions);
+    });
+    answerBox().innerHTML = html;
+    bindProducts();
+  }
+
   function bindProducts() {
-    on("[data-card]", function (d) { show("card", d.card); });
-    on("[data-add]", function (d) { guard(async function () { await api("POST", "/api/cart/items", { product_id: d.add, quantity: 1 }); tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success"); }); });
-    on("[data-choose]", function (d, node) { guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/choose", { product_ids: [d.choose] }); node.textContent = "Выбрано"; }); });
-    on("[data-reject]", function (d, node) { guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/reject", { product_ids: [d.reject] }); node.closest(".card").remove(); }); });
+    on("[data-card]", function (d) { return show("card", d.card); });
+    // Нажатие кнопки ядра — тот же ход, что в чате: решает ядро, не приложение.
+    on("[data-action]", function (d) { return guard(async function () { showReplies(await api("POST", "/api/dialogue/action", { action: d.action })); }); });
+    on("[data-link]", function (d) { if (tg && tg.openLink) tg.openLink(d.link); else window.open(d.link, "_blank"); });
+    on("[data-add]", function (d) { return guard(async function () { await api("POST", "/api/cart/items", { product_id: d.add, quantity: 1 }); tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success"); }); });
+    on("[data-choose]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/choose", { product_ids: [d.choose] }); node.textContent = "Выбрано"; }); });
+    on("[data-reject]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/reject", { product_ids: [d.reject] }); node.closest(".card").remove(); }); });
   }
 
   var SCREENS = {
@@ -138,28 +206,20 @@
         "Цены, наличие и нормативы — из данных каталога.</div>" +
         '<div class="row"><button class="primary" data-go="pick">Подобрать</button><button data-go="norm">По нормативу</button>' +
         '<button data-go="upload">Проверить готовый заказ</button><button data-go="cart">Корзина</button></div>';
-      on("[data-go]", function (d) { show(d.go); });
+      on("[data-go]", function (d) { return show(d.go); });
     },
 
     pick: async function () {
       screen.innerHTML = "<h2>AI-подбор</h2><label>Что нужно</label><textarea id=\"ask\" rows=\"3\" placeholder=\"Школа, кабинет информатики\"></textarea>" +
         '<button class="primary" id="send">Отправить</button><div id="answer"></div>';
-      document.getElementById("send").addEventListener("click", function () {
-        guard(async function () {
-          var text = document.getElementById("ask").value.trim();
-          if (!text) return;
-          var reply = await api("POST", "/api/dialogue/message", { text: text });
-          var html = "";
-          reply.data.responses.forEach(function (r) {
-            if (r.type === "text") html += '<div class="card"><pre>' + esc(r.text) + "</pre></div>";
-            if (r.type === "product_list") {
-              html += "<h2>" + esc(r.title) + "</h2>";
-              r.items.forEach(function (i) { html += productRow(Object.assign({ product_id: i.product.id }, i.product)); });
-            }
-            if (r.type === "product") html += productRow(Object.assign({ product_id: r.product.id }, r.product));
+      var send = document.getElementById("send");
+      send.addEventListener("click", function () {
+        busy(send, function () {
+          return guard(async function () {
+            var text = document.getElementById("ask").value.trim();
+            if (!text) return;
+            showReplies(await api("POST", "/api/dialogue/message", { text: text }));
           });
-          document.getElementById("answer").innerHTML = html;
-          bindProducts();
         });
       });
     },
@@ -222,13 +282,20 @@
       var cart = (await api("GET", "/api/cart")).data;
       screen.innerHTML = "<h2>Корзина</h2>" + (cart.items.length ? cart.items.map(function (i) {
         return '<div class="card"><b>' + esc(i.name) + '</b><div class="meta">' + i.quantity + " × " + money(i.price) + "</div>" +
+          // «−» при единице убирает позицию (ядро: quantity 0 — снять товар),
+          // но нажимать минус по одному ради этого не надо — рядом «Убрать».
           '<div class="row"><button data-qty="' + esc(i.product_id) + '" data-n="' + (i.quantity - 1) + '">−</button>' +
-          '<button data-qty="' + esc(i.product_id) + '" data-n="' + (i.quantity + 1) + '">+</button></div></div>';
+          '<button data-qty="' + esc(i.product_id) + '" data-n="' + (i.quantity + 1) + '">+</button>' +
+          '<button data-drop="' + esc(i.product_id) + '">Убрать</button></div></div>';
       }).join("") + '<div class="total">Итого: ' + money(cart.total) + "</div>" +
-        '<div class="row"><button class="primary" id="spec">Спецификация из корзины</button></div>' : '<div class="card">Корзина пуста.</div>');
-      on("[data-qty]", function (d) { guard(async function () { await api("POST", "/api/cart/items", { product_id: d.qty, quantity: parseInt(d.n, 10) }); show("cart"); }); });
+        '<div class="row"><button class="primary" id="spec">Спецификация из корзины</button><button id="clear">Очистить корзину</button></div>'
+        : '<div class="card">Корзина пуста.</div>');
+      on("[data-qty]", function (d) { return guard(async function () { await api("POST", "/api/cart/items", { product_id: d.qty, quantity: Math.max(parseInt(d.n, 10), 0) }); show("cart"); }); });
+      on("[data-drop]", function (d) { return guard(async function () { await api("POST", "/api/cart/items", { product_id: d.drop, quantity: 0 }); show("cart"); }); });
+      var clear = document.getElementById("clear");
+      if (clear) clear.addEventListener("click", function () { busy(clear, function () { return guard(async function () { await api("DELETE", "/api/cart"); show("cart"); }); }); });
       var spec = document.getElementById("spec");
-      if (spec) spec.addEventListener("click", function () { guard(async function () { state.spec = (await api("POST", "/api/cart/specification")).data; show("spec"); }); });
+      if (spec) spec.addEventListener("click", function () { busy(spec, function () { return guard(async function () { state.spec = (await api("POST", "/api/cart/specification")).data; show("spec"); }); }); });
     },
 
     spec: async function () {
@@ -241,7 +308,7 @@
         }).join("") + '</table><div class="total">Итого: ' + money(s.totals.amount) + (s.totals.complete ? "" : " (без цены: " + s.totals.missing_prices + ")") + "</div>" +
         '<div class="row"><button data-file="xlsx">Excel</button><button data-file="docx">Word</button><button id="check">Проверить цены</button>' +
         '<button class="primary" id="order">Оформить предзаказ</button></div><div id="fresh"></div>';
-      on("[data-file]", function (d) { guard(async function () {
+      on("[data-file]", function (d) { return guard(async function () {
         var link = (await api("POST", "/api/procurement/specifications/" + s.id + "/export-link?format=" + d.file)).data;
         var url = location.origin + link.url;
         if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank");
@@ -283,7 +350,7 @@
             esc(i.name || "—") + '<div class="meta">' + money(i.current_price) + "</div></td><td>" + chip(i.match_status) + chip(i.price_status) + chip(i.availability) + chip(i.norm_status) + "</td></tr>";
         }).join("") + "</table>" +
         '<div class="row"><button data-go="errors">Ошибки и предупреждения</button>' + (e.status !== "REJECTED" ? '<button class="primary" id="order">Оформить предзаказ</button>' : "") + "</div>";
-      on("[data-go]", function (d) { show(d.go); });
+      on("[data-go]", function (d) { return show(d.go); });
       var order = document.getElementById("order");
       if (order) order.addEventListener("click", function () { guard(async function () {
         state.preorder = (await api("POST", "/api/preorders", { source: "uploaded_order", source_id: state.order.id })).data;
@@ -338,8 +405,8 @@
       }).join("") || '<div class="meta">нет</div>') + "<h2>Загруженные заказы</h2>" + (h.orders.map(function (o) {
         return '<div class="card">' + esc(o.filename) + ' <span class="meta">' + esc(o.id) + "</span></div>";
       }).join("") || '<div class="meta">нет</div>');
-      on("[data-preorder]", function (d) { guard(async function () { state.preorder = (await api("GET", "/api/preorders/" + d.preorder)).data; show("preorder"); }); });
-      on("[data-spec]", function (d) { guard(async function () { state.spec = (await api("GET", "/api/procurement/specifications/" + d.spec)).data; show("spec"); }); });
+      on("[data-preorder]", function (d) { return guard(async function () { state.preorder = (await api("GET", "/api/preorders/" + d.preorder)).data; show("preorder"); }); });
+      on("[data-spec]", function (d) { return guard(async function () { state.spec = (await api("GET", "/api/procurement/specifications/" + d.spec)).data; show("spec"); }); });
     }
   };
 

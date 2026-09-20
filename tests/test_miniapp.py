@@ -141,3 +141,41 @@ def test_download_link_is_single_use(api):
     assert first.status_code == 200 and first.content.startswith(b"PK") and first.headers["X-Catalog-Version"] == spec["catalog_version"]
     error(api.client.get(link["url"]), 404, "DOWNLOAD_NOT_FOUND")
     error(api.client.post(f"/api/procurement/specifications/{spec['data']['id']}/export-link?format=xlsx"), 401, "SESSION_NOT_FOUND")
+
+# --- Кнопки ядра в приложении ---------------------------------------------------
+
+
+def test_page_draws_core_buttons_and_sends_them_back(api):
+    """В приложении должно быть то же, что в чате: «Оформить», «Корзина», «Задать вопрос».
+
+    Своего списка текстов у страницы нет: кнопки приходят в `actions` ответа
+    диалога, а нажатие возвращается в ядро через /api/dialogue/action.
+    """
+    html = api.client.get("/miniapp").text
+    assert "actionsRow" in html and "/api/dialogue/action" in html
+    assert "data-action" in html and "data-link" in html
+
+    headers = telegram_session(api, 42)
+    reply = ok(api.client.post("/api/dialogue/message", json={"text": "/start"}, headers=headers))
+    actions = [button for response in reply["data"]["responses"] for row in response["actions"] for button in row]
+    assert actions, "ядро отдало ответ без кнопок — рисовать в приложении будет нечего"
+
+    answer = ok(api.client.post("/api/dialogue/action", json={"action": actions[0]["action"]}, headers=headers))
+    assert answer["data"]["responses"]
+
+
+def test_cart_screen_can_drop_a_line(api):
+    """В корзине приложения не было способа убрать позицию — только «−» по одной штуке."""
+    html = api.client.get("/miniapp").text
+    assert "data-drop" in html and "Убрать" in html and "Очистить корзину" in html
+
+    headers = telegram_session(api, 42)
+    ok(api.client.post("/api/cart/items", json={"product_id": "I1", "quantity": 3}, headers=headers))
+    cart = ok(api.client.post("/api/cart/items", json={"product_id": "I1", "quantity": 0}, headers=headers))["data"]
+    assert cart["items"] == []
+
+
+def test_every_button_is_guarded_against_a_second_tap(api):
+    """Ответ модели идёт десятками секунд: без блокировки второе нажатие шлёт второй запрос."""
+    html = api.client.get("/miniapp").text
+    assert "node.disabled = true" in html and "busy(node" in html

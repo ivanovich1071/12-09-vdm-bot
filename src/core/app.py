@@ -17,6 +17,7 @@ from core.dialog import DialogEngine
 from core.storage import Storage
 from media.fetcher import DEFAULT_USER_AGENT, PageFetcher
 from media.files import PhotoStore
+from media.prefetch import MediaPrefetcher
 from media.service import MediaService
 from observability.dialog_log import DialogLogger
 from orders.service import OrderService, build_sink
@@ -74,6 +75,13 @@ def build_engine(
         enabled=settings.media_enabled,
         photos=PhotoStore(fetcher=fetcher, root=Path(settings.media_dir)),
     )
+    if settings.media_enabled:
+        # Снимки собираются в фоне: ход диалога за ними в сеть не ходит.
+        # Поток нужен только долгоживущим каналам — разовая команда успеет
+        # закончиться раньше, чем сборщик доберётся до первого товара.
+        media.prefetch = MediaPrefetcher(media)
+        if warm_llm if watch_catalog is None else watch_catalog:
+            media.prefetch.start()
     engine = DialogEngine(
         runtime, storage, orders, settings, agent=agent, dialog_log=dialog_log, media=media
     )
