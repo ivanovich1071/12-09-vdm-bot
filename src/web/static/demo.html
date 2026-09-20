@@ -5,19 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Демо виджета · ЭЛТИ-КУДИЦ</title>
   <style>
-    body { margin: 0; font: 16px/1.6 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
-           color: #1c2430; background: #fff; }
-    header { background: #0b6ab0; color: #fff; padding: 20px 32px; }
+    /* Палитра «в духе vdm.ru» — общая с widget.js и miniapp.html (менять во всех трёх):
+       accent #bd3054 · шапка #1f2228 · текст #26292e · вторичный #6b7076 · бледный #8a8f96 ·
+       границы #e6e7e9 · подложки #f4f4f4 · шрифт Roboto. */
+    body { margin: 0; font: 16px/1.6 Roboto, -apple-system, "Segoe UI", Arial, sans-serif;
+           color: #26292e; background: #fff; }
+    header { background: #1f2228; border-bottom: 2px solid #bd3054; color: #fff; padding: 20px 32px; }
     header b { font-size: 20px; }
     main { max-width: 780px; margin: 0 auto; padding: 40px 24px 120px; }
     h1 { font-size: 28px; margin: 0 0 8px; }
-    .lead { color: #5a6a7d; margin-bottom: 32px; }
-    .card { border: 1px solid #e3e8ee; border-radius: 12px; padding: 20px 24px; margin-bottom: 16px; }
+    .lead { color: #6b7076; margin-bottom: 32px; }
+    .card { border: 1px solid #e6e7e9; border-radius: 10px; padding: 20px 24px; margin-bottom: 16px; }
     .card h2 { font-size: 17px; margin: 0 0 10px; }
-    code { background: #f2f5f8; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
-    pre { background: #f2f5f8; padding: 14px 16px; border-radius: 8px; overflow-x: auto; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
+    pre { background: #f4f4f4; padding: 14px 16px; border-radius: 8px; overflow-x: auto; }
     ul { margin: 8px 0 0; padding-left: 20px; }
-    .hint { color: #7d8b9c; font-size: 14px; }
+    .hint { color: #8a8f96; font-size: 14px; }
   </style>
 </head>
 <body>
