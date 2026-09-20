@@ -136,10 +136,14 @@ def create_app(
         с тем, кто уже полчаса выбирает мячи, — худшее, что может сделать виджет.
         """
         session_id = (payload.session_id if payload else None) or uuid.uuid4().hex
-        responses = engine.start(session_id, CHANNEL)
+        # Историю смотрим до start: если разговор уже сохранён, приветствие второй раз
+        # не выдаём. 19.09 (сервер) в середине диалога бот дважды приветствовал заново —
+        # restore внутри start падал, и виджет получал полное «Здравствуйте!».
         history = _history(engine.session(session_id, CHANNEL))
-        if history and isinstance(responses[0], Message):
-            responses[0] = Message(CONTINUED, keyboard=responses[0].keyboard)
+        if history:
+            responses = [Message(CONTINUED)]
+        else:
+            responses = engine.start(session_id, CHANNEL)
         cart = engine.storage.load_cart(session_id)
         if not cart.is_empty:
             responses += engine.handle_action(session_id, CHANNEL, "cart")

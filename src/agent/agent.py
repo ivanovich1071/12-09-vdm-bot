@@ -248,6 +248,17 @@ def may_show_cards(
     return True, "задача ясна, клиент готов смотреть"
 
 
+_NAMED_FORMAT = re.compile(r"excel|xlsx|эксел|ексел|ворд|word|docx", re.IGNORECASE)
+_WORD_FORMAT = re.compile(r"word|docx|ворд", re.IGNORECASE)
+
+
+def _named_format(text: str) -> str | None:
+    """Формат файла, названный в реплике, если назван."""
+    if not text or not _NAMED_FORMAT.search(text):
+        return None
+    return exports.WORD if _WORD_FORMAT.search(text) else exports.EXCEL
+
+
 class SalesAgent:
     def __init__(self, engine, router: LLMRouter, routing: Orchestrator | None = None) -> None:  # noqa: ANN001
         self.engine = engine
@@ -468,6 +479,7 @@ class SalesAgent:
         tools: ToolBox,
         schemas: list[dict] | None,
     ) -> str:
+        candidate = ""
         for _ in range(MAX_TOOL_ROUNDS):
             if tools.calls >= TURN_CALLS:
                 # Лимит хода исчерпан: дальше только просьба ответить по собранному.
@@ -478,7 +490,11 @@ class SalesAgent:
             account_usage(tools.session, client, message)
             calls = message.get("tool_calls") or []
             if not calls:
-                return (message.get("content") or "").strip()
+                # Текст, написанный рядом с вызовами инструментов, пропадал: модель
+                # рассказывает суть в первом же ходе, а до финального хода дело не
+                # доходит. Теперь это запасной ответ.
+                return (message.get("content") or "").strip() or candidate
+            candidate = (message.get("content") or "").strip() or candidate
 
             # Ответ модели возвращаем в историю как есть. Пересобирать его из
             # content и tool_calls нельзя: рассуждающие модели отдают ещё и
@@ -503,7 +519,7 @@ class SalesAgent:
         final = client.complete(messages)
         tools.calls += 1
         account_usage(tools.session, client, final)
-        return (final.get("content") or "").strip()
+        return (final.get("content") or "").strip() or candidate
 
     # --- Обещание вместо подбора ---------------------------------------------------
 
@@ -688,6 +704,14 @@ class SalesAgent:
             )
         return f"В твоём ответе есть {' и '.join(parts)}." if parts else ""
 
+    def _has_prefixed_code(self, code: str) -> bool:
+        """Есть ли пункт, начинающийся с этого кода: «2.20» покрывается «2.20.1»."""
+        return any(
+            key.startswith(f"{code}.")
+            for by_code in self.engine.norm_texts.items.values()
+            for key in by_code
+        )
+
     def _registry_problems(self, answer: str, session=None) -> tuple[list[str], set[str]]:  # noqa: ANN001
         """Коды из строк списка и «раздел X» — против текста приказов, раздел группы — против возраста клиента.
 
@@ -707,6 +731,11 @@ class SalesAgent:
         bad: set[str] = set()
         for code, claimed in dict(listed_codes(answer)).items():
             docs = index.documents_with(code)
+            if not docs and self._has_prefixed_code(code):
+                # «Раздел 2.20» — не пункт, а группа: сам по себе он в справочнике не
+                # хранится, хранятся 2.20.1, 2.20.2… Раньше такой код считался
+                # несуществующим, и корректный ответ заставляли переписывать (20.09).
+                continue
             if not docs:
                 if strict:
                     unknown.append(code)
@@ -807,6 +836,19 @@ class SalesAgent:
         # а в сц. 3 трижды подряд получил «Пришлю комплектацию файлом. В каком виде?».
         deadline = intent.asks_deadline(text)
         if decision.intent == EXPORT_REQUEST:
+            # Формат назван в самой реплике («нужна спецификация в excel») — строим файл
+            # сразу. Иначе «В каком виде?» сходилось с ответом «в excel» в цикле по три
+            # круга (16.09, диалоги про 1.14 и 2.15).
+            fmt = _named_format(text)
+            if fmt is not None and exports.ready(session):
+                # Файл строит канал по кнопке — но вопрос «В каком виде?» после ответа
+                # «в excel» крутился по три круга (16.09). Отдаём кнопку названного
+                # формата сразу.
+                session.route["fallback"] = "export"
+                label = "Excel" if fmt == exports.EXCEL else "Word"
+                session.remember("assistant", f"Формат понял: {label}.")
+                keyboard = exports.buttons(Keyboard().row(Button("Меню", "menu")))
+                return [Message(f"Собираю файл в {label} — файл по кнопке ниже.", keyboard=keyboard)]
             offer = exports.offer(self.engine, session)
             if offer is not None:
                 session.route["fallback"] = "export"

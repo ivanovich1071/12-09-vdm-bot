@@ -30,7 +30,9 @@ QUESTIONS = {
     "room": "для какого помещения или зоны",
 }
 # Предупреждения ядра, которые стоит сказать человеку. Остальные — служебный отчёт о фильтрах.
-SPOKEN_WARNINGS = frozenset({"BUDGET_EXCEEDED", "NORM_REVIEW_REQUIRED"})
+# NORM_REVIEW_REQUIRED не для клиента: его расшифровка («Документ назван пользователем…»)
+# — служебный отчёт, который 19-20.09 показывался людям как часть ответа.
+SPOKEN_WARNINGS = frozenset({"BUDGET_EXCEEDED"})
 MAX_QUERY = 200
 
 

@@ -45,7 +45,8 @@ class ChatClient:
     base_url: str = "https://foundation-models.api.cloud.ru/v1"
     model: str = "deepseek-ai/DeepSeek-V4-Flash"
     timeout: float = 60.0
-    max_tokens: int = 2000
+    # 2000 обрезали ответы посреди списка («1. Минимальный бюджет» и стоп, 15-17.09).
+    max_tokens: int = 4000
     # Как провайдер называется в логах и в диагностике: «cloudru», «openrouter».
     name: str = "cloudru"
     # OpenRouter просит указать, откуда пришёл запрос; Cloud.ru лишние заголовки
@@ -119,6 +120,11 @@ class ChatClient:
         # а обратно провайдеру такое сообщение не уходит — там пересобирается
         # только то, что он прислал сам.
         message = dict(choices[0]["message"])
+        finish = (choices[0] or {}).get("finish_reason")
+        if finish == "length":
+            # Обрыв по лимиту не маскируем под полный ответ: в логах видно, что ход
+            # кончился на полуслове, а не потому, что модель «так ответила».
+            log.warning("%s: ответ обрезан по лимиту токенов", self.name)
         message["_usage"] = _usage(body, self.model)
         return message
 

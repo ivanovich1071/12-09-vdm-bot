@@ -686,7 +686,12 @@ class DialogEngine:
                 f"Если нужно, подключим менеджера: {self.settings.manager_contact}."
             )
         else:
-            lines = [f"• {item.name} — {item.reason}" for item in result.items]
+            # reason — служебная строка с фильтрами подбора («совпадает с запросом…»),
+            # человеку от неё шум; показываем только основание по перечню.
+            lines = [
+                f"• {item.name}" + (f" — {citation}" if (citation := selection.citation(item)) else "")
+                for item in result.items
+            ]
             text = "\n".join([f"{header}:", "", *lines, *(["", *selection.notes(result)] if selection.notes(result) else [])])
             session.remember("assistant", text)
             session.profile.remember_offered([item.product_id for item in result.items])

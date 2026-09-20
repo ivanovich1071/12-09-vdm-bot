@@ -77,6 +77,11 @@ def buttons(keyboard: Keyboard | None = None) -> Keyboard:
     )
 
 
+def ready(session: Session) -> bool:
+    """Есть ли что выгружать: список подбора, комплектация или присланный заказ."""
+    return _subject(session) is not None
+
+
 def offer(engine: DialogEngine, session: Session) -> list[Response] | None:
     """Ответ на «сохрани в файл»: что будет в файле и выбор формата. `None` — выгружать нечего.
 
