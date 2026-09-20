@@ -72,36 +72,78 @@ class NormItem:
 
 
 def parse_838(text: str) -> list[NormItem]:
-    items: list[NormItem] = []
-    section = subsection = None
+    """Раздел пункта определяется его собственным номером, а не позицией строки.
 
+    pypdf вынимает текст страницы не по порядку: на странице 18 заголовки
+    «Подраздел 3» и «Подраздел 4» приезжают после «Подраздел 21», а блок пунктов
+    2.1–2.17 — раньше своих заголовков. Прежнее «липкое» наследование подписывало
+    им чужой подраздел, и почти весь раздел 2 становился «Кабинетом учителя-
+    логопеда». Поэтому заголовки собираются в карту «номер → название», и пункт
+    2.15.36 получает «Кабинет химии» по своим цифрам — в каком порядке строки ни
+    приезжай из выгрузки.
+    """
+    sections: dict[str, str] = {}
+    subsections: dict[tuple[str, str], str] = {}
+    chapter: str | None = None
+
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        heading = _HEADING.match(line)
+        if not heading:
+            continue
+        kind, number, title = heading.groups()
+        title = title.strip(" .*")
+        if kind == "Раздел":
+            chapter = number
+            sections.setdefault(number, title)
+        elif chapter is not None:
+            subsections.setdefault((chapter, number), title)
+
+    items: list[NormItem] = []
     for raw in text.splitlines():
         line = " ".join(raw.split())
         if not line:
             continue
-
-        heading = _HEADING.match(line)
-        if heading:
-            kind, number, title = heading.groups()
-            if kind == "Раздел":
-                section, subsection = title.strip(" .*"), None
-            else:
-                subsection = title.strip(" .*")
-            continue
-
         match = _ITEM_838.match(line)
         if not match:
             continue
         code, title = match.groups()
+        parts = code.split(".")
+        subsection = subsections.get((parts[0], parts[1]))
         items.append(
             NormItem(
                 doc_id="order_838",
                 code=code,
                 title=title.strip(" .*"),
-                section=subsection or section,
+                section=subsection or sections.get(parts[0]),
             )
         )
     return items
+
+
+def section_conflicts(known: dict[str, dict[str, NormItem]]) -> list[str]:
+    """Признак «липких» разделов: одно название накрыло несколько подразделов.
+
+    При прошлом сбое «Кабинет учителя-логопеда» числился разделом у пунктов
+    2.1, 2.12–2.17 сразу. Здоровый справочник держит у одного подраздела —
+    первых двух цифр кода — одно название раздела.
+    """
+    conflicts: list[str] = []
+    for doc_id, by_code in known.items():
+        owner: dict[str, set[str]] = {}
+        for code, item in by_code.items():
+            if not item.section:
+                continue
+            parts = code.split(".")
+            if len(parts) < 2:
+                continue
+            owner.setdefault(item.section, set()).add(".".join(parts[:2]))
+        for section, groups in sorted(owner.items()):
+            if len(groups) > 1:
+                conflicts.append(
+                    f"{doc_id}: раздел «{section}» накрывает подразделы {sorted(groups)}"
+                )
+    return conflicts
 
 
 def parse_1057(text: str) -> list[NormItem]:

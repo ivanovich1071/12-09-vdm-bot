@@ -45,6 +45,51 @@ def test_838_ignores_headings():
     assert codes == {"2.4.35", "2.4.40", "2.20.63"}
 
 
+# pypdf выдаёт текст страницы не по порядку: пункты приезжают раньше своих
+# заголовков, а «Подраздел 4» — после чужих подразделов. Прежнее «липкое»
+# наследование подписывало весь раздел 2 «Кабинетом учителя-логопеда».
+TEXT_838_SCRAMBLED = """
+Раздел 2. Комплекс оснащения предметных кабинетов
+Подраздел 4. Кабинет учителя-логопеда (учителя-дефектолога)
+2.14.47. Микроскоп демонстрационный
+Подраздел 14. Кабинет физики
+2.15.36. Эвдиометр
+Подраздел 15. Кабинет химии
+2.15. Конторка
+Подраздел 1. Кабинет начальных классов
+2.1. а) рельсовая система с классной доской
+"""
+
+
+def test_838_section_follows_code_not_line_order():
+    items = {item.code: item for item in parse_838(TEXT_838_SCRAMBLED)}
+    assert items["2.14.47"].section == "Кабинет физики"
+    assert items["2.15.36"].section == "Кабинет химии"
+    assert items["2.15"].section == "Кабинет химии"
+    assert items["2.1"].section == "Кабинет начальных классов"
+
+
+def test_section_conflicts_spots_sticky_sections():
+    from norms.items import section_conflicts
+
+    known = {
+        "order_838": {
+            code: NormItem(doc_id="order_838", code=code, title="x", section="Кабинет учителя-логопеда")
+            for code in ("2.1", "2.15.1", "2.16.1")
+        }
+    }
+    conflicts = section_conflicts(known)
+    assert conflicts and "2.1" in conflicts[0]
+
+    healthy = {
+        "order_838": {
+            "2.15.1": NormItem(doc_id="order_838", code="2.15.1", title="x", section="Кабинет химии"),
+            "2.15.2": NormItem(doc_id="order_838", code="2.15.2", title="y", section="Кабинет химии"),
+        }
+    }
+    assert section_conflicts(healthy) == []
+
+
 def test_1057_glues_code_split_by_layout():
     """«1.13.4.3.1.1 0» — это пункт 1.13.4.3.1.10, а не 1.13.4.3.1.1.
 

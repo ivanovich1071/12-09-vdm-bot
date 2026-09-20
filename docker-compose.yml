@@ -60,12 +60,15 @@ services:
       - "api.telegram.org:149.154.167.220"
 
   # Разовые команды каталога: импорт 1С, diff, утверждение, версии, откат, фото, реестр.
-  # Прямая пересборка `ingest` каталог бота при версиях не меняет.
+  # Прямая пересборка `ingest` каталог бота при версиях не меняет. Корень проекта
+  # смонтирован целиком: командам нужны код и PDF приказов, привезённые upload.sh
+  # (образ их не содержит — *.pdf в .dockerignore), а питон и зависимости — из образа.
   catalog:
     build: .
     entrypoint: ["python", "run.py"]
     command: ["catalog", "versions"]
     env_file: .env
     volumes:
+      - .:/app
       - ./data:/app/data
     profiles: ["tools"]

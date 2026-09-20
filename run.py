@@ -431,6 +431,17 @@ def _parse_acts(args) -> None:  # noqa: ANN001 — argparse.Namespace
     if len(missing_codes) > 20:
         print(f"    … ещё {len(missing_codes) - 20}")
 
+    conflicts = norm_items.section_conflicts(known)
+    naked = [code for code, item in known.get("order_838", {}).items() if not item.section]
+    if conflicts or naked:
+        print("\nструктура справочника подозрительна — разделы «переехали» между подразделами:")
+        for line in conflicts[:10]:
+            print("   ", line)
+        if naked:
+            print(f"    пунктов 838 без раздела: {len(naked)} (например {naked[:5]})")
+        raise SystemExit(1)
+    print("\nструктура справочника в порядке: у каждого подраздела своё название раздела")
+
 
 def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     """Сбор фотографий и характеристик с сайта и запись их в базу знаний.
