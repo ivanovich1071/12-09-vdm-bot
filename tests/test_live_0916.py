@@ -177,10 +177,15 @@ def test_checkout_in_words_fills_the_cart_instead_of_a_form(engine):  # noqa: F8
         engine.session(USER, CHANNEL).profile.offered.append("S1")
         responses = engine.handle_text(USER, CHANNEL, "Оформить. Согласен, организация МБОУ СОШ № 5.")
 
+    # Показанное само в корзину не падает: бот сначала перечисляет, что положит,
+    # и только явное «Добавить и оформить» наполняет корзину.
+    assert engine.storage.load_cart(USER).is_empty
+    assert "order_shown" in actions(responses[0])
+    assert "Название организации" not in texts(responses), "анкету пишет модель, а не ядро"
+
+    engine.handle_action(USER, CHANNEL, "order_shown")
     cart = engine.storage.load_cart(USER)
     assert cart.count == 1 and cart.items[0].sku_1c == "S1"
-    assert "checkout" in actions(responses[0])
-    assert "Название организации" not in texts(responses), "анкету пишет модель, а не ядро"
 
 
 def test_checkout_with_an_empty_cart_says_so_instead_of_asking_for_details(engine):  # noqa: F811

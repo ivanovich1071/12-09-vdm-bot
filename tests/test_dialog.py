@@ -356,3 +356,45 @@ def test_card_never_touches_the_site(engine, tmp_path):
     card = [r for r in responses if isinstance(r, ProductCard)][0]
     assert card.product.sku_1c == "S2"
     assert media.prefetch.pending == 1, "товар без снимка должен уйти фоновому сборщику"
+
+
+# --- Оформление без сюрпризов: анкета, счётчики файла -------------------------
+
+
+def test_wizard_does_not_take_service_words_as_data(engine):
+    engine.handle_action(USER, CHANNEL, "add:S1")
+    engine.handle_action(USER, CHANNEL, "checkout")
+    engine.handle_action(USER, CHANNEL, "consent_yes")
+    # «Оформить» в поле «организация» уезжало менеджеру в заявке (17.09).
+    asked = engine.handle_text(USER, CHANNEL, "Оформить")[0].text
+    assert "Название организации" in asked
+    assert engine.session(USER, CHANNEL).customer.organization == ""
+
+
+def test_wizard_reasks_bad_phone(engine):
+    engine.handle_action(USER, CHANNEL, "add:S1")
+    engine.handle_action(USER, CHANNEL, "checkout")
+    engine.handle_action(USER, CHANNEL, "consent_yes")
+    engine.handle_text(USER, CHANNEL, "Школа 1")
+    engine.handle_text(USER, CHANNEL, "Иванов")
+    asked = engine.handle_text(USER, CHANNEL, "Иванова")[0].text
+    assert "телефон" in asked.lower()
+    asked = engine.handle_text(USER, CHANNEL, "+7 916 330-02-79")[0].text
+    assert "E-mail" in asked
+    assert engine.session(USER, CHANNEL).customer.phone == "+7 916 330-02-79"
+
+
+def test_order_cart_counts_lines_like_the_preview(engine):
+    """Превью проверки файла считает строки, «положил» — товары: цифры не должны спорить."""
+    engine.session(USER, CHANNEL).profile.order = {
+        "file": "заказ.xlsx",
+        "positions": [
+            {"sku": "S1", "quantity": 2},
+            {"sku": "S1", "quantity": 1},
+            {"sku": "НЕТ-В-КАТАЛОГЕ", "quantity": 1},
+        ],
+    }
+    replies = engine.order_cart(engine.session(USER, CHANNEL), default=1)
+    assert "2 из 3" in replies[0].text
+    cart = engine.storage.load_cart(USER)
+    assert cart.count == 2 and len(cart.items) == 1

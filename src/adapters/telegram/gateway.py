@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from core.errors import DomainError
+from core.models import Cart
 from core.ui import (
     Button,
     Keyboard,
@@ -104,6 +105,11 @@ class TelegramGateway:
         self._sessions: dict[str, CoreSession] = {}
         self._awaiting_contact: dict[str, str] = {}
         self._contact_misses: dict[str, int] = {}
+        # Идемпотентность оформления: одна корзина — один предзаказ. 19.09 одна и та же
+        # корзина уехала менеджеру четырьмя копиями: каждую кнопку «Оформить» под старыми
+        # сообщениями ядро честно считало новой заявкой.
+        self._last_checkout: dict[str, tuple[tuple, list[TelegramReply]]] = {}
+        self._last_preorder: dict[tuple[str, str], list[TelegramReply]] = {}
 
     @property
     def storage(self):  # noqa: ANN201 — кэш file_id снимков у рендера
@@ -263,12 +269,34 @@ class TelegramGateway:
         return [self._file(session, spec, "xlsx")]
 
     def _checkout(self, user_id: str) -> list[TelegramReply]:
-        """«Оформить» и /order: спецификацию и предзаказ собирает ядро, канал просит согласие и контакт."""
+        """«Оформить» и /order: спецификацию и предзаказ собирает ядро, канал просит согласие и контакт.
+
+        Тот же состав корзины — тот же предзаказ: повторное нажатие (в том числе по старой
+        кнопке под старым сообщением) отдаёт прежние спецификацию и заявку, а не плодит копии.
+        Новая заявка создаётся только когда корзина изменилась.
+        """
+        cart = self.storage.load_cart(user_id)
+        if cart.is_empty:
+            return [
+                Message(
+                    "Корзина пуста. Соберём позиции словами, пунктом перечня или файлом заказа.",
+                    keyboard=Keyboard().row(Button("Меню", "menu")),
+                )
+            ]
+        fingerprint = _cart_fingerprint(cart)
+        previous = self._last_checkout.get(user_id)
+        if previous is not None and previous[0] == fingerprint:
+            return previous[1]
         session = self.session(user_id)
         spec_result, preorder_result = self.core.checkout(session)
         spec, preorder = spec_result.data, preorder_result.data
         assert isinstance(spec, dto.SpecificationOut) and isinstance(preorder, dto.PreorderOut)
-        return [self._file(session, spec, "xlsx", preorder_button=False), *self._offer_preorder(user_id, preorder)]
+        replies = [
+            self._file(session, spec, "xlsx", preorder_button=False),
+            *self._offer_preorder(user_id, preorder),
+        ]
+        self._last_checkout[user_id] = (fingerprint, replies)
+        return replies
 
     def _spec_file(self, user_id: str, spec_id: str, fmt: str) -> list[TelegramReply]:
         session = self.session(user_id)
@@ -293,10 +321,17 @@ class TelegramGateway:
         return FileReply(document.filename, document.content, caption, keyboard)
 
     def _preorder(self, user_id: str, source: str, source_id: str) -> list[TelegramReply]:
+        """Кнопка «Оформить предзаказ» по файлу или спецификации: повтор не создаёт копию."""
+        key = (user_id, f"{source}:{source_id}")
+        cached = self._last_preorder.get(key)
+        if cached is not None:
+            return cached
         session = self.session(user_id)
         preorder = self.core.create_preorder(session, source, source_id, None).data
         assert isinstance(preorder, dto.PreorderOut)
-        return self._offer_preorder(user_id, preorder)
+        replies = self._offer_preorder(user_id, preorder)
+        self._last_preorder[key] = replies
+        return replies
 
     def _offer_preorder(self, user_id: str, preorder: dto.PreorderOut) -> list[TelegramReply]:
         session = self.session(user_id)
@@ -330,7 +365,20 @@ class TelegramGateway:
         preorder_id = self._awaiting_contact.pop(user_id, None)
         self._contact_misses.pop(user_id, None)
         if preorder_id is None:
-            return [Message("Контакт получен, но предзаказ не выбран. Соберите его заново: /order или файлом заказа.")]
+            # Контакт мог прийти после перезапуска бота или из другого процесса — ждать
+            # в памяти ненадёжно (19.09: «Контакт получен, но предзаказ не выбран»).
+            # Забираем последний готовый предзаказ владельца.
+            history = self.core.history(self.session(user_id)).data
+            assert isinstance(history, dto.HistoryOut)
+            waiting = [p for p in history.preorders if p["status"] == "READY_FOR_MANAGER"]
+            if not waiting:
+                return [
+                    Message(
+                        "Контакт получен, но предзаказ не выбран. "
+                        "Соберите его заново: /order или файлом заказа."
+                    )
+                ]
+            preorder_id = waiting[0]["id"]
         customer = dto.CustomerIn(name=name[:200], phone=phone[:50])
         sent = self.core.send_preorder(self.session(user_id), preorder_id, customer).data
         assert isinstance(sent, dto.PreorderOut)
@@ -390,6 +438,11 @@ def _about_something_else(text: str) -> bool:
     """Реплика во время ожидания контакта — про другое, а не имя с телефоном."""
     lowered = text.lower()
     return "?" in text or len(text.split()) > NAME_WORDS or any(word in lowered for word in _ASKING_WORDS)
+
+
+def _cart_fingerprint(cart: Cart) -> tuple:
+    """Состав корзины одним значением: те же товары и количества — тот же предзаказ."""
+    return tuple(sorted((item.sku_1c, item.quantity) for item in cart.items))
 
 
 def _status(code: str) -> str:

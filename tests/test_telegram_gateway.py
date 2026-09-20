@@ -198,8 +198,8 @@ def test_deeplink_with_foreign_payload_does_not_touch_cart(env):
 
 ALLOWED = {
     "__future__", "logging", "collections.abc", "dataclasses", "re",
-    "core.errors", "core.ui", "core_api", "core_api.facade", "core_api.sessions",
-    "privacy.consent", "privacy.masking",
+    "core.errors", "core.models", "core.ui", "core_api", "core_api.facade",
+    "core_api.sessions", "privacy.consent", "privacy.masking",
 }
 
 
@@ -253,3 +253,26 @@ def test_gateway_has_no_business_logic_dependencies():
         elif isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
     assert imported <= ALLOWED, imported - ALLOWED
+
+
+CHANNEL = "telegram"
+
+
+def test_repeated_checkout_reuses_one_preorder(env):
+    """Вторая кнопка «Оформить» с той же корзиной — прежняя заявка, а не копия (19.09)."""
+    api, gateway = env
+    api.engine.handle_action(USER, CHANNEL, "add:B1")
+
+    first = gateway.action(USER, "checkout")
+    second = gateway.action(USER, "checkout")
+
+    def preorder_id(replies):
+        for reply in replies:
+            text = getattr(reply, "text", "") or ""
+            if "Предварительный заказ" in text:
+                return text.split("Предварительный заказ ")[1].split(":")[0]
+        return None
+
+    one, two = preorder_id(first), preorder_id(second)
+    assert one and one == two
+    assert len(api.core.services.preorders.of_owner(USER)) == 1

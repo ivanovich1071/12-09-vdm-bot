@@ -181,6 +181,10 @@ class DialogProfile:
     # Присланный заказ: файл и строки с товарами каталога — из проверки заказа, не из текста. 14.09
     # после файла «подбери по этому заказу» и «30 позиций из наличия» ни на что не ссылались.
     order: dict[str, Any] | None = None
+    # Коды 1С, подобранные по формулировке приказа без точной привязки: в корзину сами не
+    # кладутся, ждут отдельного «Добавить подобранное». Молчаливая замена дала пересортицу
+    # в предзаказе 19.09: вместо модульного пола уехал игровой лабиринт.
+    review: list[str] = field(default_factory=list)
 
     @property
     def audience(self) -> str | None:
@@ -331,6 +335,7 @@ class DialogProfile:
         self.shortlist = []
         self.export = None
         self.order = None
+        self.review = []
 
     def remember_kit(self, kit: dict[str, Any]) -> None:
         self.kit = kit
@@ -425,6 +430,7 @@ class DialogProfile:
             "shortlist": self.shortlist,
             "export": self.export,
             "order": self.order,
+            "review": self.review,
         }
 
     @classmethod

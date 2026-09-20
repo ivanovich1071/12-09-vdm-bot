@@ -100,6 +100,16 @@ CHECKOUT_FIELDS: tuple[tuple[str, str], ...] = (
     ("comment", "Комментарий к заказу (можно «-»):"),
 )
 
+# Ответы, которые данными заказа не становятся: названия кнопок и меню. «Оформить»,
+# вписанное в организацию 17.09, уехало менеджеру в заявке.
+_CONTACT_NOISE = re.compile(
+    r"^(оформ\w*|корзин\w*|меню|менеджер\w*|каталог\w*|назад|отмен\w*|начать заново|да|ок)$",
+    re.IGNORECASE,
+)
+# Телефон: цифры с разделителями, от десяти знаков — чтобы «Иванова» в поле телефона
+# не проходила, а «+7 (900) 123-45-67» проходила.
+_CONTACT_PHONE = re.compile(r"\+?\d[\d\s()\-]{9,}\d")
+
 # Сколько позиций показываем за раз. Пять оказалось много: заказчик отдельно
 # отметил, что выдача из пяти карточек «излишня». Три помещаются на экран
 # целиком, и каждую можно показать со снимком, не превращая чат в ленту.
@@ -503,6 +513,10 @@ class DialogEngine:
                 ]
             case "confirm_order":
                 return self._submit(session)
+            case "order_shown":
+                return self._add_shown(session)
+            case "order_review":
+                return self._add_review(session)
             case "cancel":
                 session.checkout_step = None
                 session.pending_checkout = False
@@ -923,7 +937,7 @@ class DialogEngine:
 
     def _points_to_products(
         self, session: Session, points: list[tuple[str, int | None]], each: int | None
-    ) -> tuple[list[tuple[Product, int]], list[str], list[str]]:
+    ) -> tuple[list[tuple[Product, int]], list[str], list[tuple[str, Product]]]:
         """Пункты перечня — в позиции каталога: по одному товару на пункт, в порядке перечня.
 
         Пункт — это норма, а не товар: под ним в каталоге бывает несколько позиций. Берём ту,
@@ -932,20 +946,22 @@ class DialogEngine:
         1 шт.»), иначе указанное у самого пункта, иначе одна штука.
 
         Пункт без привязки в каталоге ищется по номеру в названии товара и по формулировке
-        приказа (`catalog.points`); подобранное по формулировке возвращается отдельным списком —
-        человеку такие позиции показываются как требующие проверки.
+        приказа (`catalog.points`), но в корзину не попадает: подобранное по формулировке —
+        замена без выбора клиента, и 19.09 такая замена увезла в предзаказ игровой лабиринт
+        вместо модульного пола. Кандидаты возвращаются отдельно — показываем и спрашиваем.
         """
         finder = self.point_finder(session)
         chosen: list[tuple[Product, int]] = []
         missing: list[str] = []
-        review: list[str] = []
+        review: list[tuple[str, Product]] = []
         for code, quantity in points[:POINTS_TO_CART]:
             found = finder.find(code)
             if found is None:
                 missing.append(code)
                 continue
             if not found.confirmed:
-                review.append(code)
+                review.append((code, found.product))
+                continue
             chosen.append((found.product, each or quantity or 1))
         return chosen, missing, review
 
@@ -985,44 +1001,87 @@ class DialogEngine:
         points = intent.listed_points(text)
         if not points and not shown:
             points = intent.listed_points(self._last_answer(session))
-        missing: list[str] = []
-        review: list[str] = []
         if points:
             chosen, missing, review = self._points_to_products(session, points, each)
-            added, cart = self._add_products(session, chosen)
-            head = (
-                f"Оформляем. Собрал корзину по перечню: {added} "
-                f"{plural(added, 'позиция', 'позиции', 'позиций')}, по одной на пункт. "
-                f"В корзине {cart.count} шт. на {price_text(cart.total)}."
+            profile.review = [product.sku_1c for _, product in review]
+            if not chosen and not review:
+                answer = self._nothing_to_checkout(missing)
+                session.remember("assistant", answer)
+                return [Message(answer, keyboard=self._offer_menu())]
+            self._remember(session)
+            lines: list[str] = []
+            keyboard = Keyboard()
+            if chosen:
+                added, cart = self._add_products(session, chosen)
+                lines.append(
+                    f"Собрал корзину по перечню: {added} "
+                    f"{plural(added, 'позиция', 'позиции', 'позиций')}, по одной на пункт. "
+                    f"В корзине {cart.count} шт. на {price_text(cart.total)}."
+                )
+                keyboard.row(Button("Моя корзина", "cart"), Button("Оформить", "checkout"))
+            if review:
+                candidates = "; ".join(f"«{product.name}» (п. {code})" for code, product in review)
+                lines.append(
+                    ("Точной привязки в каталоге нет у: " if chosen else "По формулировке приказа подобралось: ")
+                    + candidates
+                    + ". В корзину их не ставил — это замена без вашего выбора. Подходят?"
+                )
+                keyboard.row(Button("Добавить подобранное", "order_review"))
+            if missing:
+                lines.append(_missing_points(missing))
+            lines.append(
+                "Проверьте состав и нажмите «Оформить» — дальше спрошу организацию, контакт и телефон. "
+                "Если по какому-то пункту нужен другой вариант, назовите его номер."
             )
-        else:
-            added, cart = self._add_skus(session, shown, each or 1)
-            head = (
-                f"Оформляем. Положил в корзину {added} "
-                f"{plural(added, 'позицию', 'позиции', 'позиций')} из показанных, по {each or 1} шт. "
-                f"В корзине {cart.count} шт. на {price_text(cart.total)}."
-            )
-        if not added:
-            answer = self._nothing_to_checkout(missing)
+            answer = " ".join(lines)
+            session.remember("assistant", answer)
+            return [Message(answer, keyboard=keyboard)]
+        if not shown:
+            answer = self._nothing_to_checkout([])
             session.remember("assistant", answer)
             return [Message(answer, keyboard=self._offer_menu())]
-        lines = [head]
-        if review:
-            lines.append(
-                f"По пунктам {_points_line(review)} привязки в каталоге нет — подобрал ближайшее "
-                "по формулировке приказа, проверьте эти позиции."
-            )
-        if missing:
-            lines.append(_missing_points(missing))
-        lines.append(
-            "Проверьте состав и нажмите «Оформить» — дальше спрошу организацию, контакт и телефон. "
-            "Если по какому-то пункту нужен другой вариант, назовите его номер."
+        # Показанные позиции сами в корзину не падают: «оформить» под чужим списком
+        # собирало предзаказ из того, что бот показывал часом ранее. Сначала — что
+        # именно будет положено, добавление и оформление — отдельным нажатием.
+        names = "; ".join(
+            f"«{product.name}»" for sku in shown if (product := self.index.get(sku)) is not None
         )
-        answer = " ".join(lines)
+        answer = (
+            "В корзине пока пусто. По слову «оформить» готов добавить показанные позиции: "
+            f"{names}. Добавить и продолжить оформление?"
+        )
         session.remember("assistant", answer)
         return [
             Message(
                 answer,
+                keyboard=Keyboard().row(
+                    Button("Добавить и оформить", "order_shown"), Button("Меню", "menu")
+                ),
+            )
+        ]
+
+    def _add_shown(self, session: Session) -> list[Response]:
+        """Кнопка «Добавить и оформить»: показанные позиции — в корзину по явному согласию."""
+        profile = session.profile
+        shown = profile.shortlist or profile.offered[-OFFERED_TO_CART:]
+        added, _ = self._add_skus(session, shown, 1)
+        if not added:
+            return [Message("Добавлять нечего — список показанных пуст.", keyboard=self._main_menu())]
+        return self._start_checkout(session)
+
+    def _add_review(self, session: Session) -> list[Response]:
+        """Кнопка «Добавить подобранное»: кандидаты по формулировке — только после явного «да»."""
+        skus = session.profile.review
+        added, cart = self._add_skus(session, skus, 1)
+        session.profile.review = []
+        self._remember(session)
+        if not added:
+            return [Message("Список для добавления пуст — подберём заново.", keyboard=self._main_menu())]
+        return [
+            Message(
+                f"Добавил {added} {plural(added, 'позицию', 'позиции', 'позиций')} по формулировке "
+                f"приказа — проверьте их особенно внимательно. В корзине {cart.count} шт. на "
+                f"{price_text(cart.total)}.",
                 keyboard=Keyboard().row(Button("Моя корзина", "cart"), Button("Оформить", "checkout")),
             )
         ]
@@ -1054,13 +1113,20 @@ class DialogEngine:
         name = order.get("file") or "заказ"
         found: list[tuple[Product, int | None]] = []
         seen: set[str] = set()
+        resolved = 0
         for position in positions:
             product = self.index.get(position.get("sku") or "")
-            if product is None or product.id in seen:
+            if product is None:
+                continue
+            # Строки и товары считаются раздельно: превью проверки файла говорит
+            # «найдено N строк», и «положил M позиций» по уникальным товарам не должно
+            # выглядеть противоречащим (19.09: «найдено 58» рядом с «положил 57»).
+            resolved += 1
+            if product.id in seen:
                 continue
             seen.add(product.id)
             found.append((product, _quantity(position.get("quantity"))))
-        missing = sum(1 for position in positions if self.index.get(position.get("sku") or "") is None)
+        missing = len(positions) - resolved
 
         keyboard = Keyboard()
         if not found:
@@ -1070,7 +1136,7 @@ class DialogEngine:
             unknown = sum(1 for _, quantity in found if quantity is None)
             if unknown:
                 text = (
-                    f"По заказу «{name}» в каталоге {len(found)} из {len(positions)} строк, но у {unknown} "
+                    f"По заказу «{name}» в каталоге {resolved} из {len(positions)} строк, но у {unknown} "
                     f"{plural(unknown, 'позиции', 'позиций', 'позиций')} не указано количество. Нажмите "
                     "«Найденные в корзину по 1 шт.» или напишите, например, «все по 2»."
                 )
@@ -1078,7 +1144,7 @@ class DialogEngine:
             else:
                 # Количество есть везде — предзаказ по файлу целиком: не найденные строки менеджер увидит сам.
                 text = (
-                    f"По заказу «{name}» всё готово к предзаказу: в каталоге {len(found)} из {len(positions)} "
+                    f"По заказу «{name}» всё готово к предзаказу: в каталоге {resolved} из {len(positions)} "
                     "строк, количество — из файла. Нажмите «Оформить предзаказ»: строки, которых нет в "
                     "каталоге, менеджер проверит сам."
                 )
@@ -1107,7 +1173,8 @@ class DialogEngine:
             how = f"по {override} шт." if override else "количество — из файла" + (f", где его нет — {default} шт." if default else "")
             text = (
                 f"Положил в корзину {len(found)} {plural(len(found), 'позицию', 'позиции', 'позиций')} из заказа "
-                f"«{name}», {how} В корзине {cart.count} шт. на {price_text(cart.total)}."
+                f"«{name}» ({resolved} из {len(positions)} строк найдено), {how} "
+                f"В корзине {cart.count} шт. на {price_text(cart.total)}."
             )
             if missing:
                 text += (
@@ -1561,6 +1628,17 @@ class DialogEngine:
         step = session.checkout_step or 0
         field_name, _ = CHECKOUT_FIELDS[step]
         value = "" if text.strip() in {"-", "—", "нет"} else text.strip()
+        if value and _CONTACT_NOISE.match(value):
+            # Кнопки и меню данными не становятся — переспрашиваем тот же шаг.
+            return self._ask_contact(session, step)
+        if field_name == "phone" and value and not _CONTACT_PHONE.search(value):
+            return [
+                Message(
+                    "Не похоже на телефон. Напишите номер цифрами — например +7 900 123-45-67 — "
+                    "или «-», если телефона нет.",
+                    keyboard=Keyboard().row(Button("Отменить", "cancel")),
+                )
+            ]
         setattr(session.customer, field_name, value)
 
         if step + 1 < len(CHECKOUT_FIELDS):

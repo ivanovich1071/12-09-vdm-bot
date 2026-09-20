@@ -32,6 +32,12 @@ SELECTION_TOOLS = frozenset({"search_products", "find_by_norm_code"})
 # консультант составляет по ним полную предварительную комплектацию — обрезать раздел нельзя.
 MAX_POSITIONS = 100
 
+# Просьба добавить в корзину: «добавь», «клади», «в корзину», «возьмём», «оформи».
+_ADD_REQUEST = re.compile(
+    r"добав\w*|клад\w*|полож\w*|в\s+корзин\w*|возьм\w*|бер\w*\s|куплю|заказыв\w*|оформ\w*",
+    re.IGNORECASE,
+)
+
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -359,6 +365,12 @@ class ToolBox:
         cart = self.engine.storage.load_cart(self.session.user_id)
         return {*self.shown_skus, *self.session.profile.offered, *(item.sku_1c for item in cart.items)}
 
+    def _last_user_text(self) -> str:
+        for message in reversed(self.session.history):
+            if message.get("role") == "user":
+                return str(message.get("content") or "")
+        return ""
+
     def _find_norm_item(self, query: str, document: str | None = None) -> dict[str, Any]:
         index = self.engine.norm_texts
         if not index.loaded:
@@ -513,6 +525,15 @@ class ToolBox:
     def _add_to_cart(self, sku_1c: str, quantity: int = 1) -> dict[str, Any]:
         if sku_1c not in self._offered():
             return {"error": f"товара {sku_1c} не было в подборе — в корзину кладётся только подобранное"}
+        # В схеме инструмента написано «только после согласия пользователя», но модель
+        # иногда клала в корзину всё, что показала: 19.09 на «покажи конкретные модели»
+        # в корзине оказались две цифровые лаборатории на 490 583 ₽. Без просьбы —
+        # требуем сначала спросить.
+        if not _ADD_REQUEST.search(self._last_user_text()):
+            return {
+                "error": "пользователь не просил добавлять в корзину: спросите «добавить в "
+                "корзину?» и вызывайте инструмент только после явного согласия"
+            }
         product = self.engine.index.get(sku_1c)
         if product is None:
             return {"error": f"товара с кодом {sku_1c} нет в каталоге"}
