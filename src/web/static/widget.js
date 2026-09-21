@@ -302,7 +302,9 @@
         box.appendChild(el("div", "vdm-total", "Итого: " + response.total));
         if (response.note) box.appendChild(el("div", "vdm-meta", response.note));
       }
-      var acts = actionsNode(response.actions);
+      // Кнопки карточки уже нарисованы в ней самой (`itemNode`): наверху они бы
+      // задвоились — «В корзину Подробнее» дважды под каждым товаром (21.09).
+      var acts = response.type === "item" ? null : actionsNode(response.actions);
       if (acts) box.appendChild(acts);
       log.appendChild(box);
     });

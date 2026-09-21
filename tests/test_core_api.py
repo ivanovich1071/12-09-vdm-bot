@@ -361,3 +361,37 @@ def test_core_api_has_no_channel_logic():
             if isinstance(node, ast.Compare):
                 constants = [c.value for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
                 assert not {"telegram", "max", "web", "widget"} & set(constants), f"{path.name}: ветвление по каналу"
+
+
+# --- 21.09: файлы и кнопки в мини-аппе ------------------------------------------------------
+
+
+def test_dialogue_export_action_serves_a_download_link(api):
+    """«Скачать Excel» в Mini App — файл одноразовой ссылкой, а не «пришлю в Telegram-боте»."""
+    created = ok(api.client.post("/api/sessions"), 201)
+    headers = {"X-Session-Id": created["session_id"]}
+    # Что-нибудь выгружаемое в профиле: показанный подбор.
+    session = api.engine.session(created["session_id"], created["data"]["channel"])
+    session.profile.shortlist = ["I1"]
+    session.profile.export = "shortlist"
+    body = ok(api.client.post("/api/dialogue/action", json={"action": "export:xlsx"}, headers=headers))
+    replies = body["data"]["responses"]
+    assert replies and replies[0]["type"] == "text"
+    assert "пришлю в Telegram" not in replies[0]["text"]
+    buttons = [button for row in replies[0]["actions"] for button in row]
+    link = next(button["url"] for button in buttons if button["url"])
+    assert link.startswith("/api/downloads/")
+    download = api.client.get(link)
+    assert download.status_code == 200
+    assert download.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    # Токен одноразовый.
+    assert api.client.get(link).status_code == 404
+
+
+def test_dialogue_export_action_without_anything_to_export(api):
+    created = ok(api.client.post("/api/sessions"), 201)
+    headers = {"X-Session-Id": created["session_id"]}
+    body = ok(api.client.post("/api/dialogue/action", json={"action": "export:docx"}, headers=headers))
+    assert "нечего" in body["data"]["responses"][0]["text"]

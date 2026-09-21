@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -48,6 +49,7 @@ class CoreApi:
         self.services = services
         self.verifiers = dict(verifiers or {})
         self._downloads: dict[str, tuple[float, str, str, str]] = {}
+        self._file_downloads: dict[str, tuple[float, str, bytes]] = {}
         self._downloads_lock = threading.Lock()
 
     @property
@@ -129,9 +131,44 @@ class CoreApi:
             return Result(dto.DialogueOut(responses=render.responses(replies)), session.id, catalog_version=state.label)
 
     def action(self, session: CoreSession, action: str) -> Result:
+        verb, _, arg = action.partition(":")
+        if verb == "export" and arg in {"xlsx", "docx"}:
+            # «Скачать Excel/Word» из Mini App: в ядре на это действие заглушка «пришлю
+            # в Telegram-боте», а файлу анонимной сессии в Telegram уходить некуда.
+            # Отдаём одноразовой ссылкой — как спецификацию (`export_link`); Telegram
+            # до этого места не доходит, у адаптера свои файлы.
+            return self._export_action(session, arg)
         with self.runtime.turn() as state:
             replies = self.action_primitives(session, action)
             return Result(dto.DialogueOut(responses=render.responses(replies)), session.id, catalog_version=state.label)
+
+    def _export_action(self, session: CoreSession, fmt: str) -> Result:
+        from core.ui import Button, Keyboard, Message
+
+        file = self.export_dialog_list(session, fmt)
+        if file is None:
+            replies = [
+                Message(
+                    "Сохранять пока нечего: сначала соберём комплектацию или подберём позиции.",
+                    keyboard=Keyboard().row(Button("Меню", "menu")),
+                )
+            ]
+        else:
+            replies = [
+                Message(
+                    file.caption,
+                    keyboard=Keyboard().row(Button("Скачать файл", "noop", url=self._remember_file(file.filename, file.content))),
+                )
+            ]
+        return Result(dto.DialogueOut(responses=render.responses(replies)), session.id)
+
+    def _remember_file(self, filename: str, content: bytes) -> str:
+        token = secrets.token_urlsafe(24)
+        with self._downloads_lock:
+            now = time.monotonic()
+            self._file_downloads = {key: entry for key, entry in self._file_downloads.items() if entry[0] > now}
+            self._file_downloads[token] = (now + DOWNLOAD_TTL, filename, content)
+        return f"/api/downloads/{token}"
 
     def message_primitives(self, session: CoreSession, text: str) -> list[Response]:
         """Ответ диалога примитивами `core.ui` — для адаптеров в том же процессе.
@@ -262,10 +299,24 @@ class CoreApi:
         return Result(dto.DownloadOut(url=f"/api/downloads/{token}", expires_in=DOWNLOAD_TTL), session.id)
 
     def download(self, token: str) -> tuple[ExportedDocument, str, str]:
+        now = time.monotonic()
         with self._downloads_lock:
             entry = self._downloads.pop(token, None)
-        if entry is None or entry[0] < time.monotonic():
+            file_entry = self._file_downloads.pop(token, None)
+        if entry is not None and entry[0] < now:
+            entry = None
+        if file_entry is not None and file_entry[0] < now:
+            file_entry = None
+        if entry is None and file_entry is None:
             raise NotFound("Ссылка недействительна или истекла.", code="DOWNLOAD_NOT_FOUND")
+        if file_entry is not None:
+            # Файл списка разговора уже собран (`exports.build`) — отдаём как есть.
+            _, filename, content = file_entry
+            media_type = {
+                ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            }.get(Path(filename).suffix.lower(), "application/octet-stream")
+            return ExportedDocument(filename, media_type, content), "", ""
         _, owner, spec_id, fmt = entry
         spec = self.services.procurement.get_specification(spec_id, owner)
         document = self.services.procurement.export_specification(spec_id, owner, fmt)

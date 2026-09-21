@@ -133,7 +133,7 @@
   }
 
   // Кнопки ядра — те же, что в чате: «Оформить», «Моя корзина», «Связаться с
-  // менеджером», «Задать вопрос». Своего списка текстов у приложения нет.
+  // менеджером», ссылки на файлы. Своего списка текстов у приложения нет.
   function actionsRow(rows) {
     var html = (rows || []).map(function (row) {
       return row.map(function (b) {
@@ -145,15 +145,21 @@
     return html ? '<div class="row">' + html + "</div>" : "";
   }
 
-  function productRow(item) {
+  function productRow(item, actions) {
+    // Кнопки карточки приходят от ядра в `actions`; хардкод — только для экранов
+    // без ответа диалога (результаты подбора). Раньше рисовали и то и другое —
+    // «В корзину Подробнее» задваивались (21.09).
+    var buttons = actions
+      ? actionsRow(actions)
+      : '<div class="row"><button data-card="' + esc(item.product_id || item.id) + '">Подробнее</button>' +
+        '<button data-add="' + esc(item.product_id || item.id) + '">В корзину</button></div>';
     return '<div class="card"><b>' + esc(item.name) + "</b><div class=\"meta\">" + esc(item.article) + " · " + money(item.price) + "</div>" +
       (item.availability ? chip(item.availability) : "") + (item.norm_status ? chip(item.norm_status) : "") +
       (item.quantity ? '<div class="meta">' + item.quantity + " шт. — " + esc(label(item.quantity_source)) + (item.quantity_note ? ": " + esc(item.quantity_note) : "") + "</div>" : "") +
       (item.reason ? '<div class="meta">' + esc(item.reason) + "</div>" : "") +
-      '<div class="row"><button data-card="' + esc(item.product_id || item.id) + '">Подробнее</button>' +
-      '<button data-add="' + esc(item.product_id || item.id) + '">В корзину</button>' +
-      (state.task ? '<button data-choose="' + esc(item.product_id) + '">Выбрать</button><button data-reject="' + esc(item.product_id) + '">Не подходит</button>' : "") +
-      "</div></div>";
+      buttons +
+      (state.task ? '<div class="row"><button data-choose="' + esc(item.product_id) + '">Выбрать</button><button data-reject="' + esc(item.product_id) + '">Не подходит</button></div>' : "") +
+      "</div>";
   }
   // Корзина как её вернуло ядро в ответе диалога — строками, без кнопок:
   // кнопки придут отдельно, в `actions` того же ответа.
@@ -184,11 +190,12 @@
       if (r.type === "text") html += '<div class="card"><pre>' + esc(r.text) + "</pre></div>";
       if (r.type === "product_list") {
         html += "<h2>" + esc(r.title) + "</h2>";
-        r.items.forEach(function (i) { html += productRow(Object.assign({ product_id: i.product.id }, i.product)); });
+        r.items.forEach(function (i) { html += productRow(Object.assign({ product_id: i.product.id }, i.product), i.actions); });
       }
-      if (r.type === "product") html += productRow(Object.assign({ product_id: r.product.id }, r.product));
+      // Кнопки карточки уже нарисованы в ней самой: наверху они бы задвоились.
+      if (r.type === "product") html += productRow(Object.assign({ product_id: r.product.id }, r.product), r.actions);
       if (r.type === "cart") html += cartRows(r);
-      html += actionsRow(r.actions);
+      if (r.type !== "product") html += actionsRow(r.actions);
     });
     answerBox().innerHTML = html;
     bindProducts();
@@ -198,7 +205,12 @@
     on("[data-card]", function (d) { return show("card", d.card); });
     // Нажатие кнопки ядра — тот же ход, что в чате: решает ядро, не приложение.
     on("[data-action]", function (d) { return guard(async function () { showReplies(await api("POST", "/api/dialogue/action", { action: d.action })); }); });
-    on("[data-link]", function (d) { if (tg && tg.openLink) tg.openLink(d.link); else window.open(d.link, "_blank"); });
+    on("[data-link]", function (d) {
+      // Ссылки ядра относительные («/api/downloads/…»): Telegram.openLink требует
+      // абсолютный адрес — достраиваем до origin мини-аппа.
+      var url = d.link.charAt(0) === "/" ? location.origin + d.link : d.link;
+      if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank");
+    });
     on("[data-add]", function (d) { return guard(async function () { await api("POST", "/api/cart/items", { product_id: d.add, quantity: 1 }); tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success"); }); });
     on("[data-choose]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/choose", { product_ids: [d.choose] }); node.textContent = "Выбрано"; }); });
     on("[data-reject]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/reject", { product_ids: [d.reject] }); node.closest(".card").remove(); }); });
