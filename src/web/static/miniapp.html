@@ -110,8 +110,8 @@
     try { await SCREENS[name](argument); }
     catch (error) { screen.insertAdjacentHTML("afterbegin", '<div class="error">' + esc(error.message) + " <small>(" + esc(error.code || "") + ")</small></div>"); }
   }
-  function on(selector, handler) {
-    screen.querySelectorAll(selector).forEach(function (node) {
+  function on(selector, handler, root) {
+    (root || screen).querySelectorAll(selector).forEach(function (node) {
       // Кнопка на время работы выключается: ответ модели идёт десятками секунд,
       // и без этого второе нажатие запускало второй такой же запрос.
       node.addEventListener("click", function () { busy(node, function () { return handler(node.dataset, node); }); });
@@ -143,6 +143,16 @@
       }).join("");
     }).join("");
     return html ? '<div class="row">' + html + "</div>" : "";
+  }
+
+  // Ссылки ядра относительные («/api/downloads/…»). Внутри Telegram их открывает
+  // openLink, но скрипт telegram-web-app.js определяет openLink и в обычном
+  // браузере, где тот молча ничего не делает, — «Скачать файл» не реагировала
+  // вовсе (21.09). Поэтому openLink — только при настоящем Telegram-хосте.
+  function openUrl(url) {
+    var full = url.charAt(0) === "/" ? location.origin + url : url;
+    var inside = tg && tg.platform && tg.platform !== "unknown";
+    if (inside && tg.openLink) tg.openLink(full); else window.open(full, "_blank");
   }
 
   function productRow(item, actions) {
@@ -183,9 +193,14 @@
     return box;
   }
 
-  // Ответ диалога: реплики, карточки и кнопки ядра под ними.
+  // Ответ диалога: реплики, карточки и кнопки ядра под ними. Ответы дописываются
+  // в конец, как сообщения в чате: после «Скачать Excel» комплектация остаётся
+  // на экране, а не исчезала вместе со всеми кнопками (21.09, «дальше ничего
+  // не даёт»). Слушатели вешаются только на новый кусок — старые кнопки уже
+  // со своими, повторное bindProducts дало бы двойные срабатывания.
   function showReplies(reply) {
     var html = "";
+    var hasLink = false;
     reply.data.responses.forEach(function (r) {
       if (r.type === "text") html += '<div class="card"><pre>' + esc(r.text) + "</pre></div>";
       if (r.type === "product_list") {
@@ -196,24 +211,28 @@
       if (r.type === "product") html += productRow(Object.assign({ product_id: r.product.id }, r.product), r.actions);
       if (r.type === "cart") html += cartRows(r);
       if (r.type !== "product") html += actionsRow(r.actions);
+      (r.actions || []).forEach(function (row) { row.forEach(function (b) { if (b.url) hasLink = true; }); });
     });
-    answerBox().innerHTML = html;
-    bindProducts();
+    // Под ссылкой на файл — путь обратно: заполненный файл принимает вкладка
+    // «Загрузка заказа». Без неё в мини-приложении упирались в «пришлите файл
+    // боту», которого здесь нет (21.09).
+    if (hasLink) html += '<div class="row"><button data-go-upload="1">Отправить заполненный файл</button></div>';
+    var piece = document.createElement("div");
+    piece.innerHTML = html;
+    answerBox().appendChild(piece);
+    bindProducts(piece);
+    on("[data-go-upload]", function () { return show("upload"); }, piece);
+    piece.scrollIntoView({ block: "end" });
   }
 
-  function bindProducts() {
-    on("[data-card]", function (d) { return show("card", d.card); });
+  function bindProducts(root) {
+    on("[data-card]", function (d) { return show("card", d.card); }, root);
     // Нажатие кнопки ядра — тот же ход, что в чате: решает ядро, не приложение.
-    on("[data-action]", function (d) { return guard(async function () { showReplies(await api("POST", "/api/dialogue/action", { action: d.action })); }); });
-    on("[data-link]", function (d) {
-      // Ссылки ядра относительные («/api/downloads/…»): Telegram.openLink требует
-      // абсолютный адрес — достраиваем до origin мини-аппа.
-      var url = d.link.charAt(0) === "/" ? location.origin + d.link : d.link;
-      if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank");
-    });
-    on("[data-add]", function (d) { return guard(async function () { await api("POST", "/api/cart/items", { product_id: d.add, quantity: 1 }); tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success"); }); });
-    on("[data-choose]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/choose", { product_ids: [d.choose] }); node.textContent = "Выбрано"; }); });
-    on("[data-reject]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/reject", { product_ids: [d.reject] }); node.closest(".card").remove(); }); });
+    on("[data-action]", function (d) { return guard(async function () { showReplies(await api("POST", "/api/dialogue/action", { action: d.action })); }); }, root);
+    on("[data-link]", function (d) { openUrl(d.link); }, root);
+    on("[data-add]", function (d) { return guard(async function () { await api("POST", "/api/cart/items", { product_id: d.add, quantity: 1 }); tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success"); }); }, root);
+    on("[data-choose]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/choose", { product_ids: [d.choose] }); node.textContent = "Выбрано"; }); }, root);
+    on("[data-reject]", function (d, node) { return guard(async function () { await api("POST", "/api/procurement/tasks/" + state.task + "/reject", { product_ids: [d.reject] }); node.closest(".card").remove(); }); }, root);
   }
 
   var SCREENS = {
@@ -327,8 +346,7 @@
         '<button class="primary" id="order">Оформить предзаказ</button></div><div id="fresh"></div>';
       on("[data-file]", function (d) { return guard(async function () {
         var link = (await api("POST", "/api/procurement/specifications/" + s.id + "/export-link?format=" + d.file)).data;
-        var url = location.origin + link.url;
-        if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank");
+        openUrl(link.url);
       }); });
       document.getElementById("check").addEventListener("click", function () { guard(async function () {
         var fresh = (await api("GET", "/api/procurement/specifications/" + s.id + "/check")).data;

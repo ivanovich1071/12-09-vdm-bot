@@ -154,9 +154,17 @@ class CoreApi:
                 )
             ]
         else:
+            # Подпись файла адресована чату («пришлите его боту»); в Mini App путь
+            # обратно — своя вкладка загрузки, без неё пользователь упирался в
+            # «нечего отправить» (21.09).
+            text = (
+                f"{file.caption}\n"
+                "Заполненный файл можно вернуть прямо здесь: вкладка «Загрузка заказа» "
+                "проверит его по каталогу и соберёт предзаказ."
+            )
             replies = [
                 Message(
-                    file.caption,
+                    text,
                     keyboard=Keyboard().row(Button("Скачать файл", "noop", url=self._remember_file(file.filename, file.content))),
                 )
             ]

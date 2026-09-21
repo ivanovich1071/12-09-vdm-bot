@@ -378,6 +378,8 @@ def test_dialogue_export_action_serves_a_download_link(api):
     replies = body["data"]["responses"]
     assert replies and replies[0]["type"] == "text"
     assert "пришлю в Telegram" not in replies[0]["text"]
+    # Путь обратно — вкладка загрузки мини-приложения, а не чат бота (21.09).
+    assert "Загрузка заказа" in replies[0]["text"]
     buttons = [button for row in replies[0]["actions"] for button in row]
     link = next(button["url"] for button in buttons if button["url"])
     assert link.startswith("/api/downloads/")
