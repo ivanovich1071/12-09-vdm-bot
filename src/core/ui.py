@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from catalog.models import Product
@@ -15,6 +16,16 @@ from catalog.models import Product
 # до 3, если это кнопки-ссылки. Иначе интерфейс разъедется между каналами.
 MAX_BUTTONS_IN_ROW = 7
 MAX_LINK_BUTTONS_IN_ROW = 3
+
+# Markdown консультанта (**жирный**, ____, `код`): Telegram рисует его сам, а виджет
+# и мини-апп показывают текст как есть — 21.09 клиент видел «**2.20 «Кабинет труда»**»
+# со звёздочками. Веб-рендеры снимают разметку этим помощником.
+_MARKDOWN = re.compile(r"\*\*|__|`")
+
+
+def plain_text(text: str) -> str:
+    """Текст без markdown-разметки: для каналов, которые её не рисуют."""
+    return _MARKDOWN.sub("", text or "")
 
 
 @dataclass(frozen=True)
@@ -36,7 +47,20 @@ class Keyboard:
         limit = MAX_LINK_BUTTONS_IN_ROW if any(b.is_link for b in buttons) else MAX_BUTTONS_IN_ROW
         if len(buttons) > limit:
             raise ValueError(f"В ряду не больше {limit} кнопок: {[b.title for b in buttons]}")
-        self.rows.append(list(buttons))
+        # Повтор кнопки (по действию и ссылке) в одной клавиатуре — всегда ошибка
+        # сборки: 21.09 «Связаться с менеджером» стояла в одном сообщении дважды.
+        # Повтор не добавляем, а не падаем: ответ важнее раскладки.
+        fresh = [
+            button
+            for button in buttons
+            if not any(
+                button.action == seen.action and button.url == seen.url
+                for row in self.rows
+                for seen in row
+            )
+        ]
+        if fresh:
+            self.rows.append(fresh)
         return self
 
 

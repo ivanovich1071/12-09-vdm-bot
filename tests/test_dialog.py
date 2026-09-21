@@ -530,3 +530,39 @@ def test_submit_attaches_kit_file_for_the_manager(engine, tmp_path):
     fill_contacts(engine)
     engine.handle_action(USER, CHANNEL, "confirm_order")
     assert sink.extras and sink.extras[0][0][0].endswith(".xlsx")
+
+
+def test_empty_cart_offers_to_repeat_the_last_specification(tmp_path):
+    """Пустая корзина — не тупик: последнюю спецификацию можно собрать заново."""
+    from core_fixtures import procurement_service, products
+
+    storage = Storage(tmp_path / "t.sqlite3")
+    engine = DialogEngine(
+        CatalogIndex(products()),
+        storage,
+        OrderService(storage, JsonlSink(path=tmp_path / "orders.jsonl")),
+        Settings(orders_jsonl_path=str(tmp_path / "orders.jsonl")),
+    )
+    engine.procurement = procurement_service(tmp_path)
+
+    task = engine.procurement.create_task(USER, "telegram", text="Детский сад, по приказу 1057 пункт 1.5.1")
+    selection = engine.procurement.select(task.id, USER)
+    engine.procurement.choose(task.id, USER, [item.product_id for item in selection.items])
+    engine.procurement.build_specification(task.id, USER, None)
+    assert engine.procurement.repository.specifications_of(USER), "спецификация собрана"
+
+    [empty] = engine.handle_action(USER, CHANNEL, "cart")
+    assert "Собрать её заново" in empty.text
+    assert any(button.action == "repeat_last_spec" for row in empty.keyboard.rows for button in row)
+
+    engine.handle_action(USER, CHANNEL, "repeat_last_spec")
+    cart = engine.storage.load_cart(USER)
+    assert cart.count > 0
+
+
+def test_web_render_strips_markdown():
+    """Виджет не рисует markdown: звёздочки модели клиент видеть не должен (21.09)."""
+    from web.render import to_json
+
+    [data] = to_json([Message("раздел **2.20 «Кабинет труда»** и `код`")])
+    assert data["text"] == "раздел 2.20 «Кабинет труда» и код"

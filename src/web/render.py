@@ -17,6 +17,7 @@ from core.ui import (
     ProductCard,
     ProductList,
     Response,
+    plain_text,
     price_text,
     stock_text,
 )
@@ -30,7 +31,7 @@ def _one(response: Response) -> dict[str, Any]:
     keyboard = _keyboard(getattr(response, "keyboard", None))
 
     if isinstance(response, Message):
-        return {"type": "text", "text": response.text, "actions": keyboard}
+        return {"type": "text", "text": plain_text(response.text), "actions": keyboard}
 
     if isinstance(response, ProductCard):
         product = response.product

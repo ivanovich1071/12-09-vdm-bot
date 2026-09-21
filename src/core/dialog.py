@@ -484,6 +484,8 @@ class DialogEngine:
                 return self._show_cart(session)
             case "clear":
                 return self._clear_cart(session)
+            case "repeat_last_spec":
+                return self._repeat_last_spec(session)
             case "restart":
                 return self._confirm_restart()
             case "add_all":
@@ -1250,18 +1252,13 @@ class DialogEngine:
             self._remember(session)
 
     def _offer_menu(self) -> Keyboard:
-        return Keyboard().row(
-            Button("Каталог", "catalog"),
-            Button("Связаться с менеджером", "manager"),
-        ).row(*self._manager_row())
+        return Keyboard().row(Button("Каталог", "catalog"), *self._manager_row())
 
     def _manager_row(self) -> list[Button]:
-        # «Задать вопрос» открывает онлайн-чат заказчика в браузере клиента;
-        # ядро по нажатию ничего не делает ("noop") — ссылку открывает сам Telegram.
-        row = [Button("Связаться с менеджером", "manager")]
-        if self.settings.support_chat_url:
-            row.append(Button("Задать вопрос", "noop", url=self.settings.support_chat_url))
-        return row
+        # Единая функция (решение заказчика 21.09): одна кнопка «Связаться с менеджером».
+        # Онлайн-чат открывается по нажатию (см. `_manager`), а не отдельной кнопкой —
+        # рядом с ней он только путал.
+        return [Button("Связаться с менеджером", "manager")]
 
     def _more(self, session: Session, offset: int) -> list[Response]:
         hits = session.last_hits
@@ -1593,7 +1590,7 @@ class DialogEngine:
     def _show_cart(self, session: Session, replace: bool = False) -> list[Response]:
         cart = self.storage.load_cart(session.user_id)
         if cart.is_empty:
-            return [Message("Корзина пуста.", keyboard=self._main_menu(), replace=replace)]
+            return [self._empty_cart(session, replace)]
 
         # Название товара живёт в тексте, а не в кнопке. В кнопку Telegram влезает
         # десятка два символов, и заказчик видел «1 × Сенсом...» вместо позиции.
@@ -1646,6 +1643,51 @@ class DialogEngine:
         cart.clear()
         self.storage.save_cart(cart)
         return [Message("Корзина очищена.", keyboard=self._main_menu())]
+
+    def _empty_cart(self, session: Session, replace: bool = False) -> Message:
+        """Пустая корзина — не тупик: была спецификация, предложим собрать её заново.
+
+        Корзины каналов разделены (сайт и Telegram — разные пользователи), и «покажи
+        корзину» после собранной в другом канале заявки отвечало тупым «пуста».
+        """
+        specification = self._last_specification(session)
+        if specification is not None:
+            return Message(
+                f"Корзина пуста. Последняя спецификация {specification.id} — "
+                f"{price_text(specification.totals.amount)}. Собрать её заново?",
+                keyboard=Keyboard().row(
+                    Button("Повторить заказ", "repeat_last_spec"),
+                    Button("Меню", "menu"),
+                ),
+                replace=replace,
+            )
+        return Message("Корзина пуста.", keyboard=self._main_menu(), replace=replace)
+
+    def _last_specification(self, session: Session):
+        """Последняя спецификация пользователя; `None` — ядра закупки нет или пусто."""
+        service = self.procurement_service()
+        if service is None:
+            return None
+        try:
+            found = service.repository.specifications_of(session.user_id, limit=1)
+        except Exception as exc:  # повтор заказа не стоит поломки ответа
+            log.warning("Спецификации %s не прочитаны: %s", session.user_id, exc)
+            return None
+        return found[0] if found else None
+
+    def _repeat_last_spec(self, session: Session) -> list[Response]:
+        """Спецификация → корзина: повтор прежнего заказа одним нажатием."""
+        specification = self._last_specification(session)
+        if specification is None:
+            return [Message("Прежних спецификаций нет — скажите, что подобрать.", keyboard=self._main_menu())]
+        chosen = []
+        for item in specification.items:
+            product = self.index.get(item.product_id)
+            if product is not None:
+                chosen.append((product, item.quantity))
+        if chosen:
+            self._add_products(session, chosen)
+        return self._show_cart(session)
 
     # --- Оформление -------------------------------------------------------------
 
@@ -1820,8 +1862,8 @@ class DialogEngine:
         «Связаться с менеджером» — исключение, и стоит отдельной строкой. Заказчик
         просил не спрашивать контакты в начале разговора, но дать возможность
         оставить их в любой момент; в виджете командного меню нет, и без этой
-        кнопки уйти к человеку было неоткуда. Рядом — «Задать вопрос» (онлайн-чат),
-        если SUPPORT_CHAT_URL задан: ссылка открывается в браузере клиента.
+        кнопки уйти к человеку было неоткуда. Онлайн-чат — по нажатию этой кнопки
+        (`_manager`), отдельной кнопки у него больше нет.
         """
         return Keyboard().row(
             Button("Каталог", "catalog"),
@@ -1865,9 +1907,14 @@ class DialogEngine:
         Ночью 16.09 пять диалогов кончились этим сообщением: человек нажимал кнопку,
         получал телефон и уходил, а заявки с составом корзины менеджер не видел.
         Подсказка «/order» текстом в Telegram не нажимается — теперь это кнопка.
+
+        Единая функция (решение заказчика 21.09): кто предпочитает переписку, уходит
+        в онлайн-чат заказчика одной кнопкой здесь же, без отдельной кнопки в меню.
         """
         cart = self.storage.load_cart(session.user_id).count if session is not None else 0
         keyboard = self._main_menu()
+        if self.settings.support_chat_url:
+            keyboard.row(Button("Написать в онлайн-чате", "noop", url=self.settings.support_chat_url))
         if cart:
             keyboard.row(Button("Оформить заявку", "checkout"))
         return [

@@ -62,6 +62,10 @@ _STOPWORDS = {
     "для", "и", "или", "с", "со", "на", "в", "во", "по", "из", "от", "до", "к", "у",
     "что", "как", "нужн", "нужен", "нужна", "надо", "хочу", "подбер", "покажи", "най",
     "мне", "пожалуйст", "это", "весь", "все", "нам",
+    # Слова о каталоге, а не о товаре. Без них «по каталогу подбери…» искало слово
+    # «каталогу», а запасной префиксный проход склеивал «ката-» с «каталкой» —
+    # и на запрос комплектации кабинета труда приезжали прогулочные каталки (21.09).
+    "каталог", "прайс", "ассортимент", "номенклатур",
 }
 
 
@@ -206,7 +210,9 @@ class CatalogIndex:
         elif hits:
             return _diversified(hits)[: query.limit]
 
-        if len(hits) < query.limit and query.text.strip():
+        if len(hits) < query.limit and query.text.strip() and self._content_tokens(query.text):
+            # Запрос из одних служебных слов («каталогу») триграммами не добираем:
+            # товарного слова в нём нет, и «ката-» притянет каталки к слову «каталог».
             for hit in self._by_trigram(query, allowed, seen):
                 hits.append(hit)
                 seen.add(hit.product.sku_1c)
@@ -306,8 +312,12 @@ class CatalogIndex:
             return set(norm_docs.for_audience(query.audience))
         return None
 
+    def _content_tokens(self, text: str) -> list[str]:
+        """Товарные слова запроса: без стоп-слов о задаче и каталоге."""
+        return [token for token in stems(text) if token not in _STOPWORDS]
+
     def _by_text(self, query: SearchQuery, allowed: set[int]) -> list[SearchHit]:
-        tokens = [token for token in stems(query.text) if token not in _STOPWORDS]
+        tokens = self._content_tokens(query.text)
         if not tokens:
             return []
         # «Спортзал» в каталоге называется «спортивный зал», «мастерская» —

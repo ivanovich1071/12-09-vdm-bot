@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.ui import Keyboard, Message, OrderSummary, ProductCard, ProductList, Response
+from core.ui import Keyboard, Message, OrderSummary, ProductCard, ProductList, Response, plain_text
 
 
 def responses(items: list[Response]) -> list[dict[str, Any]]:
@@ -18,7 +18,7 @@ def responses(items: list[Response]) -> list[dict[str, Any]]:
 def _one(response: Response) -> dict[str, Any]:
     actions = _keyboard(getattr(response, "keyboard", None))
     if isinstance(response, Message):
-        return {"type": "text", "text": response.text, "actions": actions, "replace": response.replace}
+        return {"type": "text", "text": plain_text(response.text), "actions": actions, "replace": response.replace}
     if isinstance(response, ProductCard):
         return {
             "type": "product",

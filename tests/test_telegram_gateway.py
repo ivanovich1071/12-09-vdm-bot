@@ -203,31 +203,35 @@ ALLOWED = {
 }
 
 
-# --- Кнопка «Задать вопрос» (онлайн-чат заказчика, SUPPORT_CHAT_URL) ------------
+# --- Единая функция «Связаться с менеджером» (онлайн-чат заказчика, SUPPORT_CHAT_URL) ---
 
 CHAT_URL = "https://vdmmsk.bitrix24.ru/online/chat"
 
 
-def test_support_chat_button_in_main_menu(tmp_path):
-    """URL задан — в главном меню появляется кнопка со ссылкой на чат."""
+def test_support_chat_opens_from_the_manager_button(tmp_path):
+    """Одна кнопка в меню, а онлайн-чат предлагается по нажатию (решение заказчика 21.09)."""
     api = build(tmp_path, support_chat_url=CHAT_URL)
     gateway = TelegramGateway(api.core, 20 * 1024 * 1024)
-    [reply] = gateway.action(USER, "menu")
+    [menu] = gateway.action(USER, "menu")
+    titles = [button.title for row in menu.keyboard.rows for button in row]
+    assert titles.count("Связаться с менеджером") == 1, "кнопка менеджера в меню одна"
+    assert all(title != "Задать вопрос" for title in titles)
+    [reply] = gateway.action(USER, "manager")
     chat = [
         button
         for row in reply.keyboard.rows
         for button in row
-        if button.title == "Задать вопрос"
+        if button.title == "Написать в онлайн-чате"
     ]
     assert chat and chat[0].url == CHAT_URL and chat[0].action == "noop"
 
 
-def test_support_chat_button_hidden_without_url(env):
-    """URL пуст (как по умолчанию) — меню в точности прежнее, лишней кнопки нет."""
+def test_support_chat_hidden_without_url(env):
+    """URL пуст (как по умолчанию) — ответ менеджеру в точности прежний, лишней кнопки нет."""
     _, gateway = env
-    [reply] = gateway.action(USER, "menu")
+    [reply] = gateway.action(USER, "manager")
     assert all(
-        button.title != "Задать вопрос"
+        button.title != "Написать в онлайн-чате"
         for row in reply.keyboard.rows
         for button in row
     )
@@ -237,10 +241,19 @@ def test_support_chat_button_renders_as_url_button(tmp_path):
     """Telegram получает кнопку-ссылку: открытие чата делает клиент, не бот."""
     api = build(tmp_path, support_chat_url=CHAT_URL)
     gateway = TelegramGateway(api.core, 20 * 1024 * 1024)
-    [reply] = gateway.action(USER, "menu")
+    [reply] = gateway.action(USER, "manager")
     markup = to_markup(reply.keyboard)
     urls = [button.url for row in markup.inline_keyboard for button in row if button.url]
     assert CHAT_URL in urls
+
+
+def test_keyboard_drops_repeated_buttons():
+    """Повтор кнопки в одной клавиатуре не добавляется дважды (21.09: дубль менеджера)."""
+    keyboard = Keyboard().row(Button("Каталог", "catalog"), Button("Связаться с менеджером", "manager"))
+    keyboard.row(Button("Связаться с менеджером", "manager"), Button("Меню", "menu"))
+    flattened = [button.action for row in keyboard.rows for button in row]
+    assert flattened.count("manager") == 1
+    assert flattened == ["catalog", "manager", "menu"]
 
 
 def test_gateway_has_no_business_logic_dependencies():

@@ -565,3 +565,18 @@ def test_engine_exposes_catalog_service(products, tmp_path, monkeypatch):
     # Прежний поиск работает как раньше и о новом слое не знает.
     legacy = engine.index.search(SearchQuery(text="мяч"))
     assert "BALL1" in {hit.product.sku_1c for hit in legacy}
+
+
+def test_catalog_word_is_not_a_product_query():
+    """«По каталогу подбери…» — слово о каталоге, а не о товаре (21.09).
+
+    Раньше «каталогу» уходило в поиск, запасной префиксный проход склеивал
+    «ката-» с «каталкой», и на запрос комплектации приезжали прогулочные каталки.
+    """
+    from core_fixtures import GROUP_23
+    from core_fixtures import raw as fixture_raw
+
+    index = CatalogIndex([Product.from_dict(fixture_raw("G23", "Каталка для прогулки", [GROUP_23]))])
+    assert index.search(SearchQuery(text="каталка", limit=5)), "товар сам по себе находится"
+    assert not index.search(SearchQuery(text="каталогу", limit=5))
+    assert not index.search(SearchQuery(text="по каталогу подбери всё", limit=5))
