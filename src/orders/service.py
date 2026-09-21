@@ -81,11 +81,13 @@ class OrderService:
         self.storage = storage
         self.sink = sink
 
-    def submit(self, cart: Cart, customer: Customer, channel: str) -> Order:
+    def submit(self, cart: Cart, customer: Customer, channel: str, extras: list[tuple[str, bytes]] | None = None) -> Order:
         """Создаёт заказ и пытается отправить.
 
         Согласие проверяется здесь, а не в адаптере: канал не должен уметь обходить
-        это правило.
+        это правило. `extras` — дополнительные вложения письма менеджеру (полный
+        перечень приказа): они живут только в письме и при повторной доставке
+        не восстанавливаются.
         """
         consent_id = self.storage.active_consent(cart.user_id)
         if consent_id is None:
@@ -98,7 +100,7 @@ class OrderService:
 
         order = Order.create(cart, customer, channel, consent_id)
         self.storage.save_order(order)
-        self._deliver(order)
+        self._deliver(order, extras or [])
         cart.clear()
         self.storage.save_cart(cart)
         return order
@@ -113,10 +115,10 @@ class OrderService:
                 sent += 1
         return sent
 
-    def _deliver(self, order: Order) -> bool:
+    def _deliver(self, order: Order, extras: list[tuple[str, bytes]] = ()) -> bool:
         order.delivery_attempts += 1
         try:
-            self.sink.push(order)
+            self.sink.push(order, extras)
         except Exception as exc:
             order.status = "failed"
             order.last_error = str(exc)

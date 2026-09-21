@@ -4,8 +4,9 @@ import pytest
 
 from catalog.models import Product
 from catalog.search import CatalogIndex
+from core import intent
 from core.config import Settings
-from core.dialog import CHECKOUT_FIELDS, DialogEngine
+from core.dialog import CART_PREVIEW_LINES, CHECKOUT_FIELDS, DialogEngine
 from core.storage import Storage
 from core.ui import Message, OrderSummary, ProductList
 from orders.service import OrderService
@@ -398,3 +399,134 @@ def test_order_cart_counts_lines_like_the_preview(engine):
     assert "2 из 3" in replies[0].text
     cart = engine.storage.load_cart(USER)
     assert cart.count == 2 and len(cart.items) == 1
+
+
+# --- 21.09: полный перечень, а не коды из обрезанного ответа ---------------------------------
+
+
+def kit(session, positions):
+    session.profile.remember_kit(
+        {"document": "order_838", "code": "2.20", "title": "Кабинет труда", "positions": positions}
+    )
+
+
+def test_full_kit_goes_to_cart_not_just_surviving_codes(engine):
+    """«По этому списку сформируй предзаказ по 1 шт»: перечень из профиля целиком.
+
+    21.09 комплектация логопеда на 88 позиций собралась восемью: ответ бота обрезан
+    до 2500 знаков, и только уцелевшие коды доехали до корзины.
+    """
+    session = engine.session(USER, CHANNEL)
+    kit(
+        session,
+        [
+            {"code": "2.20.63", "title": "Фрезерный станок"},
+            {"code": "1.7.11", "title": "Мяч баскетбольный"},
+            {"code": "2.20.99", "title": "В каталоге товара нет"},
+        ],
+    )
+    replies = engine.checkout_by_intent(
+        session, "по этому списку сформируй предзаказ по 1 шт по каждой позиции"
+    )
+    cart = engine.storage.load_cart(USER)
+    assert {item.sku_1c for item in cart.items} == {"S1", "S2"}
+    assert "из 3" in replies[0].text
+    assert "Без позиций остались пункты 2.20.99" in replies[0].text
+
+
+def test_kit_used_only_while_it_is_the_last_thing_shown(engine):
+    """Устаревшей комплектацией корзину не наполняем: после неё показывали другое."""
+    session = engine.session(USER, CHANNEL)
+    kit(session, [{"code": "2.20.63", "title": "Фрезерный станок"}])
+    session.profile.export = "order"
+    engine.checkout_by_intent(session, "оформи предзаказ")
+    assert engine.storage.load_cart(USER).is_empty
+
+
+def test_cart_citation_names_the_requested_point(tmp_path):
+    """Основание позиции в корзине — запрошенный пункт, а не выбор по релевантности.
+
+    21.09 песочница, взятая по пункту 1.13.3.2.3, уехала в заявку с подписью 1.13.2.3.6.
+    """
+    multi = product(
+        "M1",
+        "Интерактивная песочница",
+        5000,
+        norms=["2.20.63", "1.7.11"],
+    )
+    index = CatalogIndex([multi])
+    storage = Storage(tmp_path / "t.sqlite3")
+    engine = DialogEngine(
+        index,
+        storage,
+        OrderService(storage, JsonlSink(path=tmp_path / "orders.jsonl")),
+        Settings(orders_jsonl_path=str(tmp_path / "orders.jsonl")),
+    )
+    session = engine.session(USER, CHANNEL)
+    engine.checkout_by_intent(session, "1.7.11 мяч — сформируй предзаказ по 1 шт")
+    cart = engine.storage.load_cart(USER)
+    assert cart.count == 1
+    assert "позиция 1.7.11" in (cart.items[0].norm_citation or "")
+
+
+def test_complaint_about_positions_is_not_a_checkout_request():
+    """«Проверь, ты выдаешь предзаказ только на 8 позиций» — вопрос, а не «оформить»."""
+    assert not intent.asks_checkout(
+        "в полном списке в файле 88 позиций - проверь , ты выдаешь предзаказ только на 8 позиций"
+    )
+    assert not intent.asks_checkout("почему предзаказ не на все позиции")
+    assert intent.asks_checkout("сформируй предзаказ по 1 шт по каждой позиции")
+    assert not intent.asks_order_checkout("проверь заказ, тут не всё")
+    assert intent.asks_order_checkout("оформи всё из файла, все позиции по 1 шт")
+
+
+def test_wizard_does_not_take_questions_as_data(engine):
+    """Вопрос посреди анкеты названием организации не становится."""
+    engine.handle_action(USER, CHANNEL, "add:S1")
+    engine.handle_action(USER, CHANNEL, "checkout")
+    engine.handle_action(USER, CHANNEL, "consent_yes")
+    replies = engine.handle_text(USER, CHANNEL, "а можно доставку в другой регион?")
+    assert engine.session(USER, CHANNEL).customer.organization == ""
+    assert any("Шаг 1" in r.text for r in replies if isinstance(r, Message))
+
+
+def test_cart_preview_caps_lines(tmp_path):
+    """Полная комплектация — до сотни строк: в превью первые, остальное — словами."""
+    storage = Storage(tmp_path / "t.sqlite3")
+    engine = DialogEngine(
+        CatalogIndex([product(f"P{i}", f"Товар {i}", 100) for i in range(25)]),
+        storage,
+        OrderService(storage, JsonlSink(path=tmp_path / "orders.jsonl")),
+        Settings(orders_jsonl_path=str(tmp_path / "orders.jsonl")),
+    )
+    for i in range(25):
+        engine.handle_action(USER, CHANNEL, f"add:P{i}")
+    summary = engine.handle_action(USER, CHANNEL, "cart")[0]
+    assert isinstance(summary, OrderSummary)
+    assert len(summary.lines) == CART_PREVIEW_LINES
+    assert "ещё 5" in (summary.note or "")
+    assert summary.total == 2500
+
+
+class RecordingSink:
+    name = "recording"
+
+    def __init__(self):
+        self.extras = []
+
+    def push(self, order, extras=()):
+        self.extras.append(list(extras))
+
+
+def test_submit_attaches_kit_file_for_the_manager(engine, tmp_path):
+    """Заявка менеджеру несёт файл полного перечня, а не только позиции из корзины."""
+    sink = RecordingSink()
+    engine.orders = OrderService(engine.storage, sink)
+    session = engine.session(USER, CHANNEL)
+    kit(session, [{"code": "2.20.63", "title": "Фрезерный станок"}])
+    engine.handle_action(USER, CHANNEL, "add:S1")
+    engine.handle_action(USER, CHANNEL, "checkout")
+    engine.handle_action(USER, CHANNEL, "consent_yes")
+    fill_contacts(engine)
+    engine.handle_action(USER, CHANNEL, "confirm_order")
+    assert sink.extras and sink.extras[0][0][0].endswith(".xlsx")

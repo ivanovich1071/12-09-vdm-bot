@@ -214,6 +214,11 @@ class Session:
 OFFERED_TO_CART = 3
 # Сколько пунктов перечня разбираем за одно «оформить»: комплектация спортзала — два десятка.
 POINTS_TO_CART = 40
+# Сколько кандидатов-замен показываем в сообщении: полный список длиннее пары строк
+# превращает ответ в простыню (21.09: у комплектации логопеда 6+ кандидатов на 88 пунктов).
+REVIEW_TO_SHOW = 5
+# Строк корзины в превью: сообщения Telegram длиннее 4096 знаков не уходят.
+CART_PREVIEW_LINES = 20
 
 
 class DialogEngine:
@@ -912,18 +917,30 @@ class DialogEngine:
                 chosen.append((product, quantity))
         return self._add_products(session, chosen)
 
-    def _add_products(self, session: Session, chosen: list[tuple[Product, int]]) -> tuple[int, Cart]:
+    def _add_products(
+        self, session: Session, chosen: list[tuple[Product, int]],
+        norm_codes: dict[str, str] | None = None,
+    ) -> tuple[int, Cart]:
         """Товары в корзину, у каждого своё количество.
 
         Что уже лежит в корзине, не удваивается: «оформить» человек пишет и после того, как
         сам добавил позицию кнопкой.
+
+        `norm_codes` — запрошенный пункт для каждого товара: в основании позиции пишем именно
+        его, а не выбор `product.norm_for()` по релевантности. 21.09 песочница, взятая по
+        пункту 1.13.3.2.3, уехала в заявку с чужой подписью 1.13.2.3.6 — у товара несколько
+        привязок, и релевантность выбрала не ту.
         """
         cart = self.storage.load_cart(session.user_id)
         added = 0
         for product, quantity in chosen:
             if cart.find(product.sku_1c) is not None:
                 continue
-            norm = product.norm_for(session.profile.audience, session.profile.room or "")
+            norm = None
+            if norm_codes and (wanted := norm_codes.get(product.sku_1c)):
+                norm = next((ref for ref in product.norms if ref.item_code == wanted), None)
+            if norm is None:
+                norm = product.norm_for(session.profile.audience, session.profile.room or "")
             cart.add(
                 CartItem(
                     sku_1c=product.sku_1c,
@@ -941,8 +958,9 @@ class DialogEngine:
         return added, cart
 
     def _points_to_products(
-        self, session: Session, points: list[tuple[str, int | None]], each: int | None
-    ) -> tuple[list[tuple[Product, int]], list[str], list[tuple[str, Product]]]:
+        self, session: Session, points: list[tuple[str, int | None]], each: int | None,
+        limit: int = POINTS_TO_CART,
+    ) -> tuple[list[tuple[Product, int]], list[str], list[tuple[str, Product]], dict[str, str]]:
         """Пункты перечня — в позиции каталога: по одному товару на пункт, в порядке перечня.
 
         Пункт — это норма, а не товар: под ним в каталоге бывает несколько позиций. Берём ту,
@@ -954,12 +972,19 @@ class DialogEngine:
         приказа (`catalog.points`), но в корзину не попадает: подобранное по формулировке —
         замена без выбора клиента, и 19.09 такая замена увезла в предзаказ игровой лабиринт
         вместо модульного пола. Кандидаты возвращаются отдельно — показываем и спрашиваем.
+
+        Полной комплектации из профиля (`profile.kit`) лимит не нужен: там все позиции раздела,
+        их не больше сотни, и человек попросил «по 1 шт. по каждой позиции».
+
+        Возвращает также карту «код 1С → запрошенный пункт»: основание позиции в корзине —
+        именно этот пункт, а не выбор по релевантности.
         """
         finder = self.point_finder(session)
         chosen: list[tuple[Product, int]] = []
         missing: list[str] = []
         review: list[tuple[str, Product]] = []
-        for code, quantity in points[:POINTS_TO_CART]:
+        codes: dict[str, str] = {}
+        for code, quantity in points[:limit]:
             found = finder.find(code)
             if found is None:
                 missing.append(code)
@@ -968,7 +993,8 @@ class DialogEngine:
                 review.append((code, found.product))
                 continue
             chosen.append((found.product, each or quantity or 1))
-        return chosen, missing, review
+            codes[found.product.sku_1c] = code
+        return chosen, missing, review, codes
 
     def point_finder(self, session: Session) -> PointFinder:
         """Поиск товара по пункту перечня для одной операции: словарь названий строится один раз."""
@@ -994,8 +1020,9 @@ class DialogEngine:
         комплектацию спортзала пунктами приказа и написал «сформируй предзаказ» — ответом было
         «корзина пуста»: ядро искало показанные карточки, а разговор шёл о пунктах перечня.
 
-        Порядок источников: пункты из самой реплики, показанные позиции, пункты из последнего
-        ответа бота (человек пишет «оформи» сразу под присланной комплектацией).
+        Порядок источников: пункты из самой реплики, построенная комплектация целиком
+        (`profile.kit` — она не обрезана, в отличие от последнего ответа бота), показанные
+        позиции, пункты из последнего ответа бота.
         """
         cart = self.storage.load_cart(session.user_id)
         if not cart.is_empty:
@@ -1004,10 +1031,24 @@ class DialogEngine:
         each = intent.each_quantity(text)
         shown = profile.shortlist or profile.offered[-OFFERED_TO_CART:]
         points = intent.listed_points(text)
-        if not points and not shown:
+        kit_points: list[tuple[str, int | None]] = []
+        if not points and profile.kit and profile.export == "kit":
+            # «По этому списку сформируй предзаказ по 1 шт. по каждой позиции»: полный перечень
+            # лежит в профиле, а последний ответ бота обрезан до 2500 знаков, и из него
+            # выживают единичные коды — 21.09 комплектация логопеда на 88 позиций собралась
+            # восемью.
+            kit_points = [
+                (position["code"], None)
+                for position in profile.kit.get("positions") or []
+                if position.get("code")
+            ]
+        if not points and not kit_points and not shown:
             points = intent.listed_points(self._last_answer(session))
-        if points:
-            chosen, missing, review = self._points_to_products(session, points, each)
+        if points or kit_points:
+            source = kit_points or points
+            chosen, missing, review, codes = self._points_to_products(
+                session, source, each, limit=len(source) if kit_points else POINTS_TO_CART
+            )
             profile.review = [product.sku_1c for _, product in review]
             if not chosen and not review:
                 answer = self._nothing_to_checkout(missing)
@@ -1017,15 +1058,20 @@ class DialogEngine:
             lines: list[str] = []
             keyboard = Keyboard()
             if chosen:
-                added, cart = self._add_products(session, chosen)
+                added, cart = self._add_products(session, chosen, norm_codes=codes)
                 lines.append(
                     f"Собрал корзину по перечню: {added} "
-                    f"{plural(added, 'позиция', 'позиции', 'позиций')}, по одной на пункт. "
-                    f"В корзине {cart.count} шт. на {price_text(cart.total)}."
+                    f"{plural(added, 'позиция', 'позиции', 'позиций')}"
+                    + (f" из {len(source)}" if len(missing) + len(review) else "")
+                    + ". В корзине "
+                    f"{cart.count} шт. на {price_text(cart.total)}."
                 )
                 keyboard.row(Button("Моя корзина", "cart"), Button("Оформить", "checkout"))
             if review:
-                candidates = "; ".join(f"«{product.name}» (п. {code})" for code, product in review)
+                shown_review = review[:REVIEW_TO_SHOW]
+                candidates = "; ".join(f"«{product.name}» (п. {code})" for code, product in shown_review)
+                if len(review) > len(shown_review):
+                    candidates += f" и ещё {len(review) - len(shown_review)}"
                 lines.append(
                     ("Точной привязки в каталоге нет у: " if chosen else "По формулировке приказа подобралось: ")
                     + candidates
@@ -1552,8 +1598,12 @@ class DialogEngine:
         # Название товара живёт в тексте, а не в кнопке. В кнопку Telegram влезает
         # десятка два символов, и заказчик видел «1 × Сенсом...» вместо позиции.
         # Кнопки теперь короткие и пронумерованы так же, как строки списка.
+        # Полная комплектация — это до сотни строк: в превью помещаются первые
+        # (лимит сообщения в Telegram — 4096 знаков), весь состав уходит менеджеру
+        # и в файле.
+        visible = cart.items[:CART_PREVIEW_LINES]
         keyboard = Keyboard()
-        for number, item in enumerate(cart.items, 1):
+        for number, item in enumerate(visible, 1):
             keyboard.row(
                 Button(f"{number} −", f"dec:{item.sku_1c}"),
                 Button(f"{number}: {item.quantity} шт.", "noop"),
@@ -1562,9 +1612,16 @@ class DialogEngine:
             )
         keyboard.row(Button("Оформить заказ", "checkout"), Button("Очистить", "clear"))
 
-        note = None
+        notes = []
+        if len(cart.items) > len(visible):
+            hidden = len(cart.items) - len(visible)
+            notes.append(
+                f"… и ещё {hidden} {plural(hidden, 'позиция', 'позиции', 'позиций')} — "
+                "полный состав уйдёт менеджеру и в файле."
+            )
         if any(item.price is None for item in cart.items):
-            note = "По части позиций цена уточняется — менеджер пришлёт её при подтверждении."
+            notes.append("По части позиций цена уточняется — менеджер пришлёт её при подтверждении.")
+        note = " ".join(notes) or None
         return [
             OrderSummary(
                 lines=[
@@ -1575,7 +1632,7 @@ class DialogEngine:
                         sku_1c=item.sku_1c,
                         norm_citation=item.norm_citation,
                     )
-                    for item in cart.items
+                    for item in visible
                 ],
                 total=cart.total,
                 note=note,
@@ -1636,6 +1693,17 @@ class DialogEngine:
         if value and _CONTACT_NOISE.match(value):
             # Кнопки и меню данными не становятся — переспрашиваем тот же шаг.
             return self._ask_contact(session, step)
+        if value and intent.asks_about_order(value):
+            # Вопрос посреди анкеты («а можно доставку в другой регион?») названием
+            # организации не становится: шаг переспрашивается, реплика — на совести
+            # консультанта, а анкета не портится.
+            return [
+                Message(
+                    "Сначала закончим оформление — или нажмите «Отменить», и я отвечу на вопрос.",
+                    keyboard=Keyboard().row(Button("Отменить", "cancel")),
+                ),
+                *self._ask_contact(session, step),
+            ]
         if field_name == "phone" and value and not _CONTACT_PHONE.search(value):
             return [
                 Message(
@@ -1683,8 +1751,15 @@ class DialogEngine:
 
     def _submit(self, session: Session) -> list[Response]:
         cart = self.storage.load_cart(session.user_id)
+        # Комплектация из перечня уходит менеджеру целиком: в корзине только позиции с
+        # товарами, а менеджеру нужен весь список приказа, чтобы подобрать остальное.
+        extras: list[tuple[str, bytes]] = []
+        if session.profile.kit:
+            file = exports.build(self, session, exports.EXCEL)
+            if file is not None:
+                extras.append((file.filename, file.content))
         try:
-            order = self.orders.submit(cart, session.customer, session.channel)
+            order = self.orders.submit(cart, session.customer, session.channel, extras=extras or None)
         except PermissionError:
             return self._start_checkout(session)
         except ValueError as exc:

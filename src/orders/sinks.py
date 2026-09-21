@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -86,8 +87,12 @@ def order_rows(order: Order) -> list[list[str]]:
 class OrderSink(Protocol):
     name: str
 
-    def push(self, order: Order) -> None:
-        """Отправить заказ. Исключение означает «повторить позже»."""
+    def push(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()) -> None:
+        """Отправить заказ. Исключение означает «повторить позже».
+
+        `extras` — вложения сверх стандартной спецификации (полный перечень приказа):
+        письму — файлы, приёмникам-журналам они не нужны.
+        """
         ...
 
 
@@ -98,7 +103,7 @@ class JsonlSink:
     path: Path = Path("data/orders.jsonl")
     name: str = "jsonl"
 
-    def push(self, order: Order) -> None:
+    def push(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as fh:
             for row in order_rows(order):
@@ -122,7 +127,7 @@ class XlsxSink:
     directory: Path = Path("data/orders")
     name: str = "xlsx"
 
-    def push(self, order: Order) -> None:
+    def push(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         target = self.directory / f"{order.id}.xlsx"
         _write_xlsx(target, HEADERS, order_rows(order))
@@ -209,7 +214,7 @@ class GoogleSheetsSink:
     worksheet: str = "Заказы"
     name: str = "google_sheets"
 
-    def push(self, order: Order) -> None:
+    def push(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()) -> None:
         sheet = self._worksheet()
         if not sheet.acell("A1").value:
             sheet.append_row(HEADERS, value_input_option="RAW")
@@ -248,12 +253,12 @@ class SmtpSink:
     timeout: float = 30.0
     name: str = "smtp"
 
-    def push(self, order: Order) -> None:
+    def push(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()) -> None:
         if not self.host or not self.to:
             raise RuntimeError("Почтовый приёмник не настроен: нужны SMTP_HOST и ORDER_EMAIL_TO")
-        self._send(self.message(order))
+        self._send(self.message(order, extras))
 
-    def message(self, order: Order):  # noqa: ANN201 — email.message.EmailMessage
+    def message(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()):  # noqa: ANN201 — email.message.EmailMessage
         from email.message import EmailMessage
 
         count = len(order.items)
@@ -264,13 +269,24 @@ class SmtpSink:
         )
         message["From"] = self.sender or self.user
         message["To"] = self.to
-        message.set_content(self._body(order))
+        body = self._body(order)
+        if extras:
+            names = ", ".join(filename for filename, _ in extras)
+            body += f"\nПолный перечень по приказу — во вложении: {names}.\n"
+        message.set_content(body)
         message.add_attachment(
             order_xlsx(order),
             maintype="application",
             subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             filename=f"{order.id}.xlsx",
         )
+        for filename, content in extras:
+            message.add_attachment(
+                content,
+                maintype="application",
+                subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename=filename,
+            )
         return message
 
     @staticmethod
@@ -328,7 +344,7 @@ class Bitrix24Sink:
     webhook_url: str
     name: str = "bitrix24"
 
-    def push(self, order: Order) -> None:
+    def push(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()) -> None:
         raise NotImplementedError(
             "Интеграция с Битрикс24 не включена: нужен вебхук и согласованный состав "
             "полей сделки. До этого заказы уходят в Google Sheets."
@@ -346,12 +362,12 @@ class CompositeSink:
     sinks: list[OrderSink]
     name: str = "composite"
 
-    def push(self, order: Order) -> None:
+    def push(self, order: Order, extras: Sequence[tuple[str, bytes]] = ()) -> None:
         errors: list[str] = []
         delivered = False
         for sink in self.sinks:
             try:
-                sink.push(order)
+                sink.push(order, extras)
                 delivered = True
             except Exception as exc:
                 errors.append(f"{sink.name}: {exc}")

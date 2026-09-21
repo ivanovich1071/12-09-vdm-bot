@@ -274,15 +274,38 @@ _CHECKOUT = re.compile(
 )
 
 
+# Разговор О заказе, а не заказ: «в файле 88 позиций - проверь, ты выдаешь предзаказ только
+# на 8» содержит слово «предзаказ», но оформлять не просит. 21.09 такая реплика запускала
+# визард анкеты вместо ответа консультанта — вопрос клиента так и остался без ответа.
+_META_TALK = re.compile(
+    r"почему|зачем|провер\w*|перепровер\w*|исправ\w*|ошибк\w*|глюч\w*|\bбаг\w*|непонятн\w*|"
+    r"что\s+за\s|дубл\w*|ты\s+(?:выда\w*|присыл\w*|собрал|неправ)",
+    re.IGNORECASE,
+)
+
+
 def asks_checkout(text: str) -> bool:
     """Просьба оформить заказ — без присланного файла (`asks_order_checkout` — по нему)."""
     plain = (text or "").lower().replace("ё", "е")
-    return "?" not in plain and bool(_CHECKOUT.search(plain))
+    return "?" not in plain and not _META_TALK.search(plain) and bool(_CHECKOUT.search(plain))
 
 
 def asks_order_checkout(text: str) -> bool:
     """Просьба оформить или положить в корзину — по присланному заказу, если он есть."""
-    return bool(_ORDER_CHECKOUT.search(text or "") or _EACH_QUANTITY.search(text or ""))
+    plain = (text or "").lower().replace("ё", "е")
+    return not _META_TALK.search(plain) and bool(
+        _ORDER_CHECKOUT.search(plain) or _EACH_QUANTITY.search(plain)
+    )
+
+
+def asks_about_order(text: str) -> bool:
+    """Вопрос или претензия о заказе: данными анкеты такая реплика не становится.
+
+    «А можно доставку в другой регион?» посреди оформления — вопрос, а не название
+    организации; анкета переспрашивает свой шаг, а не глотает реплику.
+    """
+    plain = (text or "").lower().replace("ё", "е")
+    return "?" in plain or bool(_META_TALK.search(plain))
 
 
 # Сроки и график поставок. Ночью 16.09 это самый частый вопрос без ответа: «сколько по
