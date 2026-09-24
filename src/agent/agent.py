@@ -483,6 +483,35 @@ class SalesAgent:
         if by_code:
             return _unique([sku for sku in by_code if not _rejected(answer, sku)])
 
+        # Пункты перечня, названные в ответе: товар с другим пунктом к перечислению
+        # отношения не имеет. 23.09 карточка «Ящик для игрушек Моби» (1.14.2.2.3)
+        # приходила под списком пунктов 1.14.5.1.1-3 (сц. 1), кукольная мебель — под
+        # спальней (сц. 8).
+        cited = _cited_codes(answer)
+
+        def _cited_or_uncoded(product) -> bool:  # noqa: ANN001 — catalog.models.Product
+            code = _name_code(product.name)
+            if not code or not cited:
+                return True
+            return any(
+                code == want or code.startswith(f"{want}.") or want.startswith(f"{code}.") for want in cited
+            )
+
+        # Артикул поставщика в ответе («EKUD 0335», «0321/1Т») — точное совпадение с
+        # названием. 23.09 после списка «первые три: 0321/1Т, 0335, 0420» приходили
+        # карточки EKUD 0306 и 0321 инд. — двух из трёх не было в списке (сц. 12).
+        answer_marks = _marks(answer)
+        by_mark = [
+            sku
+            for sku in _unique(tools.shown_skus)
+            if (product := self.engine.index.get(sku)) is not None
+            and _marks(product.name) & answer_marks
+            and _cited_or_uncoded(product)
+            and not _rejected(answer, product.name)
+        ]
+        if by_mark:
+            return by_mark
+
         words = _significant(answer)
         pairs = {(words[i], words[i + 1]) for i in range(len(words) - 1)}
         matched = []
@@ -496,6 +525,8 @@ class SalesAgent:
             # демонстрационный». Пункт не назван в ответе — товар не он.
             code = _name_code(product.name)
             if code and not names_code(answer, code):
+                continue
+            if not _cited_or_uncoded(product):
                 continue
             # Модель бывает права, отказывая: 01.09 она сама выяснила, что код
             # 45892 — игрушечный бронемобиль, честно об этом написала, а карточка
@@ -531,8 +562,24 @@ class SalesAgent:
 
     def _section_products(self, tools: ToolBox, answer: str) -> list:
         """Позиции каталога из тех же разделов перечня, что названы в ответе."""
+        wanted = _cited_codes(answer)
+        # Сначала — точные совпадения с названными пунктами: текст и карточки должны
+        # быть про один и тот же список. 23.09 на «первые три пункта 1.14.5.1.1-3»
+        # блок «Что по этим пунктам есть в каталоге» брал первые три товара раздела —
+        # и карточки расходились со списком (сц. 1, 7, 12).
+        exact = []
+        for sku in _unique(tools.shown_skus):
+            product = self.engine.index.get(sku)
+            code = _name_code(product.name) if product is not None else ""
+            if code and any(
+                code == want or code.startswith(f"{want}.") or want.startswith(f"{code}.") for want in wanted
+            ):
+                exact.append(product)
+        if exact:
+            return exact[:CARDS_SHOWN]
+
         sections = set()
-        for code, _ in listed_codes(answer):
+        for code in wanted:
             parts = code.split(".")
             section = ".".join(parts[:-1]) if len(parts) > 2 else code
             if section.count(".") >= 1:
@@ -1213,6 +1260,14 @@ def _rejected(answer: str, needle: str) -> bool:
 # Код перечня в начале названия товара: «2.14.106 Установка для изучения фотоэффекта».
 _NAME_CODE = re.compile(r"^\s*(\d{1,2}(?:\.\d{1,3}){1,5})\s")
 _CATALOG_BLOCK = "Что по этим пунктам есть в каталоге:"
+# Пункт перечня в любом месте ответа: «первые три — 1.14.5.1.1-3». Точка в конце
+# предложения коду не мешает, дата «25.12.2024» кодом не считается.
+_CITED_CODE = re.compile(r"(?<![\d.])\d{1,2}(?:\.\d{1,3}){2,5}(?!\d|\.\d)")
+
+
+def _cited_codes(answer: str) -> list[str]:
+    """Пункты перечня, названные в ответе, — в любом месте текста."""
+    return _CITED_CODE.findall(answer or "")
 
 
 def _name_code(name: str) -> str:
@@ -1241,12 +1296,19 @@ def _named_in(name: str, words: list[str], pairs: set[tuple[str, str]]) -> bool:
     return any((own[i], own[i + 1]) in pairs for i in range(len(own) - 1))
 
 
-# Артикул поставщика в названии: «Д-214», «С-913», «У1076», «KF0015». Цифры отдельно — не артикул.
-_MARK = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])[A-Za-zА-Яа-яЁё]{1,4}-?\d{2,6}(?![0-9A-Za-zА-Яа-яЁё])")
+# Артикул поставщика в названии: «Д-214», «С-913», «У1076», «KF0015», «EKUD 0335»,
+# «0321/1Т». Цифры отдельно — не артикул. Буквы с цифрами через пробел — артикул
+# поставщика: «EKUD 0335» из ответа должен находить товар «EKUD 0335 "Лесенка-4"».
+_MARK = re.compile(
+    r"(?<![0-9A-Za-zА-Яа-яЁё])"
+    r"(?:[A-Za-zА-Яа-яЁё]{1,6}\s?-?\d{2,6}(?:/\d{1,2}[A-Za-zА-Яа-яЁё]?)?|\d{3,6}/\d{1,2}[A-Za-zА-Яа-яЁё]?)"
+    r"(?![0-9A-Za-zА-Яа-яЁё])",
+    re.IGNORECASE,
+)
 
 
 def _marks(text: str) -> set[str]:
-    return {mark.replace("-", "").lower() for mark in _MARK.findall(text or "")}
+    return {re.sub(r"[\s-]+", "", mark).lower() for mark in _MARK.findall(text or "")}
 
 
 def _marks_agree(name: str, answer: str) -> bool:

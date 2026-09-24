@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from agent.agent import SalesAgent as _SalesAgent
 from agent.agent import _about_deadline_only, _without_codes
 from agent.routing import _also_asks_other, _asks_export
 from agent.tools import ToolBox
@@ -306,3 +309,78 @@ def test_article_survives_query_from_text():
     """Раньше query_from_text выбрасывал цифры — «артикул 12345» искался как «артикул»."""
     assert "12345" in query_from_text("Есть ли в наличии артикул 12345?")
     assert query_from_text("нужны мячи для спортзала, дети 3-4 лет") == "мячи"
+
+
+# --- Пакет E: карточки соответствуют списку в ответе ------------------------------------------
+
+
+def _product(sku: str, name: str) -> Product:
+    return Product.from_dict(
+        {
+            "sku_1c": sku,
+            "name": name,
+            "price": 1000,
+            "currency": "RUB",
+            "in_stock": 1,
+            "category_paths": [["КАТАЛОГ", "Разное"]],
+            "description": "",
+            "kit_contents": [],
+            "norms": [],
+        }
+    )
+
+
+def _cards_agent(names: dict[str, str]):  # noqa: ANN001
+    """Агент-заглушка: _mentioned_skus/_section_products нужен только index.get."""
+    products = {sku: _product(sku, name) for sku, name in names.items()}
+    fake_index = SimpleNamespace(get=products.get)
+    return SimpleNamespace(engine=SimpleNamespace(index=fake_index))
+
+
+SECTION_GOODS = {
+    "A1": "1.14.5.1.1 Ковёр детский",
+    "A2": "1.14.5.1.2 Стол воспитателя",
+    "A3": "1.14.5.1.3 Стул детский",
+    "A4": "1.14.2.2.3 Ящик для игрушек Моби",
+}
+
+
+def _tools_with(dialog, skus):  # noqa: ANN001
+    tools = ToolBox(dialog, dialog.session(USER, CHANNEL))
+    tools.shown_skus = list(skus)
+    return tools
+
+
+def test_cards_follow_cited_points_not_section(engine):  # noqa: F811
+    """Сц. 1/7/12: под списком пунктов 1.14.5.1.1-3 приходила карточка ящика 1.14.2.2.3."""
+    agent = _cards_agent(SECTION_GOODS)
+    tools = _tools_with(engine, SECTION_GOODS)
+    said = "Первые три пункта раздела — 1.14.5.1.1, 1.14.5.1.2 и 1.14.5.1.3."
+    got = _SalesAgent._section_products(agent, tools, said)
+    assert [p.sku_1c for p in got] == ["A1", "A2", "A3"], "ровно названные пункты"
+
+
+def test_named_goods_outside_cited_points_get_no_card(engine):  # noqa: F811
+    """«Ящик для игрушек вне этой тройки» — карточка ящика не приходит."""
+    agent = _cards_agent(SECTION_GOODS)
+    tools = _tools_with(engine, SECTION_GOODS)
+    said = (
+        "Первые три пункта — 1.14.5.1.1 ковёр, 1.14.5.1.2 стол и 1.14.5.1.3 стул. "
+        "Ящик для игрушек в тройку не входит."
+    )
+    got = _SalesAgent._mentioned_skus(agent, tools, said)
+    assert "A4" not in got, "товар с пунктом вне названных не показываем"
+
+
+def test_supplier_article_in_answer_picks_that_product(engine):  # noqa: F811
+    """Сц. 12: «первые три: EKUD 0335, 0321/1Т, 0420» — карточки должны быть из списка."""
+    goods = {
+        "A5": "EKUD 0335 Лесенка-4",
+        "A6": "EKUD 0306 Зеркало",
+        "A1": "1.14.5.1.1 Ковёр детский",
+    }
+    agent = _cards_agent(goods)
+    tools = _tools_with(engine, goods)
+    said = "Из показанного возьмём первые три: EKUD 0335, 0321/1Т и 0420."
+    got = _SalesAgent._mentioned_skus(agent, tools, said)
+    assert got == ["A5"], "артикул из ответа — только этот товар, не первые показанные"
