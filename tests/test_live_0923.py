@@ -10,6 +10,8 @@ import pytest
 
 from agent.agent import _about_deadline_only
 from agent.routing import _also_asks_other, _asks_export
+from agent.tools import ToolBox
+from core import exports
 from core.ui import Message
 from test_agent import (  # noqa: F401 — engine: фикстура
     CHANNEL,
@@ -146,3 +148,36 @@ def test_export_hijack_guard(said: str, export: bool, other: bool):
     """Экспорт забирает реплику целиком только когда в ней нет других просьб."""
     assert _asks_export(said) is export
     assert _also_asks_other(said) is other
+
+
+# --- Пакет B: субъект экспорта живёт и после обычного поиска ----------------------------------
+
+
+def test_export_after_plain_search(engine):  # noqa: F811
+    """Сц. 4/10/14/19/22: после диалога-подбора кнопка «Скачать» говорила «Сохранять пока нечего»."""
+    session = engine.session(USER, CHANNEL)
+    session.profile.remember_offered(["S1"])
+    assert exports.ready(session), "показанные позиции — уже субъект для файла"
+    file = exports.build(engine, session, exports.EXCEL)
+    assert file is not None
+    assert file.filename.startswith("Подобранные позиции")
+    assert len(file.content) > 1000
+
+
+def test_kit_survives_later_search_turn(engine):  # noqa: F811
+    """Сц. 22: показанный кит не должен терять приоритет перед показанным товаром."""
+    session = engine.session(USER, CHANNEL)
+    session.profile.remember_kit(kit())
+    session.profile.remember_offered(["S1"])
+    assert exports._subject(session).startswith("комплектацию"), "кит остаётся субъектом файла"
+
+
+def test_single_kit_registered_without_code_in_answer(engine):  # noqa: F811
+    """Ответ без кода раздела не теряет единственную комплектацию хода (сц. 22)."""
+    tools = ToolBox(engine, engine.session(USER, CHANNEL))
+    section = kit()
+    tools.kits[f"{section['document']}:{section['code']}"] = section
+    assert tools.single_kit() == section
+    assert tools.kit_for("Вот состав кабинета технологии, файл по кнопке.") is None
+    tools.kits["order_838:2.14"] = {**section, "code": "2.14"}
+    assert tools.single_kit() is None, "разделов несколько без кода в ответе — файл не угадываем"

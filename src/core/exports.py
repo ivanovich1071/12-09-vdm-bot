@@ -102,7 +102,10 @@ def build(engine: DialogEngine, session: Session, fmt: str) -> ExportFile | None
     profile = session.profile
     if _kit_first(profile):
         title, meta, rows = _kit_table(engine, session, profile.kit)
-    elif profile.shortlist:
+    elif profile.shortlist or profile.offered:
+        # Обычный поиск не собирает ни кита, ни shortlist — только запоминает показанное
+        # (`remember_offered`). После такого диалога кнопка «Скачать» говорила «Сохранять
+        # пока нечего» (23.09, сц. 4, 10, 14, 19, 22) — выгружаем показанные позиции.
         title, meta, rows = _list_table(engine, session)
     else:
         return None
@@ -156,6 +159,9 @@ def _subject(session: Session) -> str | None:
     if profile.shortlist:
         count = len(profile.shortlist)
         return f"список из {count} {plural(count, 'позиции', 'позиций', 'позиций')}"
+    if profile.offered:
+        count = len(profile.offered)
+        return f"список из {count} {plural(count, 'позиции', 'позиций', 'позиций')} последнего подбора"
     return None
 
 
@@ -190,7 +196,8 @@ def _list_table(engine: DialogEngine, session: Session):  # noqa: ANN202
     profile = session.profile
     finder = engine.point_finder(session)
     quantities = _quantities(engine, session)
-    for sku in profile.shortlist:
+    skus = profile.shortlist or profile.offered
+    for sku in skus:
         product = engine.index.get(sku)
         if product is None:
             continue

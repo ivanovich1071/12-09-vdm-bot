@@ -568,6 +568,16 @@ class ToolBox:
                 return max(named, key=lambda kit: len(kit["code"]))
         return None
 
+    def single_kit(self) -> dict[str, Any] | None:
+        """Единственный разобранный за ход раздел — предмет файла, даже если ответ не назвал код.
+
+        23.09, сц. 22: комплектацию раздела показали, код в текст ответа не попал — кит
+        не зарегистрировался, и кнопка «Скачать» отвечала «Сохранять пока нечего».
+        """
+        if len(self.kits) == 1:
+            return next(iter(self.kits.values()))
+        return None
+
     def _handoff_to_manager(self, reason: str) -> dict[str, Any]:
         self.handoff_reason = reason
         # 14.09 после этого вызова модель писала «я передал ваш запрос специалисту», а не уходило ничего.

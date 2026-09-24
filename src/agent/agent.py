@@ -395,7 +395,8 @@ class SalesAgent:
         if decision.branch == CONSULT:
             # В файл — раздел, о котором ответ, а не последний разобранный: ночью 14.09 (сц. 24) текст был
             # про технопарк, а «Скачать Excel» прислал ученические стулья из последнего поиска «раздел 2.14».
-            tools.kit = tools.kit_for(answer)
+            # Ответ без кода раздела не должен терять единственную комплектацию хода (23.09, сц. 22).
+            tools.kit = tools.kit_for(answer) or tools.single_kit()
             if tools.kit:
                 session.profile.remember_kit(tools.kit)
                 answer = _short_kit_answer(answer)
