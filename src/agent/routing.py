@@ -189,6 +189,21 @@ def _asks_export(text: str) -> bool:
             return True
     return False
 
+
+def _also_asks_other(text: str) -> bool:
+    """В реплике кроме файла просят ещё что-то: товары или оформление.
+
+    Такая реплика не становится целиком EXPORT_REQUEST — файл додеклится префиксом
+    в агенте, а подбор и корзину разбирает обычная маршрутизация.
+    """
+    return bool(
+        intent.asks_to_show(text)
+        or intent.names_goods(text)
+        or intent.asks_for_goods(text)
+        or intent.asks_checkout(text)
+        or intent.asks_order_checkout(text)
+    )
+
 # --- Признаки продажи: конкретный товар, цена, наличие, покупка ----------------------
 #
 # Эти признаки сильнее консультации: «составьте список с ценами» — уже вопрос продавцу.
@@ -372,9 +387,12 @@ def by_rules(
 
     if _INJECTION.search(text):
         return Decision(branch=GUARD, intent=UNSUPPORTED, reason="попытка сменить роль или вытащить инструкцию")
-    if _asks_export(text):
+    if _asks_export(text) and not _also_asks_other(text):
         # Файл собирает ядро из уже составленного — модель тут не нужна (14.09 она отказала: «не могу»).
         # «Выгрузи весь каталог в JSON» сюда не попадает: это просьба к охране, а не файл разговора.
+        # Составную реплику («добавьте коврики и пришлите файл») экспорт больше не забирает
+        # целиком: 23.09 в сц. 5 и 9 так терялись добавление в корзину и подбор — файл уйдёт
+        # префиксом из агента, а остальное решает обычная маршрутизация.
         return _continue(profile, EXPORT_REQUEST, "просит список файлом")
 
     kind = intent.classify(text)

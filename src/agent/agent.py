@@ -49,6 +49,7 @@ from agent.routing import (
     SELL,
     Decision,
     Orchestrator,
+    _asks_export,
 )
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from agent.verify import (
@@ -119,6 +120,50 @@ _DEADLINE_WITHOUT_CART = (
     "\n\nНажмите «Связаться с менеджером» и оставьте имя и телефон — он ответит по срокам, "
     "этапам поставки и оплате. Могу пока подобрать позиции, чтобы в заявке был состав."
 )
+# Счёт и КП в составной реплике («пришлите файл, счёт и срок») — 23.09 такой ход отвечал
+# только файлом, а счёт выпадал до повторного вопроса (сц. 41: КП так и не сформировалось).
+_INVOICE_ANSWER = (
+    "Счёт на оплату и КП выставляет менеджер по заявке: соберите состав — кнопкой "
+    "«Оформить» или файлом спецификации, — и счёт придёт вместе с подтверждением наличия."
+)
+_INVOICE = re.compile(r"\bсч[её]т\b|\bкп\b|коммерческ\w*\s+предложени\w*", re.IGNORECASE)
+
+# Составная реплика про срок: всё, что не вопрос о сроке, — вежливость или подтверждение
+# («хорошо, скачала», «спасибо»). Всё прочее («возрасты уточните», «цвет берёза») —
+# содержание, которое шаблоном про менеджера накрывать нельзя.
+_REST_FILLER = re.compile(
+    r"^(?:(?:хорошо|окей|ок\b|понятно|понял|поняла|спасибо|благодарю|отлично|супер|ага|да\b|нет|"
+    r"точно|верно|скачал\w*|загрузил\w*|получил\w*|открыл\w*|сохранил\w*|посмотрел\w*|изучил\w*|"
+    r"посмотрю|изучу|конечно|извините)[\s,.!?]*)*$",
+    re.IGNORECASE,
+)
+
+
+def _about_deadline_only(text: str) -> bool:
+    """Реплика исчерпывается сроком: другие предложения — вежливость или подтверждение.
+
+    Слово «срок» в составном сообщении уводило весь ответ в шаблон про менеджера, а
+    возрасты и разбивку «сейчас/потом» человек больше не узнавал (23.09, сц. 1 и 3),
+    «цвет берёза. срок поставки» терял цвет (сц. 7). Шаблон остаётся репликам
+    действительно про срок; составные доходят целиком через `_finish`.
+    """
+    rest = " ".join(
+        sentence
+        for sentence in (part.strip() for part in re.split(r"(?<=[.!?;])\s+|\n+", text or ""))
+        if sentence and not intent.asks_deadline(sentence)
+    )
+    return not rest or bool(_REST_FILLER.match(rest))
+
+
+def _answers_deadline(answer: str) -> bool:
+    """Уже ответил ли текст про срок — ноту тогда не дублируем."""
+    low = (answer or "").lower()
+    return "менеджер" in low and bool(re.search(r"срок\w*|постав\w*|отгруз\w*", low))
+
+
+def _answers_invoice(answer: str) -> bool:
+    low = (answer or "").lower()
+    return "менеджер" in low and "счёт" in low
 
 
 def _about_goods(text: str) -> bool:
@@ -296,7 +341,7 @@ class SalesAgent:
         # Файл, следующая страница и список из N позиций — действия, а не разговор: отвечает ядро,
         # без модели. 14.09 на «сохрани в файл» модель ответила «не могу», на «а ещё что есть» —
         # таблицей, а «подбери из наличия 30 позиций» свела к трём карточкам.
-        service = self._service_reply(session, text, decision)
+        service, prefix = self._service_reply(session, text, decision)
         if service is not None:
             return service
 
@@ -310,8 +355,9 @@ class SalesAgent:
             answer = self._ask(messages, tools, tools_for(decision.branch))
         except LLMError:
             # Провайдеры уже помечены нерабочими и записаны в лог — здесь остаётся
-            # только доиграть ход предложением из каталога.
-            return self.engine.offer(session, text)
+            # только доиграть ход предложением из каталога. Файл и срок из составной
+            # реплики и тут не должны пропасть.
+            return self._finish(prefix, self.engine.offer(session, text), session, text, "")
 
         # Продавец пообещал подбор и не сделал его: просим один раз, в этом же ходе.
         if decision.sells and not tools.selected and promises_goods(answer, show_cards):
@@ -367,7 +413,27 @@ class SalesAgent:
         session.profile.remember_offered(_unique(tools.shown_skus))
         # Продавцу по фразе консультанта ход не передаётся: переход решает новое намерение
         # человека (ORCHESTRATOR.md, разделы 14 и 17).
-        return self._render(session, tools, answer, text, decision, show_cards)
+        return self._finish(prefix, self._render(session, tools, answer, text, decision, show_cards), session, text, answer)
+
+    def _finish(
+        self,
+        prefix: list[Response],
+        responses: list[Response],
+        session,  # noqa: ANN001
+        text: str,
+        answer: str,
+    ) -> list[Response]:
+        """Финал хода: файл — префиксом, ответ модели — в середине, срок и счёт — нотой в конце.
+
+        Составная реплика 23.09 регулярно доезжала одной частью: «Excel + счёт + срок» —
+        файлом или сроком (десять диалогов), «добавьте коврики + файл» — файлом. Теперь
+        каждая часть доходит, а нота не дублирует то, что модель уже ответила про срок.
+        """
+        if intent.asks_deadline(text) and not _answers_deadline(answer):
+            responses = [*responses, *self._deadline_note(session, invoice=bool(_INVOICE.search(text)))]
+        elif _INVOICE.search(text) and prefix and not _answers_invoice(answer):
+            responses = [*responses, *self._invoice_note(session)]
+        return [*prefix, *responses] if prefix else responses
 
     # --- Сведение текста ответа с карточками ---------------------------------
 
@@ -828,14 +894,21 @@ class SalesAgent:
 
     # --- Действия без модели -------------------------------------------------------
 
-    def _service_reply(self, session, text: str, decision: Decision) -> list[Response] | None:  # noqa: ANN001
-        """Ответ ядра без модели: файл, список из N позиций, следующая страница подбора."""
+    def _service_reply(self, session, text: str, decision: Decision) -> tuple[list[Response] | None, list[Response]]:  # noqa: ANN001
+        """Ответ ядра без модели: файл, список из N позиций, следующая страница подбора.
+
+        Возвращает `(исключающий ответ, префикс)`. Исключающий — ход закончен сервисной
+        веткой (файл, визард оформления); префикс — файл из составной реплики, после
+        которого остальное («добавьте коврики») отвечает модель (`_finish` соберёт).
+        """
         profile = session.profile
+        prefix: list[Response] = []
         # Срока от оформления до счёта и графика поставок нет ни в каталоге, ни в приказах —
         # их называет менеджер. Ночью 16.09 этот вопрос остался без ответа в семи диалогах,
         # а в сц. 3 трижды подряд получил «Пришлю комплектацию файлом. В каком виде?».
         deadline = intent.asks_deadline(text)
-        if decision.intent == EXPORT_REQUEST:
+        invoice = bool(_INVOICE.search(text))
+        if _asks_export(text):
             # Формат назван в самой реплике («нужна спецификация в excel») — строим файл
             # сразу. Иначе «В каком виде?» сходилось с ответом «в excel» в цикле по три
             # круга (16.09, диалоги про 1.14 и 2.15).
@@ -848,25 +921,42 @@ class SalesAgent:
                 label = "Excel" if fmt == exports.EXCEL else "Word"
                 session.remember("assistant", f"Формат понял: {label}.")
                 keyboard = exports.buttons(Keyboard().row(Button("Меню", "menu")))
-                return [Message(f"Собираю файл в {label} — файл по кнопке ниже.", keyboard=keyboard)]
-            offer = exports.offer(self.engine, session)
-            if offer is not None:
-                session.route["fallback"] = "export"
-                # Файл просили вместе со сроком — отвечаем и на то, и на другое.
-                return [*self._deadline_note(session), *offer] if deadline else offer
+                file_msg = [Message(f"Собираю файл в {label} — файл по кнопке ниже.", keyboard=keyboard)]
+                if decision.intent == EXPORT_REQUEST:
+                    # Реплика без других просьб: файл и, если спрошено, срок/счёт — одним
+                    # ходом. 23.09 ход 9 «Excel + счёт + срок» в десяти диалогах отвечал
+                    # только файлом, срок выпадал до повторного вопроса.
+                    if deadline:
+                        return [*file_msg, *self._deadline_note(session, invoice=invoice)], []
+                    if invoice:
+                        return [*file_msg, *self._invoice_note(session)], []
+                    return file_msg, []
+                prefix = file_msg
+            else:
+                offer = exports.offer(self.engine, session)
+                if offer is not None:
+                    session.route["fallback"] = "export"
+                    if decision.intent == EXPORT_REQUEST:
+                        # Файл просили вместе со сроком — отвечаем и на то, и на другое.
+                        if deadline:
+                            return [*self._deadline_note(session, invoice=invoice), *offer], []
+                        if invoice:
+                            return [*self._invoice_note(session), *offer], []
+                        return offer, []
+                    prefix = offer
             # Выгружать нечего: «Сохранять пока нечего: сначала соберём комплектацию» было ответом
             # на «нужна спецификация в Excel и счёт» в 11 диалогах из 25 (ночь 15.09) — и разговор
             # на этом кончался. Пусть отвечает агент: он и соберёт то, что потом уйдёт файлом.
-        if deadline and not _about_goods(text):
+        if deadline and not _about_goods(text) and _about_deadline_only(text):
             session.route["fallback"] = "deadline"
-            return self._deadline_note(session, self._manager_keyboard(session))
+            return self._deadline_note(session, self._manager_keyboard(session), invoice=invoice), []
         size = intent.list_size(text)
         # Оформление по присланному файлу — ядро, а не модель: 15.09 на «сформируй предзаказ» и «все найденные
         # по 1 шт.» модель трижды пересобрала строки файла по-разному (14 из 15, потом 4 из 15).
         if profile.order and profile.export == "order" and intent.asks_order_checkout(text):
             session.route["fallback"] = "order_cart"
-            return self.engine.order_cart(session, override=intent.each_quantity(text))
-        # «Оформить», «выставьте счёт» без присланного файла: корзина и предзаказ — кодом. Ночью
+            return self.engine.order_cart(session, override=intent.each_quantity(text)), []
+        # «Оформить», «выставите счёт» без присланного файла: корзина и предзаказ — кодом. Ночью
         # 15.09 на «Оформить. Согласен. Организация, контакт…» модель присылала анкету «1. Название
         # организации…» или советовала нажать кнопку, которой под сообщением не было: за 25 диалогов
         # ни одного предзаказа и ни одной непустой корзины.
@@ -874,34 +964,46 @@ class SalesAgent:
             checkout = self.engine.checkout_by_intent(session, text)
             if checkout is not None:
                 session.route["fallback"] = "checkout"
-                return checkout
+                return ([*prefix, *checkout] if prefix else checkout), []
         # Присланный заказ: «подбери по этому заказу», «из наличия 30 позиций» и «а ещё» — по его строкам.
         if profile.order and (intent.mentions_order(text) or (size and profile.export == "order")):
             session.route["fallback"] = "order_list"
-            return self.engine.order_list(session, text, size)
+            return self.engine.order_list(session, text, size), []
         if profile.order and profile.export == "order" and profile.order.get("shown") and intent.asks_more(text):
             session.route["fallback"] = "order_more"
-            return self.engine.order_list(session, text, None, more=True)
+            return self.engine.order_list(session, text, None, more=True), []
         if size and (decision.sells or "налич" in text.lower()):
             session.route["fallback"] = "shortlist"
-            return self.engine.shortlist(session, text, size)
+            return self.engine.shortlist(session, text, size), []
         if decision.sells and intent.asks_more(text) and profile.procurement_task_id and profile.offered:
             session.route["fallback"] = "select_more"
-            return self.engine.more_selection(session)
+            return self.engine.more_selection(session), []
         # Детский сад целиком, без помещения — разделы приказа 1057 по помещениям и вопрос, с какого начать.
         if whole_object(text) and profile.audience == "preschool" and not profile.room and not intent.names_goods(text):
             rooms = self.engine.object_rooms(session)
             if rooms is not None:
                 session.route["fallback"] = "object_rooms"
-                return rooms
-        return None
+                return rooms, []
+        return None, prefix
 
-    def _deadline_note(self, session, keyboard: Keyboard | None = None) -> list[Response]:  # noqa: ANN001
-        """Честный ответ о сроке: данных нет, называет менеджер по заявке."""
+    def _deadline_note(self, session, keyboard: Keyboard | None = None, invoice: bool = False) -> list[Response]:  # noqa: ANN001
+        """Честный ответ о сроке: данных нет, называет менеджер по заявке.
+
+        Клавиатура менеджера — по умолчанию: оба шаблона просят нажать «Связаться с
+        менеджером», а 23.09 нота уходила без кнопки, на которую ссылался её текст
+        (сц. 5, 29, 44).
+        """
         cart = self.engine.storage.load_cart(session.user_id).count
         text = _DEADLINE_ANSWER + (_DEADLINE_WITH_CART if cart else _DEADLINE_WITHOUT_CART)
+        if invoice:
+            text += "\n\n" + _INVOICE_ANSWER
         session.remember("assistant", text)
-        return [Message(text, keyboard=keyboard)]
+        return [Message(text, keyboard=keyboard or self._manager_keyboard(session))]
+
+    def _invoice_note(self, session) -> list[Response]:  # noqa: ANN001
+        """Нота про счёт/КП для составной реплики без вопроса о сроке."""
+        session.remember("assistant", _INVOICE_ANSWER)
+        return [Message(_INVOICE_ANSWER, keyboard=self._manager_keyboard(session))]
 
     def _manager_keyboard(self, session) -> Keyboard | None:  # noqa: ANN001
         keyboard = Keyboard().row(Button("Связаться с менеджером", "manager"))
