@@ -336,44 +336,61 @@ async def send(
             markup = persistent_keyboard(miniapp_url)
             persistent = False
 
-        # Изменение количества правит то сообщение, под которым нажали кнопку.
-        # Раньше каждое «+» присылало новую копию корзины, изменений в ней было
-        # не разглядеть, и человек жал ещё раз — так в чате и появлялись пять
-        # одинаковых карточек подряд. «Подробнее» (`edit_cards`) так же раскрывает
-        # карточку на месте.
-        replace = getattr(response, "replace", False) or (edit_cards and isinstance(response, ProductCard))
-        if replace and origin is not None:
-            text = _replacement_text(response)
-            if text is not None and await _edit(bot, origin, text, markup):
-                continue
-
-        if isinstance(response, Message):
-            parts = split_text(render_text(response.text))
-            for part in parts[:-1]:
-                await bot.send_message(chat_id, part)
-            await bot.send_message(chat_id, parts[-1], reply_markup=markup)
-        elif isinstance(response, ProductCard):
-            await _send_card(bot, chat_id, response, markup, storage)
-        elif isinstance(response, ProductList):
-            await bot.send_message(chat_id, fit(render_list_header(response)))
-            for card in response.cards:
-                await _send_card(bot, chat_id, card, to_markup(card.keyboard), storage, short=True)
-            # Навигация по выдаче — последним сообщением, чтобы кнопки были под рукой.
-            if markup is not None:
-                await bot.send_message(chat_id, "Что дальше?", reply_markup=markup)
-        elif isinstance(response, OrderSummary):
-            await bot.send_message(chat_id, fit(render_order(response)), reply_markup=markup)
-        elif isinstance(response, FileReply):
-            from aiogram.types import BufferedInputFile
-
-            await bot.send_document(
-                chat_id,
-                BufferedInputFile(response.content, filename=response.filename),
-                caption=_escape(response.caption)[:CAPTION_LIMIT] or None,
-                reply_markup=markup,
+        # Один недоставленный ответ не должен гасить остальные: на прогоне 23.09
+        # фото карточки, не прошедшее после всех повторов, ронило и оставшиеся
+        # карточки хода — текст приходил, карточки исчезали.
+        try:
+            await _deliver_response(bot, chat_id, response, markup, storage, origin, edit_cards)
+        except TelegramAPIError as exc:
+            log.error(
+                "Ответ %s не доставлен, остальные сообщения хода доставляем: %s",
+                type(response).__name__,
+                exc,
             )
-        elif isinstance(response, ContactRequest):
-            await bot.send_message(chat_id, _escape(response.text), reply_markup=contact_keyboard())
+
+
+async def _deliver_response(  # noqa: ANN001
+    bot: Bot, chat_id: int, response: Response, markup, storage, origin: TgMessage | None, edit_cards: bool
+) -> None:
+    """Один ответ хода — сообщение, карточка, файл. Падение ловит вызывающая сторона."""
+    # Изменение количества правит то сообщение, под которым нажали кнопку.
+    # Раньше каждое «+» присылало новую копию корзины, изменений в ней было
+    # не разглядеть, и человек жал ещё раз — так в чате и появлялись пять
+    # одинаковых карточек подряд. «Подробнее» (`edit_cards`) так же раскрывает
+    # карточку на месте.
+    replace = getattr(response, "replace", False) or (edit_cards and isinstance(response, ProductCard))
+    if replace and origin is not None:
+        text = _replacement_text(response)
+        if text is not None and await _edit(bot, origin, text, markup):
+            return
+
+    if isinstance(response, Message):
+        parts = split_text(render_text(response.text))
+        for part in parts[:-1]:
+            await bot.send_message(chat_id, part)
+        await bot.send_message(chat_id, parts[-1], reply_markup=markup)
+    elif isinstance(response, ProductCard):
+        await _send_card(bot, chat_id, response, markup, storage)
+    elif isinstance(response, ProductList):
+        await bot.send_message(chat_id, fit(render_list_header(response)))
+        for card in response.cards:
+            await _send_card(bot, chat_id, card, to_markup(card.keyboard), storage, short=True)
+        # Навигация по выдаче — последним сообщением, чтобы кнопки были под рукой.
+        if markup is not None:
+            await bot.send_message(chat_id, "Что дальше?", reply_markup=markup)
+    elif isinstance(response, OrderSummary):
+        await bot.send_message(chat_id, fit(render_order(response)), reply_markup=markup)
+    elif isinstance(response, FileReply):
+        from aiogram.types import BufferedInputFile
+
+        await bot.send_document(
+            chat_id,
+            BufferedInputFile(response.content, filename=response.filename),
+            caption=_escape(response.caption)[:CAPTION_LIMIT] or None,
+            reply_markup=markup,
+        )
+    elif isinstance(response, ContactRequest):
+        await bot.send_message(chat_id, _escape(response.text), reply_markup=contact_keyboard())
 
 
 def _replacement_text(response: Response) -> str | None:
@@ -454,9 +471,15 @@ async def _send_card(  # noqa: ANN001
             # Подпись всегда короткая (название, цена, основание), полное описание — следующим.
             sent = await bot.send_photo(chat_id, photo, caption=_caption(card))
             await bot.send_message(chat_id, fit(text), reply_markup=markup)
-    except TelegramBadRequest as exc:
+    except (TelegramBadRequest, TelegramNetworkError) as exc:
+        # Сетевая ошибка после всех повторов middleware раньше улетала наружу и гасила
+        # остальные ответы хода (23.09: текст пришёл, карточки нет). Карточка важнее
+        # снимка — шлём текстом.
         log.warning("Фото товара %s не отправилось: %s", card.product.sku_1c, exc)
-        await bot.send_message(chat_id, fit(text), reply_markup=markup)
+        try:
+            await bot.send_message(chat_id, fit(text), reply_markup=markup)
+        except TelegramAPIError as retry_exc:
+            log.error("Карточка %s не доставлена и текстом: %s", card.product.sku_1c, retry_exc)
         return
 
     _remember_photo(storage, card, sent)

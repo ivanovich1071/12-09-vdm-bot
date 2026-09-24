@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 
-from agent.client import ChatClient, LLMAuthError, LLMError, LLMPaymentError
+from agent.client import ChatClient, LLMAuthError, LLMError, LLMPaymentError, LLMRateLimitError
 
 log = logging.getLogger(__name__)
 
@@ -27,9 +28,17 @@ COOLDOWN_SECONDS = 300.0
 # Пока эти два случая жили под одним сроком, бот после пополнения Cloud.ru
 # ещё полчаса разговаривал запасной моделью — поймано на прогоне 02.09.
 AUTH_COOLDOWN_SECONDS = 1800.0
+# Лимит частоты (429) — не поломка, а очередь: Cloud.ru даёт 500 запросов в минуту,
+# и один сложный ход её исчерпывает (23.09, сц. 5). Пять минут cooldown на такой
+# отказ оставляли пользователей без модели — достаточно минуты.
+RATE_COOLDOWN_SECONDS = 60.0
+# Джиттер ±20%, чтобы параллельные ходы не снимали cooldown одновременно.
+_JITTER = (0.8, 1.2)
 
 
 def _pause_for(exc: Exception) -> float:
+    if isinstance(exc, LLMRateLimitError):
+        return RATE_COOLDOWN_SECONDS * random.uniform(*_JITTER)
     if isinstance(exc, LLMPaymentError):
         return COOLDOWN_SECONDS
     return AUTH_COOLDOWN_SECONDS if isinstance(exc, LLMAuthError) else COOLDOWN_SECONDS
@@ -154,6 +163,8 @@ __all__ = [
     "LLMError",
     "LLMAuthError",
     "LLMPaymentError",
+    "LLMRateLimitError",
     "COOLDOWN_SECONDS",
     "AUTH_COOLDOWN_SECONDS",
+    "RATE_COOLDOWN_SECONDS",
 ]

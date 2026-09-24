@@ -6,18 +6,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
+from adapters.telegram.bot import send
 from agent.agent import SalesAgent as _SalesAgent
 from agent.agent import _about_deadline_only, _without_codes
+from agent.client import ChatClient, LLMRateLimitError
+from agent.providers import _pause_for
 from agent.routing import _also_asks_other, _asks_export
 from agent.tools import ToolBox
 from catalog.models import Product
 from catalog.search import CatalogIndex, SearchQuery
 from core import exports
-from core.ui import Message
+from core.ui import Message, ProductCard
 from norms.items import ItemIndex, NormItem
 from procurement.discovery import query_from_text
 from test_agent import (  # noqa: F401 — engine: фикстура
@@ -384,3 +392,94 @@ def test_supplier_article_in_answer_picks_that_product(engine):  # noqa: F811
     said = "Из показанного возьмём первые три: EKUD 0335, 0321/1Т и 0420."
     got = _SalesAgent._mentioned_skus(agent, tools, said)
     assert got == ["A5"], "артикул из ответа — только этот товар, не первые показанные"
+
+
+# --- Пакет F: провайдер под лимитом и доставка без потерь --------------------------------------
+
+
+class ScriptedServer:
+    """POST-сервер с заданным сценарием ответов: (код, JSON, заголовки)."""
+
+    def __init__(self, script: list[tuple[int, dict, dict[str, str]]]) -> None:
+        self.script = script
+        self.requests: list[dict] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", 0))
+                outer.requests.append(json.loads(self.rfile.read(length) or b"{}"))
+                code, data, headers = outer.script[min(len(outer.requests) - 1, len(outer.script) - 1)]
+                payload = json.dumps(data).encode()
+                self.send_response(code)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> ScriptedServer:
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.server.shutdown()
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}/v1"
+
+
+_OK = (200, {"choices": [{"message": {"role": "assistant", "content": "готово"}}]}, {})
+_429 = (429, {"error": {"message": "ModelArts.81101 rate limit"}}, {"Retry-After": "0"})
+
+
+def test_rate_limit_gets_one_quick_retry():
+    """Сц. 5: один 429 раньше сажал провайдера на 5 минут — теперь быстрый повтор."""
+    with ScriptedServer([_429, _OK]) as server:
+        got = ChatClient(api_key="k", base_url=server.base_url, timeout=10).complete(
+            [{"role": "user", "content": "привет"}]
+        )
+    assert got["content"] == "готово"
+    assert len(server.requests) == 2, "после 429 — ровно один повтор"
+
+
+def test_rate_limit_after_retry_is_a_short_cooldown():
+    """Два 429 подряд — короткий cooldown с джиттером, не пять минут."""
+    with ScriptedServer([_429, _429]) as server:
+        client = ChatClient(api_key="k", base_url=server.base_url, timeout=10)
+        with pytest.raises(LLMRateLimitError) as caught:
+            client.complete([{"role": "user", "content": "привет"}])
+    pause = _pause_for(caught.value)
+    assert 60 * 0.8 <= pause <= 60 * 1.2, f"cooldown для 429 — около минуты, получили {pause:.0f} с"
+
+
+class _NoPhotoBot:
+    """Телеграм, у которого падает каждое фото, а текст доходит."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def send_photo(self, chat_id, photo, caption=None, reply_markup=None):  # noqa: ANN001
+        raise TelegramBadRequest(method="sendPhoto", message="failed to get HTTP URL content")
+
+    async def send_message(self, chat_id, text, reply_markup=None):  # noqa: ANN001
+        self.messages.append(text)
+
+
+def test_failed_photo_does_not_drop_the_rest_of_the_turn():
+    """Сц. 23.09: упавшее фото гасило остальные карточки хода — текст приходил, карточки нет."""
+    bot = _NoPhotoBot()
+    card = ProductCard(product=_product("S9", "1.5.1.41 Мяч гимнастический"), image="https://vdm.ru/p.jpg")
+    asyncio.run(send(bot, 1, [card, Message("Что дальше?")]))
+
+    assert any("Мяч гимнастический" in text for text in bot.messages), "карточка дошла текстом"
+    assert any("Что дальше?" in text for text in bot.messages), "остальные ответы хода доставлены"
