@@ -131,6 +131,28 @@ class _Posting:
     weight: float
 
 
+# Артикул в запросе («12345», «д-214») ищется только точно — триграммный добор на
+# несуществующем артикуле выдавал случайные товары (23.09, сц. 50). Номер приказа
+# артикулом не считается: «по приказу 838» — про документ, не про код 1С.
+_DOCUMENT_REF = re.compile(r"(?:приказ\w*|перечен\w*|документ\w*|фгос|фоп)\s*№?\s*\d{3,4}", re.IGNORECASE)
+
+
+def _article_tokens(text: str) -> list[str]:
+    """Слова с цифрами — артикулы и коды моделей («12345», «д-214»). Слова без цифр не считаются."""
+    low = _DOCUMENT_REF.sub(" ", (text or "").lower())
+    return [
+        token
+        for token in re.split(r"[^0-9a-zа-яё-]+", low)
+        if len(token) >= 3 and any(char.isdigit() for char in token)
+    ]
+
+
+def _matches_article(product: Product, articles: list[str]) -> bool:
+    sku = (product.sku_1c or "").lower()
+    name = (product.name or "").lower()
+    return any(token == sku or (len(token) >= 4 and token in name) for token in articles)
+
+
 @dataclass
 class CatalogIndex:
     """Инвертированный индекс по товарам.
@@ -195,6 +217,18 @@ class CatalogIndex:
         allowed = self._filter(query)
         if not allowed:
             return []
+
+        articles = _article_tokens(query.text)
+        if articles:
+            # Артикул ищется только точно — по коду 1С или вхождению в название. Триграммный
+            # добор выдавал случайные товары на несуществующий артикул (23.09, сц. 50: три
+            # позиции вместо честного «не найдено»).
+            exact = [
+                SearchHit(self.products[doc], 1.0, "text", query=query.text)
+                for doc in sorted(allowed)
+                if _matches_article(self.products[doc], articles)
+            ]
+            return _diversified(exact)[: query.limit]
 
         codes = [query.norm_code] if query.norm_code else codes_in_query(query.text)
         hits = self._by_norm(codes, allowed, query)

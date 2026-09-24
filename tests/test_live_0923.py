@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import pytest
 
-from agent.agent import _about_deadline_only
+from agent.agent import _about_deadline_only, _without_codes
 from agent.routing import _also_asks_other, _asks_export
 from agent.tools import ToolBox
+from catalog.models import Product
+from catalog.search import CatalogIndex, SearchQuery
 from core import exports
 from core.ui import Message
 from norms.items import ItemIndex, NormItem
+from procurement.discovery import query_from_text
 from test_agent import (  # noqa: F401 — engine: фикстура
     CHANNEL,
     USER,
@@ -240,3 +243,66 @@ def test_long_kit_filename_cuts_at_word_boundary(engine):  # noqa: F811
     assert len(stem) <= 60
     assert not stem.endswith((" ", ",", ";", "-")), "обрез не оставляет мусор"
     assert stem.count(" ") >= 3, "слова не склеиваются в одно"
+
+
+# --- Пакет D: текст без поломок и честное «не найдено» по артикулу ----------------------------
+
+
+def test_code_removal_leaves_no_empty_quotes_or_glued_words():
+    """Сц. 50: «По вашему запросу «» … напрямуюни одна из них не содержит»."""
+    said = (
+        "По вашему запросу «артикул 12345» нашлось несколько позиций, "
+        "но напрямую артикул 12345 ни одна из них не содержит"
+    )
+    clean = _without_codes(said)
+    assert "«»" not in clean and "„“" not in clean, "пустых кавычек не остаётся"
+    assert "напрямуюни" not in clean, "слова не склеиваются"
+    assert "напрямую ни одна" in clean
+    assert "12345" not in clean, "код 1С человеку не показываем"
+
+
+def _mini_index() -> CatalogIndex:
+    return CatalogIndex(
+        [
+            Product.from_dict(
+                {
+                    "sku_1c": "777",
+                    "name": "Панель Солнечная система",
+                    "price": 1500,
+                    "currency": "RUB",
+                    "in_stock": 5,
+                    "category_paths": [["КАТАЛОГ", "Развитие речи"]],
+                    "description": "",
+                    "kit_contents": [],
+                    "norms": [],
+                }
+            ),
+            Product.from_dict(
+                {
+                    "sku_1c": "12345",
+                    "name": "Мольберт двухсторонний",
+                    "price": 4300,
+                    "currency": "RUB",
+                    "in_stock": 2,
+                    "category_paths": [["КАТАЛОГ", "ИЗО"]],
+                    "description": "",
+                    "kit_contents": [],
+                    "norms": [],
+                }
+            ),
+        ]
+    )
+
+
+def test_unknown_article_returns_nothing_instead_of_random_goods():
+    """Сц. 50: несуществующий артикул показывал три случайных товара вместо «не найдено»."""
+    index = _mini_index()
+    assert index.search(SearchQuery(text="артикул 98765")) == []
+    found = index.search(SearchQuery(text="артикул 12345"))
+    assert [hit.product.sku_1c for hit in found] == ["12345"], "точное совпадение — только оно"
+
+
+def test_article_survives_query_from_text():
+    """Раньше query_from_text выбрасывал цифры — «артикул 12345» искался как «артикул»."""
+    assert "12345" in query_from_text("Есть ли в наличии артикул 12345?")
+    assert query_from_text("нужны мячи для спортзала, дети 3-4 лет") == "мячи"

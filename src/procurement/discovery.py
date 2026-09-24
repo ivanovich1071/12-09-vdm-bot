@@ -160,7 +160,15 @@ def query_from_text(text: str) -> str:
     for pattern in patterns:
         rest = pattern.sub(" ", rest.lower())
     rest = _TASK_WORDS.sub(" ", rest)
-    words = [word for word in re.findall(r"[а-яёa-z][а-яёa-z-]+", rest) if len(word) > 2]
+    words = []
+    for word in re.findall(r"[а-яёa-z0-9][а-яёa-z0-9-]+", rest):
+        if any(char.isdigit() for char in word):
+            # Артикул или код модели сохраняем: без цифр «артикул 12345» превращался в
+            # безсловарный запрос «артикул», и поиск добирал случайные товары (23.09, сц. 50).
+            if len(word) >= 3:
+                words.append(word)
+        elif len(word) > 2:
+            words.append(word)
     return " ".join(words)
 
 

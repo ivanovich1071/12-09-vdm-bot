@@ -106,6 +106,12 @@ _UNVERIFIED_NOTE = (
     "Часть пунктов по тексту приказа не подтвердилась — их я не привожу. Назовите номер раздела "
     "перечня, и я сверю состав по нему."
 )
+# Вырезали только цены — нота про пункты приказа звучала как чужая (23.09, сц. 7, 9, 10, 12:
+# хвост «Часть пунктов…не подтвердилась» приходил на ответах про цены без всякой сверки норм).
+_PRICE_NOTE = (
+    "Часть цен по каталогу подтвердить не могу — их я не привожу. Точные цены и наличие "
+    "по заявке подтвердит менеджер."
+)
 # Срок до счёта, график поставок и дату отгрузки бот не знает: этих данных нет ни в каталоге,
 # ни в перечнях. Ночью 16.09 такой вопрос остался без ответа в семи диалогах.
 _DEADLINE_ANSWER = (
@@ -223,6 +229,23 @@ _CODE_MENTION = re.compile(
 _DOUBLE_COMMA = re.compile(r",(?:\s*,)+")
 # Пункт списка, от которого после вырезания кода ничего не осталось: «- **Код 1С:** 42639» → «-».
 _EMPTY_BULLET = re.compile(r"^[ \t]*[-•][ \t]*[*:]*[ \t]*(?:\n|$)", re.MULTILINE)
+# Пустые кавычки от вырезанного кода внутри цитаты: «По вашему запросу «артикул 12345» …» →
+# «По вашему запросу «» …» (23.09, сц. 50). Склейки «напрямуюни» убираются заменой на пробел.
+_EMPTY_QUOTES = re.compile(r"[«„“\"']+\s*[»“„\"']+")
+_SPACE_BEFORE_PUNCT = re.compile(r"[ \t]+([,.;:!?])")
+_LINE_TRAILING_SPACE = re.compile(r"[ \t]+(?=\n)")
+_INNER_SQUEEZE = re.compile(r"(?<=\S)[ \t]{2,}")
+
+
+def _cut_code(match: re.Match[str]) -> str:
+    """Код вырезается в пустоту — или в пробел, если сшипает слова в стык.
+
+    «напрямую артикул 12345ни одна» не должно становиться «напрямуюни одна» (23.09, сц. 50).
+    """
+    start, end = match.span()
+    before = match.string[start - 1] if start else ""
+    after = match.string[end] if end < len(match.string) else ""
+    return " " if before.isalnum() and after.isalnum() else ""
 
 # Из чего собирается промпт роли. Границы идут первыми, чтобы не тонуть в
 # середине длинного текста, дальше общая часть, дальше сама роль.
@@ -343,6 +366,12 @@ class SalesAgent:
         # таблицей, а «подбери из наличия 30 позиций» свела к трём карточкам.
         service, prefix = self._service_reply(session, text, decision)
         if service is not None:
+            # Цены из ответов ядра (списки из N позиций, страницы подбора) — тоже подтверждённые:
+            # на «дорого» модель цитирует их без вызова инструментов, и проверка следующего хода
+            # не считала их выдуманными (23.09, сц. 7, 9, 10, 12 — лишний хвост про «пункты»).
+            session.prices |= {
+                price for reply in service if isinstance(reply, Message) for price in prices_in(reply.text)
+            }
             return service
 
         tools = ToolBox(self.engine, session)
@@ -735,7 +764,8 @@ class SalesAgent:
             if len(kept) >= MIN_KEPT:
                 log.warning("Ответ выдуман повторно — строки с неподтверждённым убраны.")
                 session.route["fallback"] = "unverified_lines_removed"
-                return f"{kept}\n\n{_UNVERIFIED_NOTE}"
+                cut_norms = bool(invented_norm_refs(text, refs)) or bool(self._registry_problems(text, session)[0])
+                return f"{kept}\n\n{_UNVERIFIED_NOTE if cut_norms else _PRICE_NOTE}"
         log.warning("Ответ выдуман повторно, подтверждённых строк не осталось — текст не показываем.")
         return ""
 
@@ -1253,4 +1283,9 @@ def _short_kit_answer(answer: str) -> str:
 
 
 def _without_codes(answer: str) -> str:
-    return _EMPTY_BULLET.sub("", _DOUBLE_COMMA.sub(",", _CODE_MENTION.sub("", answer)))
+    stripped = _CODE_MENTION.sub(_cut_code, answer)
+    stripped = _EMPTY_BULLET.sub("", _DOUBLE_COMMA.sub(",", stripped))
+    stripped = _EMPTY_QUOTES.sub("", stripped)
+    stripped = _SPACE_BEFORE_PUNCT.sub(r"\1", stripped)
+    stripped = _LINE_TRAILING_SPACE.sub("", stripped)
+    return _INNER_SQUEEZE.sub(" ", stripped).strip()
