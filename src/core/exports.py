@@ -171,6 +171,14 @@ def _kit_table(engine: DialogEngine, session: Session, kit: dict[str, Any]):  # 
     title = f"Комплектация {kit.get('code', '')} {kit.get('title', '')}".strip()
     meta = [f"Основание: {doc}, раздел {kit.get('code')} «{kit.get('title')}»"]
     positions = kit.get("positions") or []
+    # Кратность объекта: «на 6 групп», «4 кабинета» — норма в перечне дана на одну
+    # группу, человек умножал сам (23.09, сц. 3 и 21). Группа-строки (подразделы) не множим.
+    times = session.profile.count or 1
+    if times > 1:
+        meta.append(
+            f"Количество умножено на {times} ({session.profile.count_of}): "
+            "норма перечня указана на один объект."
+        )
     codes = [str(position.get("code", "")) for position in positions]
     finder = PointFinder(
         engine.index, engine.norm_texts, (doc_id,) if doc_id else (), session.profile.audience
@@ -186,7 +194,17 @@ def _kit_table(engine: DialogEngine, session: Session, kit: dict[str, Any]):  # 
             continue
         number += 1
         norm = " ".join(str(position.get("quantity") or "").split())
-        rows.append(_order_row(number, finder.find(code, name), code, name, norm))
+        base = _count(norm)
+        rows.append(
+            _order_row(
+                number,
+                finder.find(code, name),
+                code,
+                name,
+                norm,
+                quantity=base * times if base else None,
+            )
+        )
     return title, meta, rows
 
 

@@ -77,6 +77,9 @@ _AUDIENCE_BY_ROOM = {
 }
 
 _AGE_RANGE = re.compile(r"\b(\d)\s*[-–—]\s*(\d{1,2})\s*лет", re.IGNORECASE)
+# Одиночный возраст «дети 5 лет»: 23.09 он не парсился (нужен был диапазон), и следующий
+# ход переспрашивал возраст, только что названный (сц. 4, 14).
+_AGE_SINGLE = re.compile(r"\b(\d{1,2})\s*лет\b", re.IGNORECASE)
 _AGE_GROUPS: tuple[tuple[str, str], ...] = (
     ("младшая группа", r"младш\w+\s+групп\w*|ясельн\w+"),
     ("средняя группа", r"средн\w+\s+групп\w*"),
@@ -102,6 +105,8 @@ _DEADLINES: tuple[tuple[str, str], ...] = (
 _REGION = re.compile(
     r"(?:город|г\.|регион|область|край|доставк\w+\s+в)\s+([А-ЯЁ][а-яё-]{2,})", re.IGNORECASE
 )
+# На сколько объектов комплектация: «на 6 групп», «4 кабинета», «12 комплектов».
+_COUNT_OF = re.compile(r"\b(?:на\s+|по\s+)?(\d{1,2})\s*(групп\w*|кабинет\w*|комплект\w*|отделени\w*)", re.IGNORECASE)
 # Явный отказ от предложенного: «это не подходит», «дорого», «не то».
 _REJECTION = re.compile(
     r"не\s+подход\w+|\bне\s+то\b|\bдорог\w+|\bдешевле\b|не\s+нужн\w+", re.IGNORECASE
@@ -144,6 +149,11 @@ class DialogProfile:
     budget: str | None = None
     deadline: str | None = None
     region: str | None = None
+    # На сколько объектов комплектация: «на 6 групп», «4 кабинета». 23.09 кратность
+    # не попадала ни в профиль, ни в файл — человек получал состав одной группы
+    # и умножал сам (сц. 3, 21). Объектная характеристика, при смене задачи не сбрасывается.
+    count: int | None = None
+    count_of: str | None = None
     # Коды 1С, уже показанные пользователю, и те, что он отклонил. Нужны, чтобы
     # бот не предлагал по кругу одно и то же.
     offered: list[str] = field(default_factory=list)
@@ -312,6 +322,11 @@ class DialogProfile:
             self.region = region.group(1).capitalize()
             changed.append("region")
 
+        count = _count_of(low)
+        if count and count[0] != self.count:
+            self.count, self.count_of = count
+            changed.append("count")
+
         if _REJECTION.search(low) and self.offered:
             # Отклонили то, что показали последним: конкретную позицию пользователь
             # называет редко, а «дорого» почти всегда относится к последней выдаче.
@@ -368,6 +383,7 @@ class DialogProfile:
             ("Бюджет", self.budget),
             ("Срок", self.deadline),
             ("Регион", self.region),
+            ("Комплектация на сколько объектов", f"{self.count} {self.count_of}" if self.count else None),
         ):
             if value:
                 lines.append(f"- {label}: {value}")
@@ -417,6 +433,8 @@ class DialogProfile:
             "budget": self.budget,
             "deadline": self.deadline,
             "region": self.region,
+            "count": self.count,
+            "count_of": self.count_of,
             "offered": self.offered,
             "rejected": self.rejected,
             "procurement_task_id": self.procurement_task_id,
@@ -470,7 +488,22 @@ def _age(low: str) -> str | None:
     match = _AGE_RANGE.search(low)
     if match:
         return f"{match.group(1)}–{match.group(2)} лет"
+    single = _AGE_SINGLE.search(low)
+    if single and 1 <= int(single.group(1)) <= 18:
+        return f"{single.group(1)} лет"
     return _first_match(low, _AGE_GROUPS)
+
+
+def _count_of(low: str) -> tuple[int, str] | None:
+    """Кратность комплектации: «на 6 групп» → (6, «группы»)."""
+    match = _COUNT_OF.search(low)
+    if not match or int(match.group(1)) < 2:
+        return None
+    unit = match.group(2).lower()
+    for label, stem in (("группы", "групп"), ("кабинеты", "кабинет"), ("комплекты", "комплект"), ("отделения", "отделени")):
+        if unit.startswith(stem):
+            return int(match.group(1)), label
+    return None
 
 
 def _budget(low: str) -> str | None:

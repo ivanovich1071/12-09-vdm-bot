@@ -483,3 +483,83 @@ def test_failed_photo_does_not_drop_the_rest_of_the_turn():
 
     assert any("Мяч гимнастический" in text for text in bot.messages), "карточка дошла текстом"
     assert any("Что дальше?" in text for text in bot.messages), "остальные ответы хода доставлены"
+
+
+# --- Пакеты G и H: контекст профиля, стражи и кнопки -------------------------------------------
+
+
+def test_single_age_is_parsed_and_not_reasked(engine):  # noqa: F811
+    """Сц. 4/14: «дети 5 лет» не парсился (нужен был диапазон) — возраст переспрашивали."""
+    session = engine.session(USER, CHANNEL)
+    session.profile.update_from_text("частный сад, дети 5 лет, нужны мячи")
+    assert session.profile.age == "5 лет"
+    changed = session.profile.update_from_text("для группы 4-5 лет")
+    assert session.profile.age == "4–5 лет" and "age" in changed
+
+
+def test_consult_root_does_not_reask_known_age(engine):  # noqa: F811
+    """Вопрос возраста в начале консультации — только когда возраст не назван."""
+    session = engine.session(USER, CHANNEL)
+    profile = session.profile
+    profile.institution, profile.room = "школа", "кабинет физики"
+    answers = []
+    for with_age in (False, True):
+        profile.age = "7 лет" if with_age else None
+        reply = engine._consult_root(session, "спортинвентарь")
+        answers.append(reply[0].text)
+    assert "возраста" in answers[0], "возраст не известен — спрашиваем"
+    assert "возраста" not in answers[1], "возраст уже назван — не переспрашиваем"
+
+
+def test_kit_quantities_multiplied_by_object_count(engine):  # noqa: F811
+    """Сц. 3/21: «на 6 групп» — нормы в файле умножаются, человек не считает сам."""
+    session = engine.session(USER, CHANNEL)
+    session.profile.remember_kit(kit())
+    one = exports._kit_table(engine, session, session.profile.kit)
+    session.profile.update_from_text("комплектация на 6 групп")
+    assert session.profile.count == 6
+    six = exports._kit_table(engine, session, session.profile.kit)
+    assert one[2] and six[2], "строки собираются"
+    # Кол-во второй позиции: 2 шт. × 6 = 12.
+    assert six[2][1][3][0] == 12, "количество умножено на число групп"
+    assert one[2][1][3][0] == 2
+    assert any("умножено на 6" in line for line in six[1])
+
+
+def test_kit_amendment_updates_positions(engine):  # noqa: F811
+    """Сц. 20: «уберите верстак из комплектации» — файл собирается по новому составу."""
+    with FakeCloudRu([]) as cloud:
+        attach(engine, client(cloud.base_url))
+        session = engine.session(USER, CHANNEL)
+        session.profile.remember_kit(kit())
+        replies = engine.handle_text(USER, CHANNEL, "Уберите верстак из комплектации")
+    said = texts(replies)
+    assert "Комплектация обновлена" in said and "Верстак" in said
+    codes = [p["code"] for p in session.profile.kit["positions"]]
+    assert "2.20.2" not in codes and "2.20.1" in codes
+    assert "export:xlsx" in actions(replies)
+
+
+def test_wrong_doc_date_and_download_claim_are_complaints():
+    """Сц. 11: «приказ № 838 от 06.09.2022»; сц. 29: «вы уже скачали файл»."""
+    from agent.verify import claims_download, invented_doc_dates
+
+    assert invented_doc_dates("данные из приказа № 838 от 06.09.2022") == ["06.09.2022"]
+    assert invented_doc_dates("приказ Минпросвещения от 28.11.2024 № 838") == []
+    assert claims_download("Список вы уже скачали файлом выше.")
+    assert not claims_download("Файл можно скачать кнопками под сообщением.")
+
+
+def test_manager_button_follows_the_text_that_calls_it(engine):  # noqa: F811
+    """Сц. 5/29/44: текст звал нажать «Связаться с менеджером», кнопки не было."""
+    agent = SimpleNamespace(engine=engine)
+    session = engine.session(USER, CHANNEL)
+    tools = SimpleNamespace(handoff_reason=None, kit=None)
+    decision = SimpleNamespace(branch="sell", sells=True)
+
+    with_button = _SalesAgent._keyboard(agent, session, tools, decision, "По срокам и ценам ответит менеджер")
+    assert with_button is not None
+    assert "manager" in [button.action for row in with_button.rows for button in row]
+
+    without = _SalesAgent._keyboard(agent, session, tools, decision, "Вот подборка мячей")
+    assert without is None or "manager" not in [button.action for row in without.rows for button in row]

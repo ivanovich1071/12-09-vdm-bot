@@ -53,10 +53,12 @@ from agent.routing import (
 )
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from agent.verify import (
+    claims_download,
     claims_handoff,
     client_ages,
     describe_refs,
     foreign_script,
+    invented_doc_dates,
     invented_norm_refs,
     invented_prices,
     listed_codes,
@@ -170,6 +172,19 @@ def _answers_deadline(answer: str) -> bool:
 def _answers_invoice(answer: str) -> bool:
     low = (answer or "").lower()
     return "менеджер" in low and "счёт" in low
+
+
+# Поправка состава комплектации: «уберите песочницу из перечня», «добавьте мольберты в комплектацию».
+_KIT_WORDS = re.compile(r"комплектаци\w*|перечн\w*|состав\w*|список", re.IGNORECASE)
+_KIT_ADD_TO = re.compile(
+    r"(?:добав\w+|включ\w+|дополн\w+)\S*\s+([^.!?\n;]{3,80}?)\s+(?:в|к)\s+(?:комплектаци\w+|перечн\w+|состав|список)",
+    re.IGNORECASE,
+)
+_KIT_REMOVE_FROM = re.compile(
+    r"(?:убер\w+|исключ\w+|убра\w+)\S*\s+(?:из\s+)?([^.!?\n;]{3,80}?)"
+    r"(?=\s+(?:из|в)\s+(?:комплектаци\w+|перечн\w+|состав\w*|списка)|[.!?\n;]|$)",
+    re.IGNORECASE,
+)
 
 
 def _about_goods(text: str) -> bool:
@@ -833,6 +848,20 @@ class SalesAgent:
                 "слова о том, что заявка менеджеру уже передана, — бот сам ничего не передаёт: "
                 "напиши, что менеджер получит заявку, когда человек оставит имя и телефон"
             )
+        if claims_download(answer):
+            # 23.09, сц. 29: «список вы уже скачали файлом» — дважды подряд, хотя человек
+            # файл не скачивал: состояния «скачано» у бота нет.
+            parts.append(
+                "слова «вы уже скачали файл» — бот не знает, скачивал ли человек: предложи "
+                "кнопки «Скачать Excel» и «Скачать Word»"
+            )
+        wrong_dates = invented_doc_dates(answer)
+        if wrong_dates:
+            # 23.09, сц. 11: «приказ № 838 от 06.09.2022» — дата выдумана, в данных 28.11.2024.
+            parts.append(
+                "даты приказов, которых нет в справочнике: " + ", ".join(wrong_dates) +
+                " — дату и номер приказа называй только из результатов инструментов"
+            )
         parts.extend(self._registry_problems(answer, session)[0])
         invented = invented_prices(answer, prices)
         if invented:
@@ -927,7 +956,12 @@ class SalesAgent:
         if answer:
             # Коды 1С нужны нам для сведения текста с карточками, но человеку в
             # ответе они ни к чему — это внутренний артикул, а не характеристика.
-            responses.append(Message(_without_codes(answer), keyboard=self._keyboard(session, tools, decision)))
+            responses.append(
+                Message(
+                    _without_codes(answer),
+                    keyboard=self._keyboard(session, tools, decision, answer),
+                )
+            )
 
         for sku in mentioned[:CARDS_SHOWN]:
             product = self.engine.index.get(sku)
@@ -986,6 +1020,30 @@ class SalesAgent:
         # а в сц. 3 трижды подряд получил «Пришлю комплектацию файлом. В каком виде?».
         deadline = intent.asks_deadline(text)
         invoice = bool(_INVOICE.search(text))
+        amended = self._try_amend_kit(session, text)
+        if amended is not None:
+            # Поправка состава пересобирает кит до файла: экспорт ниже читает уже
+            # обновлённый состав (23.09, сц. 20: файл уходил по старому).
+            if _asks_export(text) and exports.ready(session):
+                fmt = _named_format(text)
+                if fmt is not None:
+                    session.route["fallback"] = "export"
+                    label = "Excel" if fmt == exports.EXCEL else "Word"
+                    session.remember("assistant", f"Формат понял: {label}.")
+                    amended = [
+                        *amended,
+                        Message(
+                            f"Собираю файл в {label} — файл по кнопке ниже.",
+                            keyboard=exports.buttons(Keyboard().row(Button("Меню", "menu"))),
+                        ),
+                    ]
+                else:
+                    amended = [*amended, *(exports.offer(self.engine, session) or [])]
+            if deadline:
+                return [*amended, *self._deadline_note(session, invoice=invoice)], []
+            if invoice:
+                return [*amended, *self._invoice_note(session)], []
+            return amended, []
         if _asks_export(text):
             # Формат назван в самой реплике («нужна спецификация в excel») — строим файл
             # сразу. Иначе «В каком виде?» сходилось с ответом «в excel» в цикле по три
@@ -1064,6 +1122,59 @@ class SalesAgent:
                 return rooms, []
         return None, prefix
 
+    def _try_amend_kit(self, session, text: str) -> list[Response] | None:  # noqa: ANN001
+        """Поправка состава комплектации: «уберите песочницу», «добавьте мольберты».
+
+        23.09 (сц. 20) поправка в составной реплике не пересобирала кит — файл уходил
+        по старому составу. Убранное снимается по названию или коду позиции, добавленное
+        подбирается каталогом.
+        """
+        profile = session.profile
+        if not profile.kit or not _KIT_WORDS.search(text or ""):
+            return None
+        remove = _KIT_REMOVE_FROM.search(text)
+        add = _KIT_ADD_TO.search(text)
+        if remove is None and add is None:
+            return None
+
+        kit = json.loads(json.dumps(profile.kit))
+        positions = kit.get("positions") or []
+        notes: list[str] = []
+
+        if remove:
+            drop = _significant(remove.group(1))
+            drop_codes = set(_cited_codes(remove.group(1)))
+            kept = []
+            for position in positions:
+                code = str(position.get("code", ""))
+                title = [word for word in _significant(str(position.get("title", ""))) if len(word) >= 4]
+                cited = code in drop_codes or any(code.startswith(f"{want}.") for want in drop_codes)
+                if cited or (title and any(word in drop for word in title)):
+                    notes.append(f"убрал «{position.get('title')}»")
+                    continue
+                kept.append(position)
+            positions = kept
+
+        if add:
+            found = selection.select(self.engine, session, query=add.group(1), norm_item="")
+            item = found.items[0] if found is not None and found.items else None
+            if item is not None:
+                mappings = item.norm_mappings or ()
+                code = mappings[0].item_code if mappings and mappings[0].item_code else "каталог"
+                positions.append({"code": code, "title": item.name, "quantity": f"{item.quantity or 1} шт."})
+                notes.append(f"добавил «{item.name}»")
+            else:
+                notes.append(f"«{' '.join(add.group(1).split())}» в каталоге не нашлось — сверьте название")
+
+        if not notes:
+            return None
+        kit["positions"] = positions
+        profile.remember_kit(kit)
+        said = "Комплектация обновлена: " + "; ".join(notes) + ". Файл соберу по новому составу — кнопки ниже."
+        session.remember("assistant", said)
+        session.route["fallback"] = "kit_amend"
+        return [Message(said, keyboard=exports.buttons(Keyboard().row(Button("Меню", "menu"))))]
+
     def _deadline_note(self, session, keyboard: Keyboard | None = None, invoice: bool = False) -> list[Response]:  # noqa: ANN001
         """Честный ответ о сроке: данных нет, называет менеджер по заявке.
 
@@ -1094,18 +1205,21 @@ class SalesAgent:
         session.remember("assistant", _CONSULT_RETRY)
         return [Message(_CONSULT_RETRY, keyboard=self._keyboard(session, tools, decision))]
 
-    def _keyboard(self, session, tools: ToolBox, decision: Decision) -> Keyboard | None:  # noqa: ANN001
+    def _keyboard(self, session, tools: ToolBox, decision: Decision, answer: str = "") -> Keyboard | None:  # noqa: ANN001
         """Кнопки под ответом модели.
 
         «Корзина» и «Оформить» — этап продавца и только при непустой корзине. 14.09 они
         стояли под ответом консультанта на «предложи по 1057 указу»: человек ещё выясняет
         задачу, а ему предлагают оформить пустую корзину.
+
+        Ответ, зовущий менеджера, всегда несёт кнопку «Связаться с менеджером»: 23.09
+        текст звал нажать её, а кнопки под сообщением не было (сц. 5, 29, 44).
         """
         keyboard = Keyboard()
         if decision.branch == CONSULT and tools.kit:
             # Комплектация раздела — файлом (решение заказчика 14.09: кратко в чате, полностью в файле).
             exports.buttons(keyboard)
-        if tools.handoff_reason:
+        if tools.handoff_reason or "менеджер" in (answer or "").lower():
             # Ночью 14.09 кнопка вела на "menu": человек просил менеджера и получал «Чем помочь?».
             keyboard.row(Button("Связаться с менеджером", "manager"))
         if decision.sells and self.engine.storage.load_cart(session.user_id).count:
