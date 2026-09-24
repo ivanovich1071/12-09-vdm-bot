@@ -415,3 +415,37 @@ def claims_handoff(answer: str) -> bool:
         if _HANDOFF_CLAIM.search(sentence):
             return True
     return False
+
+
+# «Список вы уже скачали файлом» — бот не знает, скачивал ли человек файл, и такого
+# состояния у него нет вовсе. 23.09 (сц. 29) так отвечали дважды подряд.
+_DOWNLOAD_CLAIM = re.compile(
+    r"вы\s+уже\s+скачал\w*|уже\s+скачивал\w*|вы\s+файл\s+(?:уже\s+)?(?:скачал\w*|получил\w*|открыл\w*)|"
+    r"файл\s+у\s+вас",
+    re.IGNORECASE,
+)
+
+
+def claims_download(answer: str) -> bool:
+    """Сказано ли в ответе, что человек уже скачал файл."""
+    return bool(_DOWNLOAD_CLAIM.search(answer or ""))
+
+
+# Дата приказа — часть основания: 23.09 (сц. 11) «приказ № 838 от 06.09.2022» выдал
+# несуществующую дату, хотя правильная была в данных инструментов.
+_DOC_DATE = re.compile(
+    r"(?:приказ\w*|перечен\w*|№\s?\d{3,4})[^.\n]{0,60}?от\s+(\d{2}\.\d{2}\.\d{4})", re.IGNORECASE
+)
+
+
+def invented_doc_dates(answer: str) -> list[str]:
+    """Даты приказов, которых нет в справочнике документов."""
+    from norms.documents import DOCUMENTS
+
+    known = {
+        date
+        for doc in DOCUMENTS.values()
+        for date in re.findall(r"\d{2}\.\d{2}\.\d{4}", getattr(doc, "citation", "") or "")
+    }
+    found = _DOC_DATE.findall(answer or "")
+    return sorted({date for date in found if date not in known})
