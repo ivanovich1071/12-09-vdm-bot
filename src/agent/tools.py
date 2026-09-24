@@ -205,6 +205,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 # Код пункта или раздела в тексте ответа: «1.14.7», «2.12.15». Дата «25.12.2024» кодом не считается.
 _CODE_IN_TEXT = re.compile(r"(?<![\d.])\d{1,2}(?:\.\d{1,3}){1,5}(?!\d|\.\d)")
 
+# Юридический текст позиции, а не название раздела: «а) рельсовая система (далее — Рельсовая
+# система)…». Такой заголовок в имени файла («Комплектация_2_1_а)_рельсовая…», сц. 21) не читается.
+_LEGAL_TITLE = re.compile(r"\b[а-яё]\)|\(далее|далее\s*[-—–]|\bтребования\s+к\b", re.IGNORECASE)
+
+
+def _kit_title(item) -> str:  # noqa: ANN001 — norms.items.NormItem
+    """Заголовок комплектации — имя раздела, а не формулировка позиции.
+
+    В 838 заголовки пунктов — юридические тексты позиций («Стул ученический,
+    регулируемый по высоте…»), а имя подраздела стоит в `item.section`: файлы
+    «Комплектация_2_14_Стул_ученический…» выходили в пяти диалогах (23.09, сц.
+    11, 12, 18, 21, 29). В 1057 названия разделов короткие и живут в самом
+    `item.title` — их не трогаем.
+    """
+    title = " ".join((item.title or "").split())
+    if item.section and (len(title) > 60 or _LEGAL_TITLE.search(title)):
+        return " ".join(item.section.split())
+    return title
+
 
 class ToolBox:
     """Исполнение инструментов поверх каталога и корзины пользователя."""
@@ -436,7 +455,7 @@ class ToolBox:
                 self.kit = self.kits[f"{item.doc_id}:{item.code}"] = {
                     "document": item.doc_id,
                     "code": item.code,
-                    "title": item.title,
+                    "title": _kit_title(item),
                     "positions": [
                         {
                             "code": child.code,

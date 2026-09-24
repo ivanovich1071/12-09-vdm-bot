@@ -316,4 +316,9 @@ def _text(value: Any) -> str:
 
 
 def _filename(title: str) -> str:
-    return re.sub(r'[\\/:*?"<>|«»]+', "", title)[:80].strip() or "Список"
+    clean = re.sub(r'[\\/:*?"<>|«»]+', "", title).strip()
+    if len(clean) > 60:
+        # По границе слова: «…по_высотестул_у.xlsx» из сц. 29 — обрыв посреди склейки.
+        space = clean[:60].rfind(" ")
+        clean = clean[:space] if space > 30 else clean[:60]
+    return clean.rstrip(" ,;-") or "Список"

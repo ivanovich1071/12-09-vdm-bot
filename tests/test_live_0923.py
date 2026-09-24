@@ -13,6 +13,7 @@ from agent.routing import _also_asks_other, _asks_export
 from agent.tools import ToolBox
 from core import exports
 from core.ui import Message
+from norms.items import ItemIndex, NormItem
 from test_agent import (  # noqa: F401 — engine: фикстура
     CHANNEL,
     USER,
@@ -181,3 +182,61 @@ def test_single_kit_registered_without_code_in_answer(engine):  # noqa: F811
     assert tools.kit_for("Вот состав кабинета технологии, файл по кнопке.") is None
     tools.kits["order_838:2.14"] = {**section, "code": "2.14"}
     assert tools.single_kit() is None, "разделов несколько без кода в ответе — файл не угадываем"
+
+
+# --- Пакет C: имена файлов китов 838 — имя раздела, а не текст позиции -----------------------
+
+
+def _with_norms(dialog):  # noqa: ANN001
+    dialog.norm_texts = ItemIndex(
+        {
+            "order_838": {
+                "2.14": NormItem(
+                    "order_838",
+                    "2.14",
+                    "Стул ученический, регулируемый по высоте, рост 1-4 (далее — Стул ученический)",
+                    section="Подраздел 14. Мебель ученическая",
+                ),
+                "2.14.1": NormItem("order_838", "2.14.1", "Стул ученический, рост 1", section="Подраздел 14. Мебель ученическая"),
+            },
+            "order_1057": {
+                "1.14": NormItem("order_1057", "1.14", "Групповые помещения"),
+                "1.14.2.2.1": NormItem("order_1057", "1.14.2.2.1", "Шкаф для раздевальной"),
+            },
+        }
+    )
+    return dialog
+
+
+def test_838_kit_file_named_by_section(engine):  # noqa: F811
+    """Сц. 11/12/18/21/29: файл кита назывался текстом позиции («Комплектация_2_14_Стул_ученический…»)."""
+    engine = _with_norms(engine)
+    tools = ToolBox(engine, engine.session(USER, CHANNEL))
+    brief = tools._item_brief(engine.norm_texts.get("order_838", "2.14"), with_positions=True)
+    assert "Стул ученический" in brief["title"], "модель по-прежнему видит формулировку позиции"
+    assert tools.kit["title"] == "Подраздел 14. Мебель ученическая", "файл — имя раздела"
+    assert [p["code"] for p in tools.kit["positions"]] == ["2.14.1"]
+
+
+def test_1057_kit_file_names_unchanged(engine):  # noqa: F811
+    """Короткие названия разделов 1057 остаются в имени файла как были."""
+    engine = _with_norms(engine)
+    tools = ToolBox(engine, engine.session(USER, CHANNEL))
+    tools._item_brief(engine.norm_texts.get("order_1057", "1.14"), with_positions=True)
+    assert tools.kit["title"] == "Групповые помещения"
+
+
+def test_long_kit_filename_cuts_at_word_boundary(engine):  # noqa: F811
+    """Сц. 29: имя резалось посреди склейки — «…по_высотестул_у.xlsx»."""
+    session = engine.session(USER, CHANNEL)
+    long_title = (
+        "Стул ученический, регулируемый по высоте, с полкой для книг и крючком для портфеля, "
+        "окраска светлых тонов, комплект поставки без сборки"
+    )
+    session.profile.remember_kit({**kit(), "title": long_title})
+    file = exports.build(engine, session, exports.EXCEL)
+    assert file is not None
+    stem = file.filename.rsplit(".", 1)[0]
+    assert len(stem) <= 60
+    assert not stem.endswith((" ", ",", ";", "-")), "обрез не оставляет мусор"
+    assert stem.count(" ") >= 3, "слова не склеиваются в одно"
