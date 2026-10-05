@@ -238,7 +238,9 @@ _CODE_MENTION = re.compile(
     # «Артикул» — только целым словом: 14.09 «Артикуляционная моторика» превратилась в «, мимика».
     # Слово после «код 1С» вырезается, только если это и правда код: с цифрой внутри.
     # 16.09 «или код 1С товара — отвечу» превратилось в «или— отвечу».
-    r"[ \t]*[(\[]?[ \t]*(?:\*\*)?(?:код\s*1\s*[СCc]|артикул(?![а-яё]))[\s*:]*(?=[A-Za-z0-9А-ЯЁа-яё\-]*\d)[A-Za-z0-9А-ЯЁа-яё\-]+[ \t]*[)\]]?",
+    # Код в бэктиках и кавычках вырезается целиком: «код 1С: `0Э-00006646`»
+    # уходило клиенту служебным кодом (прогон 04.10, BUG-13; К6.2).
+    r"[ \t]*[(\[]?[ \t]*(?:\*\*)?(?:код\s*1\s*[СCc]|артикул(?![а-яё]))[\s:*«»„“\"'`]*(?=[A-Za-z0-9А-ЯЁа-яё\-`»«„“\"']*\d)[A-Za-z0-9А-ЯЁа-яё\-`»«„“\"']+[ \t]*[)\]»«„“\"'`]?",
     re.IGNORECASE,
 )
 # Запятая от вырезанного кода: «Мат детский, артикул Д-214, 8 164 ₽» → «Мат детский,, 8 164 ₽».
@@ -587,7 +589,15 @@ class SalesAgent:
         """
         if self._mentioned_skus(tools, answer):
             return answer
-        products = self._section_products(tools, answer)
+        wanted = _cited_codes(answer)
+        exact = _exact_code_products(self.engine, tools, wanted)
+        if wanted and not exact:
+            # Модель перечислила пункты, которых в каталоге нет: дописывать «товары
+            # того же раздела» нельзя — под текстом про столы 2.14.1–2.14.3 приходили
+            # термометры (прогон 04.10, сц. 13; К6.1). Говорим об отсутствии прямо.
+            named = ", ".join(sorted(wanted)[:4])
+            return answer + "\n\nПо пунктам " + named + " товаров в каталоге нет."
+        products = exact or self._section_products(tools, answer)
         if not products:
             return answer
         lines = [
@@ -603,14 +613,7 @@ class SalesAgent:
         # быть про один и тот же список. 23.09 на «первые три пункта 1.14.5.1.1-3»
         # блок «Что по этим пунктам есть в каталоге» брал первые три товара раздела —
         # и карточки расходились со списком (сц. 1, 7, 12).
-        exact = []
-        for sku in _unique(tools.shown_skus):
-            product = self.engine.index.get(sku)
-            code = _name_code(product.name) if product is not None else ""
-            if code and any(
-                code == want or code.startswith(f"{want}.") or want.startswith(f"{code}.") for want in wanted
-            ):
-                exact.append(product)
+        exact = _exact_code_products(self.engine, tools, wanted)
         if exact:
             return exact[:CARDS_SHOWN]
 
@@ -867,7 +870,9 @@ class SalesAgent:
         # каталога и на возражении оборачивался «консультант временно недоступен» (ночь 15.09).
         for text in (second, answer):
             kept = without_unverified(text, prices, refs, self._registry_problems(text, session)[1])
-            if len(kept) >= MIN_KEPT:
+            # Ответ, урезанный до одной служебной ноты, не отправляется (сц. 1, ход 2):
+            # в остатке должна быть цена, код или список, а не только приветствие.
+            if len(kept) >= MIN_KEPT and _substantial(kept):
                 log.warning("Ответ выдуман повторно — строки с неподтверждённым убраны.")
                 session.route["fallback"] = "unverified_lines_removed"
                 cut_norms = bool(invented_norm_refs(text, refs)) or bool(self._registry_problems(text, session)[0])
@@ -1505,6 +1510,24 @@ def _short_kit_answer(answer: str) -> str:
     cut = answer.rfind("\n", 0, budget)
     body = answer[: cut if cut > 0 else budget].rstrip()
     return "\n\n".join(part for part in (body, _KIT_TAIL, question) if part)
+
+
+def _exact_code_products(engine, tools: ToolBox, wanted: set[str]) -> list:  # noqa: ANN001 — DialogEngine
+    """Показанные товары, чей код из названия входит в названные пункты."""
+    exact = []
+    for sku in _unique(tools.shown_skus):
+        product = engine.index.get(sku)
+        code = _name_code(product.name) if product is not None else ""
+        if code and any(
+            code == want or code.startswith(f"{want}.") or want.startswith(f"{code}.") for want in wanted
+        ):
+            exact.append(product)
+    return exact
+
+
+def _substantial(text: str) -> bool:
+    """В остатке после проверки есть содержание: цена, код или список позиций."""
+    return bool(re.search(r"\d|•|\n\s*[-*]|товар|пози", text or ""))
 
 
 def _without_codes(answer: str) -> str:

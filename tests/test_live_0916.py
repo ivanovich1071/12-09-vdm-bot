@@ -154,8 +154,10 @@ def test_the_list_in_the_text_is_built_from_the_cards_that_follow():
 
     text = agent._with_catalog_positions(tools, POINTS_ANSWER)
 
-    assert "2.14.106" in text and "40 250 ₽" in text
-    assert agent._mentioned_skus(tools, text) == ["0Э-1"]
+    # К6.1 (план 05-10): пунктов 2.14.1-2.14.3 в каталоге нет — чужой раздел
+    # («2.14.106 Установка для фотоэффекта») под текстом про столы не дописывается.
+    assert "2.14.106" not in text and "40 250" not in text
+    assert "товаров в каталоге нет" in text
 
 
 def test_products_of_another_section_are_not_added_to_the_answer():
@@ -163,7 +165,9 @@ def test_products_of_another_section_are_not_added_to_the_answer():
     tools = ToolBox(None, None)
     tools.shown_skus = ["0Э-2"]
 
-    assert agent._with_catalog_positions(tools, POINTS_ANSWER) == POINTS_ANSWER
+    text = agent._with_catalog_positions(tools, POINTS_ANSWER)
+    assert "Фрезерный станок" not in text
+    assert "товаров в каталоге нет" in text
 
 
 # --- «Оформить» словами ----------------------------------------------------------------------
