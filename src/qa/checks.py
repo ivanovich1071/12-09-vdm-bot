@@ -36,6 +36,9 @@ LABELS = {
     "ZERO_PREORDER": "предзаказ на 0 ₽",
     "FALSE_HANDOFF": "«передал» без заявки",
     "PROMISE": "скидка или бесплатная доставка без источника",
+    # Прогон 04.10: ходы без модели считаются отдельно — так видно работу запасного пути (К1/К8).
+    "DEGRADED": "ответ-заглушка «консультант недоступен»",
+    "FALLBACK_OFFER": "подбор без модели (запасной путь)",
 }
 
 _PRICE = re.compile(r"(\d{1,3}(?:[   ]\d{3})+|\d+)\s*₽")
@@ -58,6 +61,22 @@ _HANDOFF = re.compile(r"\bпередал[аи]?\b", re.IGNORECASE)
 # Эталон сценариев 15.09 обещает «скидку 5–10 %» и «бесплатную доставку от 100 000» — у магазина таких правил нет.
 _DISCOUNT = re.compile(r"скидк\w*[^.\n]{0,40}?\d{1,2}\s*(?:[-–—]\s*\d{1,2}\s*)?%|\d{1,2}\s*%[^.\n]{0,20}скидк", re.IGNORECASE)
 _FREE_DELIVERY = re.compile(r"бесплатн\w*\s+доставк|доставк\w*[^.\n]{0,40}бесплатн", re.IGNORECASE)
+# Деградация и запасной подбор без модели (прогон 04.10: 23 деградации, 74 хода без вызова модели).
+_DEGRADED = re.compile(r"проще\s+обычного", re.IGNORECASE)
+_FALLBACK_OFFER = re.compile(r"могу\s+предложить\s+товары\s+из\s+каталога", re.IGNORECASE)
+# Служебные сообщения и строки («Что дальше?», «Подбор из каталога», меню документов) — не основной
+# текст ответа: в сравнении повторов REPEAT они шумели (41 % «повторов» прогона 04.10 — это меню).
+_SERVICE_MESSAGE = re.compile(
+    r"^\s*(?:что\s+дальше\s*\??|выберите\s+раздел\s+каталога\s*:?|по\s+какому\s+документу\s+подбираем\s*\??|"
+    r"подбор\s+из\s+каталога\s*:?|меню|главное\s+меню|начать\s+заново\s*\??)[\s:!.]*$",
+    re.IGNORECASE,
+)
+_SERVICE_LINE = re.compile(
+    r"^\s*(?:что\s+дальше\s*\??|подбор\s+из\s+каталога\s*:?|могу\s+предложить\s+товары\s+из\s+каталога\s*[:—-]?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Названия товаров и цитаты: код внутри («7.71.2», артикул «1.13.3.2.2и») — не пункт приказа (BUG-13).
+_QUOTED = re.compile(r"[«»„“\"`][^«»„“\"`]{1,120}[«»„“\"`]")
 
 
 class CatalogFacts:
@@ -92,6 +111,12 @@ def check_turn(turn: Turn, facts: CatalogFacts, history: list[str], said: list[s
     elif turn.seconds > SLOW_WARNING:
         findings.append(Finding("SLOW", "warning", f"первый ответ через {turn.seconds:.0f} с"))
 
+    joined = "\n".join(message.text for message in turn.messages if message.text)
+    if _DEGRADED.search(joined):
+        findings.append(Finding("DEGRADED", "warning", "бот ответил заглушкой «проще обычного»"))
+    if turn.seconds < 2.0 and _FALLBACK_OFFER.search(joined):
+        findings.append(Finding("FALLBACK_OFFER", "warning", f"подбор без модели за {turn.seconds:.1f} с"))
+
     for message in turn.messages:
         text = message.text
         if error := _ERROR.search(text):
@@ -110,7 +135,11 @@ def check_turn(turn: Turn, facts: CatalogFacts, history: list[str], said: list[s
         elif promise := _FREE_DELIVERY.search(text):
             findings.append(Finding("PROMISE", "warning", _around(text, promise.start())))
         if facts.points:
-            for code in _POINT.findall(text):
+            # Код внутри названия товара или цитаты — не пункт приказа (артикул «7.71.2» в названии).
+            scan = text
+            if _SKU.search(text):  # карточка: первая строка — название товара
+                scan = "\n".join(scan.splitlines()[1:])
+            for code in _POINT.findall(_QUOTED.sub(" ", _LIST_LINE.sub(" ", scan))):
                 if code not in facts.points:
                     findings.append(Finding("UNKNOWN_POINT", "warning", f"пункт {code}"))
 
@@ -124,22 +153,38 @@ def check_turn(turn: Turn, facts: CatalogFacts, history: list[str], said: list[s
     findings += _other_age(turn, said or [])
     findings += _cards_off_list(turn)
 
-    seen =[_norm(message.text)[:300] for message in turn.messages if message.text.strip()]
+    seen = [_norm(message.text)[:300] for message in turn.messages if message.text.strip()]
     if len(set(seen)) < len(seen):
         findings.append(Finding("DUPLICATE", "warning", "бот прислал одно и то же несколько раз"))
-    earlier = {_norm(text)[:300] for text in history if text.strip()}
-    if any(text in earlier for text in seen):
+    # REPEAT — только по основному тексту ответа, без служебных сообщений и строк-обёрток:
+    # иначе меню и «Что дальше?» считают повтором (К8, прогон 04.10).
+    main = _substantive(message.text for message in turn.messages if message.text.strip())
+    if main and any(text in _substantive(history) for text in main):
         findings.append(Finding("REPEAT", "warning", "ответ слово в слово повторяет прошлый"))
     return _unique(findings)
+
+
+def _substantive(texts: Iterable[str]) -> list[str]:
+    """Основной текст ответов: без чисто служебных сообщений и строк-обёрток выдачи."""
+    result = []
+    for text in texts:
+        if _SERVICE_MESSAGE.match(text):
+            continue
+        cleaned = _norm(_SERVICE_LINE.sub(" ", text))
+        if len(cleaned) >= 30:
+            result.append(cleaned[:300])
+    return result
 
 
 def _prices(text: str, facts: CatalogFacts) -> list[Finding]:
     found: list[Finding] = []
     sku = _SKU.search(text)
     if sku:
-        product = facts.by_sku.get(sku.group(1))
+        # Код в обратных кавычках или цитате — не повод для «не из каталога» (0Э-00006646 ушёл за кавычки).
+        code = sku.group(1).strip("`«»„“\"'(),.;:")
+        product = facts.by_sku.get(code)
         if product is None:
-            return [Finding("UNKNOWN_SKU", "error", f"код 1С {sku.group(1)}")]
+            return [Finding("UNKNOWN_SKU", "error", f"код 1С {code}")]
         prices = [_amount(value) for value in _PRICE.findall(text)]
         if product.price is not None and prices and product.price not in prices:
             found.append(
