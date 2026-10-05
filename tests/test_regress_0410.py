@@ -65,7 +65,11 @@ def new_task() -> ProcurementTask:
 
 
 def flat(responses) -> str:
-    """Весь текст ответа хода: сообщения, заголовки, названия карточек, строки корзины."""
+    """Весь текст ответа хода: сообщения, заголовки, названия карточек, строки корзины.
+
+    Карточка в Telegram несёт «Код 1С: …» (проверка CARD_TEXT по нему и работает),
+    поэтому для карточек он добавлен сюда же.
+    """
     parts: list[str] = []
     for response in responses:
         if isinstance(response, Message):
@@ -75,9 +79,11 @@ def flat(responses) -> str:
             parts += [card.product.name for card in response.cards]
         elif isinstance(response, ProductCard):
             parts.append(response.product.name)
+            parts.append(f"Код 1С: {response.product.sku_1c}")
         elif isinstance(response, OrderSummary):
             parts.append(response.note or "")
             parts += [f"{line.name} × {line.quantity}" for line in response.lines]
+            parts.append(f"Итого: {response.total} ₽")
     return "\n".join(part for part in parts if part)
 
 
@@ -193,7 +199,7 @@ class TestCoreFallback:
 
     def test_collect_all_by_shown_list(self, engine):
         """BUG-03 (главный кейс): «по этому списку подбери все по 1 шт.» собирает корзину."""
-        engine.handle_text(USER, CHANNEL, "что входит в пункт 1.5.1 приказа 1057")
+        engine.handle_text(USER, CHANNEL, "покажите позиции по пункту 1.5.1 приказа 1057")
         out = flat(engine.handle_text(USER, CHANNEL, "по этому списку подбери все по 1 шт."))
         assert not engine.storage.load_cart(USER).is_empty
         assert "не нашлось" not in out.lower()

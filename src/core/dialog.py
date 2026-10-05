@@ -458,6 +458,35 @@ class DialogEngine:
         if action is not None:
             return self._handle_action(user_id, channel, action)
 
+        # Запрос менеджера — первым (шаг 4.1): ни анкета, ни подбор, ни модель
+        # его не глотают. «Позовите человека» — это просьба, а не имя контакта.
+        if intent.asks_manager(text):
+            return self._manager(session)
+
+        # Корзина словами (шаги 4.2–4.3): «возьму X 4 шт.» и «по этому списку
+        # по 1 шт.» — действия ядра, они работают и без модели (BUG-03/04).
+        has_procurement = self.procurement_service() is not None
+        if has_procurement and intent.asks_add(text):
+            handled = self.add_by_text(session, text)
+            if handled is not None:
+                self._remember(session)
+                return handled
+        if has_procurement and intent.asks_list_to_cart(text):
+            self._remember(session)
+            return self._collect_list(session, text)
+        # Вопросы о показанном — кодом (шаги 4.5–4.8), но только без модели:
+        # с агентом возражение «дорого» ведёт модель (цена из показанного,
+        # подсказка «разбить сейчас/потом»), а код — её запасной путь.
+        if (
+            self.agent is None
+            and has_procurement
+            and intent.classify(text) not in (intent.GREETING, intent.SMALL_TALK, intent.NORM_QUESTION)
+        ):
+            handled = self._shown_actions(session, text)
+            if handled is not None:
+                self._remember(session)
+                return handled
+
         # Профиль обновляем до ответа: то, что человек сказал сейчас, должно
         # попасть в промпт этого же хода, а не следующего.
         session.profile.update_from_text(text)
@@ -722,6 +751,153 @@ class DialogEngine:
             )
         ]
 
+    def _cart_keyboard(self) -> Keyboard:
+        return Keyboard().row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
+
+    def _offered_products(self, session: Session) -> list[Product]:
+        """Показанные в разговоре товары в порядке показа, без повторов."""
+        products = []
+        for sku in dict.fromkeys(session.profile.offered):
+            product = self.index.get(sku)
+            if product is not None:
+                products.append(product)
+        return products
+
+    def add_by_text(self, session: Session, text: str) -> list[Response] | None:
+        """«Возьму X 4 шт. / добавьте коврики» — корзина словами (шаг 4.2, BUG-04/05).
+
+        Сопоставляем с показанным: назвали однозначно — кладём и отчитываемся;
+        несколько кандидатов — карточки с кнопкой «В корзину». Ничего узнаваемого —
+        None: реплика уходит в обычный подбор.
+        """
+        low = (text or "").lower()
+        matches = []
+        for product in self._offered_products(session):
+            words = [w for w in product.name.lower().split() if len(w) >= 5]
+            if any(w in low for w in words):
+                matches.append(product)
+        if not matches:
+            return None
+        numbers = [int(n) for n in re.findall(r"(\d{1,3})\s*(?:шт|штук|комплект)", low)]
+        if not numbers:
+            single = re.search(r"\b(\d{1,3})\b", low)
+            numbers = [int(single.group(1))] if single and int(single.group(1)) <= 500 else []
+        responses: list[Response] = []
+        for index, product in enumerate(matches):
+            if index < len(numbers):
+                quantity = numbers[index]
+            elif len(numbers) == 1 and len(matches) == 1:
+                quantity = numbers[0]
+            else:
+                quantity = 1
+            responses += self._add(session, product.sku_1c, quantity)
+        cart = self.storage.load_cart(session.user_id)
+        responses.append(
+            Message(f"В корзине {cart.count} шт. на {cart.total} ₽.", keyboard=self._cart_keyboard())
+        )
+        return responses
+
+    def _collect_list(self, session: Session, text: str) -> list[Response]:
+        """«По этому списку подбери все по 1 шт.» — корзина и сводка (шаг 4.3, BUG-03).
+
+        Главный кейс заказчика: раньше фраза без слова «оформить» уходила в отказ
+        «это следующий этап». Теперь показанный список кладётся в корзину кодом.
+        """
+        each = intent.each_quantity(text) or 1
+        skus = list(dict.fromkeys(session.profile.offered))
+        if not skus:
+            return [
+                Message(
+                    "Список уже ушёл из разговора. Покажите его ещё раз — и я соберу корзину.",
+                    keyboard=self._offer_menu(),
+                )
+            ]
+        for sku in skus:
+            self._add(session, sku, each)
+        cart = self.storage.load_cart(session.user_id)
+        return [
+            Message(
+                f"Собрал по списку: {len(skus)} поз. по {each} шт. "
+                f"В корзине {cart.count} шт. на {cart.total} ₽.",
+                keyboard=self._cart_keyboard(),
+            )
+        ]
+
+    def _shown_actions(self, session: Session, text: str) -> list[Response] | None:
+        """Вопросы о показанном — ответ кодом, а не новый подбор (шаги 4.5–4.8)."""
+        low = (text or "").lower().replace("ё", "е")
+        if re.search(r"подробнее|какой код|какая цена|размеры и код", low):
+            sku = self._sku_of_reference(session, text, low)
+            if sku:
+                return self._card(session, sku)
+        if re.search(r"сколько стоит (весь |целый |весь\s+)?(комплект|список|заказ|набор)|сколько всего", low):
+            return self._total_reply(session)
+        if re.search(r"(вы\s+)?добав(ил|или|ите)|где мои позиции|что в корзине|коврики добавили", low):
+            return self._show_cart(session)
+        if discovery.is_rejection(text) and discovery.objection_of(text) == "price":
+            return self._objection_reply(session)
+        return None
+
+    def _sku_of_reference(self, session: Session, text: str, low: str) -> str | None:
+        """Какой показанный товар назван: «по первой» — первый, иначе по словам названия."""
+        offered = list(dict.fromkeys(session.profile.offered))
+        if not offered:
+            return None
+        if re.search(r"по перв|первого|первую|первый", low):
+            return offered[0]
+        if re.search(r"по втор|второго", low) and len(offered) > 1:
+            return offered[1]
+        if re.search(r"по трет|третьего", low) and len(offered) > 2:
+            return offered[2]
+        for sku in offered:
+            product = self.index.get(sku)
+            if product is None:
+                continue
+            words = [w for w in product.name.lower().split() if len(w) >= 5]
+            if any(w in low for w in words):
+                return sku
+        return offered[0] if re.search(r"подробнее", low) else None
+
+    def _total_reply(self, session: Session) -> list[Response]:
+        """«Сколько стоит весь комплект?» — сумма показанного (ТЗ BUG-09)."""
+        priced = [p for p in self._offered_products(session) if p.price is not None]
+        if not priced:
+            return [
+                Message(
+                    "Я ничего ещё не показывал — назовите товар или пункт, и я посчитаю.",
+                    keyboard=self._offer_menu(),
+                )
+            ]
+        lines = [
+            OrderLine(name=p.name, quantity=1, price=p.price, sku_1c=p.sku_1c)
+            for p in priced
+        ]
+        total = sum(p.price for p in priced)
+        return [
+            OrderSummary(
+                lines=lines,
+                total=total,
+                note="Сумма по показанному; счёт и скидку назовёт менеджер.",
+                keyboard=self._offer_menu(),
+            )
+        ]
+
+    def _objection_reply(self, session: Session) -> list[Response]:
+        """Возражение «дорого / у других дешевле» — удержание, а не заглушка (шаг 4.5)."""
+        contact = self.settings.manager_contact
+        priced = [p for p in self._offered_products(session) if p.price]
+        cheaper = sorted(priced, key=lambda p: p.price or 0)[:3]
+        head = f"Понимаю. Скидку назовёт менеджер: {contact}."
+        if cheaper:
+            lines = "\n".join(f"• {p.name} — {p.price} ₽" for p in cheaper)
+            body = f"{head}\n\nИз этой же задачи есть дешевле:\n{lines}\n\nМогу разбить на «обязательно сейчас / можно потом» — скажите."
+        else:
+            body = (
+                f"{head}\n\nМогу подобрать дешевле из той же задачи или разбить "
+                "на «обязательно сейчас / можно потом» — скажите."
+            )
+        return [Message(body, keyboard=self._offer_menu())]
+
     def select_offer(self, session: Session, text: str, header: str = "Подобрал в каталоге") -> list[Response]:
         """Подбор по реплике через Procurement Core.
 
@@ -734,6 +910,12 @@ class DialogEngine:
         # Содержательный ответ ядра выводит разговор из деградации.
         session.degradation_streak = 0
         profile = session.profile
+        # Вопросы о показанном — кодом, до подбора: «подробнее по первой» не должен
+        # искать по своим же словам (шаги 4.5–4.8).
+        if about and code is None:
+            handled = self._shown_actions(session, text)
+            if handled is not None:
+                return handled
         if code is None and discovery.is_rejection(text):
             # Два «не то» подряд — стоп (прогон 04.10, сц. 5 и 9: логопед 11 раз
             # получил следующую тройку мусора). Дальше — менеджер, а не листание.
@@ -1866,6 +2048,12 @@ class DialogEngine:
         ]
 
     def _collect_contact(self, session: Session, text: str) -> list[Response]:
+        # «Позовите человека» посреди анкеты — передача менеджеру, а не имя
+        # контакта в заявке (ТЗ BUG-02, шаг 4.1).
+        if intent.asks_manager(text):
+            session.checkout_step = None
+            session.pending_checkout = False
+            return self._manager(session)
         step = session.checkout_step or 0
         field_name, _ = CHECKOUT_FIELDS[step]
         value = "" if text.strip() in {"-", "—", "нет"} else text.strip()

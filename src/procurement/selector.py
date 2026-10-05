@@ -121,6 +121,7 @@ def _point_order(candidate: Candidate) -> tuple[int, ...]:
     return min(numbers) if numbers else (99,)
 
 
+_AUDIENCE_BY_DOCUMENT = {"order_1057": "preschool", "order_838": "school"}
 # Заготовка «Оснащения новостроек»: витринная копия с номером пункта в начале
 # названия («1.13.3.2.2 Доска магнитно-маркерная»), без привязки и без наличия.
 _STUB_NAME = re.compile(r"^\s*(\d{1,2}(?:\.\d{1,3}){1,5})и?\s+\S")
@@ -268,6 +269,11 @@ class ProcurementSelector:
             subjects = _subjects(requirement.user.text)
             stems = _stems(requirement.user.text)
             strict = [c for c in matched if _subject_hit(c, stems)]
+            if strict:
+                # Предпочитаем позициям, отвечающим ОДНОМУ слову запроса, те, где
+                # в названии есть все («волейбольный мяч», а не любой «мяч»).
+                full = [c for c in strict if _all_stems_hit(c, stems)]
+                strict = full or strict
             if matched and not strict:
                 candidates = []
             else:
@@ -319,11 +325,14 @@ class ProcurementSelector:
     def catalog_query(self, requirement: ProcurementRequirement, catalog_size: int) -> CatalogQuery:
         user, norm = requirement.user, requirement.norm
         text = user.text
+        # Названный документ диктует аудиторию (ТЗ BUG-23): «покажите позиции по
+        # пункту 1.5.1 приказа 1057» без «детского сада» — это садовский перечень.
+        audience = requirement.audience or _AUDIENCE_BY_DOCUMENT.get(norm.document)
         if user.room and requirement.catalog_room is None:
             text = f"{text} {user.room}".strip()
         return CatalogQuery(
             query=text,
-            institution_type=requirement.audience,
+            institution_type=audience,
             institution_name=user.institution_name,
             zone=user.zone,
             age_group=user.age_group,
@@ -553,6 +562,15 @@ def _named(candidates: list[Candidate], text: str) -> bool:
     if not stems:
         return bool(candidates)
     return any(_subject_hit(candidate, stems) for candidate in candidates)
+
+
+def _all_stems_hit(candidate: Candidate, stems: list[str]) -> bool:
+    """В названии есть каждое слово запроса, а не хоть одно."""
+    if not stems:
+        return True
+    name_stems = set(catalog_text.stems(_plain(candidate.product.name)))
+    name = _plain(candidate.product.name)
+    return all(stem in name_stems or stem in name for stem in stems)
 
 
 def _subject_hit(candidate: Candidate, stems: list[str]) -> bool:
