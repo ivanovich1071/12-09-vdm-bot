@@ -70,8 +70,19 @@ class PreorderService:
 
     # --- Создание ---------------------------------------------------------------
 
+    def ready(
+        self,
+        owner: str,
+        *,
+        source: str | None = None,
+        source_id: str | None = None,
+        fingerprint: str | None = None,
+    ) -> Preorder | None:
+        """Готовый предзаказ того же состава: повтор «Оформить» не плодит копии (шаг 5.3)."""
+        return self.repository.find_ready(owner, source=source, source_id=source_id, fingerprint=fingerprint)
+
     def create_from_specification(
-        self, spec_id: str, owner: str, channel: str, comment: str | None = None
+        self, spec_id: str, owner: str, channel: str, comment: str | None = None, fingerprint: str | None = None
     ) -> Preorder:
         spec = self.procurement.get_specification(spec_id, owner)
         if spec.status is SpecificationStatus.SUPERSEDED:
@@ -132,7 +143,7 @@ class PreorderService:
             item.price_status == PriceStatus.PRICE_NOT_FOUND or str(item.norm_status) in _REVIEW_NORMS
             for item in items_tuple
         )
-        preorder = self._new(owner, channel, PreorderSource.SPECIFICATION, spec.id, None, version, spec.norm_version, items_tuple, review, warnings, comment)
+        preorder = self._new(owner, channel, PreorderSource.SPECIFICATION, spec.id, None, version, spec.norm_version, items_tuple, review, warnings, comment, fingerprint=fingerprint)
         for status in (PreorderStatus.PRICE_CHECKED, PreorderStatus.READY_FOR_MANAGER):
             preorder = preorder.with_status(status, SYSTEM, self._now())
         self.repository.save(preorder)
@@ -140,7 +151,9 @@ class PreorderService:
         self.procurement.enter_order(spec.task_id, owner)
         return preorder
 
-    def create_from_order(self, order_id: str, owner: str, channel: str, comment: str | None = None) -> Preorder:
+    def create_from_order(
+        self, order_id: str, owner: str, channel: str, comment: str | None = None, fingerprint: str | None = None
+    ) -> Preorder:
         order = self.orders.get_order(order_id, owner)
         evaluation = self.orders.latest_evaluation(order_id, owner)
         if evaluation is None:
@@ -195,6 +208,7 @@ class PreorderService:
             evaluation.status is EvaluationStatus.REVIEW_REQUIRED,
             [],
             comment,
+            fingerprint=fingerprint,
         )
         for status in (
             PreorderStatus.IMPORTED,
@@ -353,7 +367,7 @@ class PreorderService:
 
     # --- Внутреннее ---------------------------------------------------------------
 
-    def _new(self, owner, channel, source, source_id, evaluation_id, version, norm_version, items, review, warnings, comment) -> Preorder:  # noqa: ANN001
+    def _new(self, owner, channel, source, source_id, evaluation_id, version, norm_version, items, review, warnings, comment, fingerprint=None) -> Preorder:  # noqa: ANN001
         now = self._clock()
         stamp = now.isoformat(timespec="seconds")
         preorder = Preorder(
@@ -373,6 +387,7 @@ class PreorderService:
             updated_at=stamp,
             warnings=tuple(warnings),
             comment=(comment or "").strip()[:1000] or None,
+            fingerprint=fingerprint,
         )
         return replace(preorder, history=(PreorderEvent(PreorderStatus.DRAFT, SYSTEM, stamp, None),))
 

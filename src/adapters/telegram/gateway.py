@@ -156,6 +156,14 @@ class TelegramGateway:
                 return [note, *self.core.message_primitives(self.session(user_id), text)]
         if command == "/order":
             return self._guard(lambda: self._checkout(user_id))
+        if (
+            not command
+            and self.core.says_checkout(stripped)
+            and not self.storage.load_cart(user_id).is_empty
+        ):
+            # Текстовое «оформить» ведёт в тот же поток спецификации и предзаказа,
+            # что и /order и кнопка: один путь во всех каналах (шаг 5.1, К7).
+            return self._guard(lambda: self._checkout(user_id))
         if command == "/spec":
             return self._guard(lambda: self._cart_specification(user_id))
         if command == "/preorders":
@@ -288,7 +296,9 @@ class TelegramGateway:
         if previous is not None and previous[0] == fingerprint:
             return previous[1]
         session = self.session(user_id)
-        spec_result, preorder_result = self.core.checkout(session)
+        # Отпечаток корзины теперь и в базе (шаг 5.3): после перезапуска повторное
+        # «Оформить» того же состава возвращает готовый предзаказ, а не копию.
+        spec_result, preorder_result = self.core.checkout(session, fingerprint=_fingerprint_key(fingerprint))
         spec, preorder = spec_result.data, preorder_result.data
         assert isinstance(spec, dto.SpecificationOut) and isinstance(preorder, dto.PreorderOut)
         replies = [
@@ -327,7 +337,7 @@ class TelegramGateway:
         if cached is not None:
             return cached
         session = self.session(user_id)
-        preorder = self.core.create_preorder(session, source, source_id, None).data
+        preorder = self.core.create_preorder(session, source, source_id, None, fingerprint=f"{source}:{source_id}").data
         assert isinstance(preorder, dto.PreorderOut)
         replies = self._offer_preorder(user_id, preorder)
         self._last_preorder[key] = replies
@@ -386,7 +396,11 @@ class TelegramGateway:
         # клиент, написавший и в Telegram, и на сайте, должен видеть одно и то же.
         settings = self.core.services.settings
         amount = sent.totals.get("amount")
-        lines = [order_accepted(sent.id, amount, delivered=sent.status == "SENT_TO_MANAGER")]
+        test = getattr(sent, "owner", "") in settings.qa_user_ids
+        if test:
+            lines = [order_accepted(sent.id, amount, delivered=False, test=True)]
+        else:
+            lines = [order_accepted(sent.id, amount, delivered=sent.status == "SENT_TO_MANAGER")]
         note = delivery_note(amount, settings.min_delivery_rub, settings.delivery_url)
         if note:
             lines.append(note)
@@ -438,6 +452,11 @@ def _about_something_else(text: str) -> bool:
     """Реплика во время ожидания контакта — про другое, а не имя с телефоном."""
     lowered = text.lower()
     return "?" in text or len(text.split()) > NAME_WORDS or any(word in lowered for word in _ASKING_WORDS)
+
+
+def _fingerprint_key(fingerprint: tuple) -> str:
+    """Отпечаток корзины строкой для базы (шаг 5.3)."""
+    return "|".join(str(part) for part in fingerprint)
 
 
 def _cart_fingerprint(cart: Cart) -> tuple:

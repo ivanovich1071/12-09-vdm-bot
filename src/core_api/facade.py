@@ -19,6 +19,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from core import intent
 from core.errors import InvalidRequest, NotFound, Unauthorized
 from core.models import CartItem, Customer
 from core.ui import Response
@@ -417,7 +418,11 @@ class CoreApi:
         )
         return self._specification(session, spec)
 
-    def checkout(self, session: CoreSession) -> tuple[Result, Result]:
+    def says_checkout(self, text: str) -> bool:
+        """Текстовая реплика-оформление («оформить заказ») — для каналов без своих правил."""
+        return intent.asks_checkout(text)
+
+    def checkout(self, session: CoreSession, fingerprint: str | None = None) -> tuple[Result, Result]:
         """«Оформить»: корзина → спецификация → предзаказ. Одна цепочка для любого канала.
 
         Прежняя анкета из шести шагов в этой цепочке не участвует: согласие и контакт канал
@@ -425,7 +430,7 @@ class CoreApi:
         """
         spec = self.cart_specification(session)
         assert isinstance(spec.data, dto.SpecificationOut)
-        return spec, self.create_preorder(session, "specification", spec.data.id, None)
+        return spec, self.create_preorder(session, "specification", spec.data.id, None, fingerprint=fingerprint)
 
     def _dialog_task(self, session: CoreSession, task_id: str | None):  # noqa: ANN202
         if not task_id:
@@ -454,12 +459,25 @@ class CoreApi:
             raise NotFound("Заказ ещё не проверен.", code="EVALUATION_NOT_FOUND", details={"order_id": order_id})
         return self._evaluation(session, evaluation)
 
-    def create_preorder(self, session: CoreSession, source: str, source_id: str, comment: str | None) -> Result:
+    def create_preorder(
+        self, session: CoreSession, source: str, source_id: str, comment: str | None,
+        fingerprint: str | None = None,
+    ) -> Result:
+        """Предзаказ из спецификации или файла. Тот же состав — тот же предзаказ (шаг 5.3):
+        готовая заявка ищется в базе по источнику и отпечатку, перезапуск процесса копий
+        не плодит."""
         service = self.services.preorders
+        # С отпечатком ищем ТОЛЬКО по нему: спецификация под той же корзиной
+        # пересоздаётся с новым номером, состав при этом тот же.
+        existing = service.ready(session.user_ref, fingerprint=fingerprint) if fingerprint else service.ready(
+            session.user_ref, source=source, source_id=source_id
+        )
+        if existing is not None:
+            return self._preorder(session, existing)
         if source == "specification":
-            preorder = service.create_from_specification(source_id, session.user_ref, session.channel, comment)
+            preorder = service.create_from_specification(source_id, session.user_ref, session.channel, comment, fingerprint)
         else:
-            preorder = service.create_from_order(source_id, session.user_ref, session.channel, comment)
+            preorder = service.create_from_order(source_id, session.user_ref, session.channel, comment, fingerprint)
         return self._preorder(session, preorder)
 
     def get_preorder(self, session: CoreSession, preorder_id: str) -> Result:

@@ -273,6 +273,9 @@ class DialogEngine:
         # `procurement_provider` соберёт его при первом подборе.
         self.procurement = None
         self.procurement_provider = None
+        # Предзаказный сервис ставит сборка ядра (`core_api.composition`): /preorders
+        # в ядре отвечает и там, где шлюза нет — виджет, Mini App (шаг 5.2).
+        self.preorders = None
         self._sessions: dict[str, Session] = {}
         # Пункты приказов с формулировками и поиском по словам. Файла может не
         # быть — тогда бот называет номер пункта без текста, как и раньше.
@@ -615,7 +618,31 @@ class DialogEngine:
                 return self._delete_data(session)
             case "/help":
                 return [Message(HELP, keyboard=self._main_menu())]
+            case "/spec":
+                return self._spec_history(session)
+            case "/preorders":
+                return self._preorder_history(session)
         return [Message("Такой команды нет. /help — что умеет бот.", keyboard=self._main_menu())]
+
+    def _spec_history(self, session: Session) -> list[Response]:
+        """Спецификации разговора — команда ядра, работает в любом канале (шаг 5.2)."""
+        specs = []
+        if self.procurement is not None:
+            specs = self.procurement.repository.specifications_of(session.user_id)
+        if not specs:
+            return [Message("Спецификаций пока нет. Соберите корзину и нажмите «Оформить».", keyboard=self._main_menu())]
+        lines = ["Ваши спецификации:"]
+        lines += [f"• {s.id} — {price_text(s.totals.amount)}, каталог {s.catalog_version}" for s in specs[:10]]
+        return [Message("\n".join(lines), keyboard=self._main_menu())]
+
+    def _preorder_history(self, session: Session) -> list[Response]:
+        """Предзаказы разговора — команда ядра, работает в любом канале (шаг 5.2)."""
+        preorders = self.preorders.of_owner(session.user_id) if self.preorders is not None else []
+        if not preorders:
+            return [Message("Предзаказов пока нет. Соберите корзину и нажмите «Оформить».", keyboard=self._main_menu())]
+        lines = ["Ваши предзаказы:"]
+        lines += [f"• {p.id} — {p.status.value}, {price_text(p.totals.amount)}" for p in preorders[:10]]
+        return [Message("\n".join(lines), keyboard=self._main_menu())]
 
     # --- Поиск и карточки -----------------------------------------------------
 
@@ -2133,7 +2160,15 @@ class DialogEngine:
             return [Message(str(exc), keyboard=self._main_menu())]
 
         session.customer = Customer()
-        lines = [order_accepted(order.id, order.total, delivered=order.status == "sent")]
+        test = session.user_id in self.settings.qa_user_ids
+        lines = [
+            order_accepted(
+                order.id,
+                order.total,
+                delivered=order.status == "sent" and not test,
+                test=test,
+            )
+        ]
         note = delivery_note(order.total, self.settings.min_delivery_rub, self.settings.delivery_url)
         if note:
             lines.append(note)

@@ -22,6 +22,33 @@ from preorder.models import (
 class PreorderRepository(Protocol):
     def save(self, preorder: Preorder) -> None: ...
 
+    def find_ready(
+        self,
+        owner: str,
+        *,
+        source: str | None = None,
+        source_id: str | None = None,
+        fingerprint: str | None = None,
+    ) -> Preorder | None:
+        """Готовый к отправке предзаказ того же состава — вместо создания копии (шаг 5.3)."""
+        clauses = ["owner = ?", "status = ?"]
+        params: list[object] = [owner, "READY_FOR_MANAGER"]
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+        if fingerprint is not None:
+            clauses.append("fingerprint = ?")
+            params.append(fingerprint)
+        with self.db.read() as db:
+            row = db.execute(
+                f"SELECT id FROM preorders WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+        return self.get(row["id"]) if row else None
+
     def get(self, preorder_id: str) -> Preorder | None: ...
 
     def of_owner(self, owner: str, limit: int = 20) -> list[Preorder]: ...
@@ -50,8 +77,8 @@ class SqlitePreorderRepository:
             db.execute(
                 "INSERT INTO preorders(id, owner, channel, source, source_id, evaluation_id, status, "
                 "catalog_version, norm_version, review_required, totals, warnings, customer, consent_id, "
-                "comment, manager_comment, created_at, updated_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "comment, manager_comment, fingerprint, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET status = excluded.status, "
                 "review_required = excluded.review_required, totals = excluded.totals, "
                 "warnings = excluded.warnings, customer = excluded.customer, "
@@ -74,6 +101,7 @@ class SqlitePreorderRepository:
                     preorder.consent_id,
                     preorder.comment,
                     preorder.manager_comment,
+                    preorder.fingerprint,
                     preorder.created_at,
                     preorder.updated_at,
                 ),
@@ -93,6 +121,33 @@ class SqlitePreorderRepository:
                     for event in preorder.history[known:]
                 ],
             )
+
+    def find_ready(
+        self,
+        owner: str,
+        *,
+        source: str | None = None,
+        source_id: str | None = None,
+        fingerprint: str | None = None,
+    ) -> Preorder | None:
+        """Готовый к отправке предзаказ того же состава — вместо создания копии (шаг 5.3)."""
+        clauses = ["owner = ?", "status = ?"]
+        params: list[object] = [owner, "READY_FOR_MANAGER"]
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+        if fingerprint is not None:
+            clauses.append("fingerprint = ?")
+            params.append(fingerprint)
+        with self.db.read() as db:
+            row = db.execute(
+                f"SELECT id FROM preorders WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+        return self.get(row["id"]) if row else None
 
     def get(self, preorder_id: str) -> Preorder | None:
         with self.db.read() as db:
@@ -129,6 +184,7 @@ class SqlitePreorderRepository:
             consent_id=row["consent_id"],
             comment=row["comment"],
             manager_comment=row["manager_comment"],
+            fingerprint=row["fingerprint"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             history=tuple(

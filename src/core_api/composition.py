@@ -69,6 +69,8 @@ def build_core(
         notifier or FileNotificationChannel(Path(settings.preorders_dir)),
         test_owners=settings.qa_user_ids,
     )
+    # /preorders в ядре отвечает и там, где шлюза нет — виджет, Mini App (шаг 5.2).
+    engine.preorders = preorders
     sessions = SessionService(SqliteSessionRepository(db))
     engine.storage.add_user_data_hook(CoreUserData(procurement_repository, orders, preorder_repository))
     engine.storage.add_user_data_hook(SessionUserData(sessions))

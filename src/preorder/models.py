@@ -126,6 +126,9 @@ class Preorder:
     consent_id: str | None = None
     comment: str | None = None
     manager_comment: str | None = None
+    # Отпечаток корзины или источника: повторное «Оформить» того же состава
+    # возвращает готовый предзаказ, а не плодит копию (шаг 5.3).
+    fingerprint: str | None = None
     history: tuple[PreorderEvent, ...] = ()
     notification: NotificationStatus | None = None
     notification_error: str | None = None
