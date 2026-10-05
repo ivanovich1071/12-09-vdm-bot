@@ -237,6 +237,10 @@ _IDENTITY_QUESTION = re.compile(
 )
 
 
+def _doc_short(doc_id: str | None) -> str:
+    return norm_docs.get(doc_id).short_name if doc_id in norm_docs.DOCUMENTS else (doc_id or "")
+
+
 def _positions_word(n: int) -> str:
     """позиция / позиции / позиций — для заголовка «По пункту N: M …» (ТЗ BUG-10)."""
     if n % 10 == 1 and n % 100 != 11:
@@ -690,6 +694,12 @@ class DialogEngine:
         # лежала рядом, не пригодилась.
         if kind is intent.NORM_QUESTION:
             session.degradation_streak = 0
+            # Вопрос о ПУНКТЕ («что за п. 1.13.2.3.9?») — формулировка из справочника
+            # без модели (шаг 3.2, ТЗ BUG-29/34): раньше такой вопрос уводил в
+            # «по какому документу подбираем?».
+            code = intent.norm_code(text)
+            if code:
+                return self._point_explain(session, text, code)
             doc_id = norm_reference.question_about_document(text)
             if doc_id is None:
                 return self._norm_help()
@@ -733,6 +743,34 @@ class DialogEngine:
         return [
             Message(f"{header}:\n\n{names}", keyboard=self._offer_menu()),
             self._list(hits[:PAGE_SIZE], "Первые три — подробнее", len(hits), offset=0),
+        ]
+
+    def _point_explain(self, session: Session, text: str, code: str) -> list[Response]:
+        """Формулировка пункта, путь разделов и счёт позиций — кодом, без модели."""
+        from norms.check import check_point, nearest_section
+
+        named = document_ids_in_text(text) or session.profile.norm_doc_ids[:1]
+        check = check_point(self.norm_texts, code, named[0] if named else None)
+        if not check.exists:
+            hint = nearest_section(self.norm_texts, text)
+            return [Message(f"{check.note} {hint}".strip(), keyboard=self._offer_menu())]
+        if check.in_other_document:
+            return [Message(check.note, keyboard=self._offer_menu())]
+        item = self.norm_texts.get(check.found_in, code)
+        lines = [f"Пункт {code} {_doc_short(check.found_in)}: «{item.title}»." if item is not None else f"Пункт {code} {_doc_short(check.found_in)}."]
+        path = self.norm_texts.parents(check.found_in, code)
+        if path:
+            lines.append("Разделы: " + " → ".join(f"{p.code} {p.title}" for p in path) + ".")
+        counted = len(self.norm_texts.children(check.found_in, code))
+        if counted:
+            lines.append(f"В него входит пунктов: {counted}.")
+        doc_name = _doc_short(check.found_in)
+        return [
+            Message(
+                "\n".join(lines)
+                + "Показать товары по пункту — нажмите кнопку или назовите предмет.",
+                keyboard=Keyboard().row(Button(f"Показать по {doc_name}", "noop")),
+            )
         ]
 
     def _small_talk(self, text: str) -> Message:

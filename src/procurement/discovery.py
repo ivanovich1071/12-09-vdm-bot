@@ -215,19 +215,28 @@ def query_from_text(text: str, vocab: frozenset[str] | None = None) -> str:
     for pattern in patterns:
         rest = pattern.sub(" ", rest.lower())
     rest = _TASK_WORDS.sub(" ", rest)
-    words = []
+    raw: list[str] = []
+    kept: list[str] = []
     for word in re.findall(r"[а-яёa-z0-9][а-яёa-z0-9-]+", rest):
         if any(char.isdigit() for char in word):
             # Артикул или код модели сохраняем: без цифр «артикул 12345» превращался в
             # безсловарный запрос «артикул», и поиск добирал случайные товары (23.09, сц. 50).
             if len(word) >= 3:
-                words.append(word)
+                raw.append(word)
+                kept.append(word)
         elif len(word) > 2:
+            raw.append(word)
             # Слово остаётся, только если его основа вообще есть в каталоге:
             # «менеджера» и «примерно» отпадут сами, а новое слово-товар не потеряется.
             if vocab is None or catalog_text.stem(word) in vocab:
-                words.append(word)
-    return " ".join(words)
+                kept.append(word)
+    subjects = [w for w in kept if not any(c.isdigit() for c in w)]
+    if vocab is not None and raw and not subjects:
+        # Все слова-предметы вне словаря: товара в каталоге действительно нет
+        # («нужен ростомер…»). Возвращаем сырые слова — строгий матч по названию
+        # даст честное «не нашлось», а не чужие товары из слов помещения.
+        return " ".join(raw)
+    return " ".join(kept)
 
 
 def is_rejection(text: str) -> bool:
