@@ -12,6 +12,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from catalog.models import Availability, Product
 from catalog.points import PointFinder
@@ -41,6 +42,8 @@ from core.ui import (
 from norms import documents as norm_docs
 from norms import items as norm_items
 from norms import reference as norm_reference
+from norms.check import check_point, nearest_section
+from norms.extract import document_ids_in_text
 from orders.service import OrderService
 from privacy.consent import CONSENT_TEXT, CONSENT_VERSION
 from privacy.masking import Masker
@@ -232,6 +235,15 @@ _IDENTITY_QUESTION = re.compile(
 )
 
 
+def _positions_word(n: int) -> str:
+    """позиция / позиции / позиций — для заголовка «По пункту N: M …» (ТЗ BUG-10)."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "позиция"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "позиции"
+    return "позиций"
+
+
 class DialogEngine:
     def __init__(
         self,
@@ -264,7 +276,9 @@ class DialogEngine:
         self._sessions: dict[str, Session] = {}
         # Пункты приказов с формулировками и поиском по словам. Файла может не
         # быть — тогда бот называет номер пункта без текста, как и раньше.
-        self.norm_texts = norm_items.ItemIndex(norm_items.load())
+        # Справочник приказов — по настройке (`norm_items_path`), а не по
+        # относительному пути: виджет и бот в одном процессе видят один файл (шаг 3.5).
+        self.norm_texts = norm_items.ItemIndex(norm_items.load(Path(self.settings.norm_items_path)))
 
     @property
     def index(self) -> CatalogIndex:
@@ -733,6 +747,17 @@ class DialogEngine:
                 ]
         else:
             profile.rejection_streak = 0
+        # Проверка пункта до выдачи (шаг 3.3): пункта нет нигде — честный отказ,
+        # пункт в другом документе — называем где. Никаких товаров вместо ответа.
+        if code:
+            named = document_ids_in_text(text) or session.profile.norm_doc_ids[:1]
+            check = check_point(self.norm_texts, code, named[0] if named else None)
+            if not check.exists:
+                hint = nearest_section(self.norm_texts, text)
+                note = f"{check.note} {hint}".strip()
+                return [Message(note, keyboard=self._offer_menu())]
+            if check.in_other_document:
+                return [Message(check.note, keyboard=self._offer_menu())]
         result = selection.select(
             self,
             session,
@@ -742,6 +767,9 @@ class DialogEngine:
             query=None,
             norm_item=code,
         )
+        if code and result is not None and result.items:
+            total = result.matched or len(result.items)
+            header = f"По пункту {code}: {total} {_positions_word(total)}"
         reply = self._selection_reply(session, result, header)
         # Позиций нет и назван пункт — объясняем про пункт, а не молчаливое «не нашлось»:
         # REVIEW_REQUIRED («пункта нет в документе») сюда тоже попадает.
@@ -1635,7 +1663,12 @@ class DialogEngine:
             ]
         session.last_hits = hits
         title = f"{norm_docs.get(doc_id).short_name}: {len(hits)} позиций"
-        return [self._list(hits[:PAGE_SIZE], title, len(hits), offset=0)]
+        head: list[Response] = []
+        if doc_id == "order_838" and session.profile.audience == "preschool":
+            # Садовод нажал «Показать позиции» на школьном перечне — предупреждаем,
+            # что это перечень для школ (ТЗ BUG-19), а не подмена выдачи.
+            head = [Message("Это перечень для школ — позиции обоснованы приказом № 838.")]
+        return [*head, self._list(hits[:PAGE_SIZE], title, len(hits), offset=0)]
 
     # --- Корзина ---------------------------------------------------------------
 

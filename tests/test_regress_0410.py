@@ -250,11 +250,11 @@ class TestCoreFallback:
         assert "Пробирка" not in out
 
     def test_age_subsection_not_substituted(self, engine):
-        """BUG-11: группе 3–4 года не предлагают подраздел 1.14.4 (2–3 года)."""
-        engine.handle_text(USER, CHANNEL, "группа 3–4 года")
-        out = flat(engine.handle_text(USER, CHANNEL, "покажи каталки"))
+        """BUG-11 (переход №10): «дети 3–7» — ящика «до года» (1.14.2) в выдаче нет."""
+        engine.handle_text(USER, CHANNEL, "группа 4–7 лет")
+        out = flat(engine.handle_text(USER, CHANNEL, "покажи каталку"))
         assert "Каталка" not in out
-        assert "нет" in out.lower()
+        assert "не нашлось" in out.lower() or "нет" in out.lower()
 
     def test_two_rejections_stop_the_listing(self, engine):
         """К2.6: два «не то» подряд — стоп и менеджер, а не следующая тройка мусора."""

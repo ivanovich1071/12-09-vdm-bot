@@ -29,8 +29,13 @@ TASK = "task"
 OTHER = "other"
 
 # «2.1.14», «п. 2.20.63», «пункт 1.13.3». Два уровня минимум: «2.4» тоже пункт,
-# а вот «2024» или «25» — нет.
-_CODE = re.compile(r"(?:^|\s|п\.?\s*|пункт\s+)(\d{1,2}(?:\.\d{1,3}){1,5})(?:$|[\s,.;)])")
+# а вот «2024» или «25» — нет. Терминаторы — и знаки вопроса с тире: «1.13.2.3.9?»
+# разбиралось как 1.13.2.3, а «2.30.1-2.30.6» — как 2.30 (прогон 04.10, К3).
+_CODE = re.compile(r"(?:^|\s|п\.?\s*|пункт\s+)(\d{1,2}(?:\.\d{1,3}){1,5})(?=$|[\s,.;:!?)»\"']|[-–—])")
+# Диапазон пунктов: «строго по 2.30.1–2.30.6».
+_CODE_RANGE = re.compile(
+    r"\b(\d{1,2}(?:\.\d{1,3}){1,5})\s*[-–—]\s*(\d{1,2}(?:\.\d{1,3}){1,5})\b"
+)
 
 _GREETING = re.compile(
     r"^\s*(?:привет\w*|здравствуй\w*|здрав\w+|добрый\s+(?:день|вечер|утр\w+)|"
@@ -111,6 +116,34 @@ def norm_code(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def norm_codes(text: str) -> list[str]:
+    """Все названные пункты. Диапазон «2.30.1-2.30.6» раскрывается в список (BUG-09)."""
+    plain = f" {text or ''} "
+    result: list[str] = []
+    rest = plain
+    for match in _CODE_RANGE.finditer(plain):
+        expanded = _expand_code_range(match.group(1), match.group(2))
+        if expanded:
+            result += [code for code in expanded if code not in result]
+            rest = rest.replace(match.group(0), " ")
+    for match in _CODE.finditer(rest):
+        if match.group(1) not in result:
+            result.append(match.group(1))
+    return result
+
+
+def _expand_code_range(first: str, last: str) -> list[str]:
+    """«2.30.1–2.30.6» → шесть кодов с общим префиксом. Разные префиксы — не диапазон."""
+    left, right = first.split("."), last.split(".")
+    if len(left) != len(right) or left[:-1] != right[:-1]:
+        return []
+    low, high = int(left[-1]), int(right[-1])
+    if not 0 <= high - low <= 60:
+        return []
+    prefix = ".".join(left[:-1])
+    return [f"{prefix}.{n}" for n in range(low, high + 1)]
+
+
 def asks_for_goods(text: str) -> bool:
     """Прямая просьба показать оборудование.
 
@@ -125,7 +158,8 @@ def asks_for_goods(text: str) -> bool:
 # пункт 2.1.14», «что входит в 1.13.3». Разница видна только по обороту.
 _ABOUT_CODE = re.compile(
     r"(?:что\s+(?:такое|значит|за|входит)|расскаж\w+|объясн\w+|как\s+звучит|"
-    r"формулировк\w+|существу\w+\s+ли|есть\s+ли\s+так\w+\s+пункт)",
+    r"формулировк\w+|существу\w+\s+ли|есть\s+ли\s+(?:у\s+вас\s+)?так\w+\s+пункт|"
+    r"у\s+вас\s+есть|текст\s+пункта)",
     re.IGNORECASE,
 )
 
@@ -226,9 +260,11 @@ def classify(text: str) -> str:
         return GREETING
     if _SMALL_TALK.match(text):
         return SMALL_TALK
-    wants_goods = bool(_ASK_FOR_GOODS.search(text))
     if norm_code(text):
-        return NORM_QUESTION if _ABOUT_CODE.search(text) and not wants_goods else NORM_CODE
+        # Вопрос о пункте («что за п. 1.12.5? покажите формулировку») побеждает
+        # «покажите»: иначе вместо текста приказа приходили товары (BUG-14).
+        return NORM_QUESTION if _ABOUT_CODE.search(text) else NORM_CODE
+    wants_goods = bool(_ASK_FOR_GOODS.search(text))
     if (_NORM_QUESTION.search(text) or _WHICH_DOCUMENT.search(text)) and not wants_goods:
         return NORM_QUESTION
     if wants_goods:

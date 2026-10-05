@@ -177,6 +177,9 @@ def explain(doc_id: str, coverage: dict[str, int] | None = None) -> str:
 
     lines = [document.full_name or document.short_name, "", reference.summary]
     lines += ["", f"Кого касается: {reference.audience}."]
+    # ТЗ 7.5: нормативные справки всегда с дисклеймером — бот опирается на данные
+    # каталога, а не на юридическое заключение.
+    lines += ["", "Это справка по данным каталога, а не юридическое заключение."]
     if reference.numbering:
         lines += ["", reference.numbering]
 

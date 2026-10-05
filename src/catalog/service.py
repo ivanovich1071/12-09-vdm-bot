@@ -384,10 +384,14 @@ def _by_category(category: str) -> Callable[[_Candidate], _Verdict]:
 
 
 def _by_age(age: AgeRange) -> Callable[[_Candidate], _Verdict]:
-    """Мягкий фильтр: возраст указан у немногих товаров.
+    """Возраст подраздела приказа — точный признак, а не пересечение (шаг 3.7).
 
-    Исключается только товар, чей известный возраст противоречит запросу. Без
-    возраста товар остаётся — кабинет и учреждение уже отсекли чужие разделы.
+    Прогон 04.10, BUG-11: группе 3–7 лет предлагали подраздел 1.14.5 (3–4 года)
+    со словами «для 4–7 то же самое»; в переписке 23.09 на «дети 3–7» прилетал
+    ящик для детей до года (1.14.2.2.3). Подраздел подходит, если его диапазон
+    вложен в запрошенный ИЛИ пересекается с соседним («3–4» при запросе «2–4»);
+    дальний чужой возраст («до года» при 3–7) — вне выдачи. Точный возраст
+    («5 лет») внутри подраздела 5–6 тоже подходит. Товар без возраста остаётся.
     """
 
     def check(candidate: _Candidate) -> _Verdict:
@@ -396,7 +400,18 @@ def _by_age(age: AgeRange) -> Callable[[_Candidate], _Verdict]:
             ranges.append(candidate.hit.product.card_age)
         if not ranges:
             return _Verdict.UNKNOWN
-        return _Verdict.MATCH if any(age.overlaps(known) for known in ranges) else _Verdict.MISMATCH
+        for known in ranges:
+            inside = known.min_years >= age.min_years and (
+                age.max_years is None
+                or (known.max_years is not None and known.max_years <= age.max_years)
+            )
+            exact = (
+                age.min_years == age.max_years
+                and known.min_years <= age.min_years <= (known.max_years or age.min_years)
+            )
+            if inside or exact or age.overlaps(known):
+                return _Verdict.MATCH
+        return _Verdict.MISMATCH
 
     return check
 
