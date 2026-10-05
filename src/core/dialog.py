@@ -226,6 +226,8 @@ POINTS_TO_CART = 40
 REVIEW_TO_SHOW = 5
 # Строк корзины в превью: сообщения Telegram длиннее 4096 знаков не уходят.
 CART_PREVIEW_LINES = 20
+# Строк корзины на странице кнопок: 8 строк × 4 кнопки — предел Telegram не грозит (шаг 7.3).
+CART_PAGE_LINES = 8
 
 
 # Вопрос «кто ты такой» не доходит до модели, если её нет, — отвечаем сами (ТЗ BUG-07).
@@ -539,6 +541,8 @@ class DialogEngine:
                 return self._change_on_card(session, arg, -1)
             case "cart":
                 return self._show_cart(session)
+            case "cart_page":
+                return self._show_cart(session, page=int(arg) if arg.isdigit() else 1)
             case "clear":
                 return self._clear_cart(session)
             case "repeat_last_spec":
@@ -1109,7 +1113,14 @@ class DialogEngine:
         """Следующая страница того же подбора — на «а ещё что есть» и на кнопку «Показать ещё»."""
         result = selection.more(self, session)
         if result is None:
-            return [Message("Больше ничего нет.", keyboard=self._main_menu())]
+            # «Показать ещё» после исчерпания — не тупик и не повтор дословно (сц. 10
+            # прогона 04.10): варианты продолжения под рукой (шаги 5.5/7.2).
+            return [
+                Message(
+                    "Других позиций по этой задаче нет. Назовите товар иначе, откройте каталог или позовём менеджера.",
+                    keyboard=Keyboard().row(Button("Каталог", "catalog"), Button("Менеджер", "manager")),
+                )
+            ]
         return self._selection_reply(session, result, "Ещё варианты из каталога")
 
     def order_list(self, session: Session, text: str, size: int | None, more: bool = False) -> list[Response]:
@@ -1601,7 +1612,14 @@ class DialogEngine:
         hits = session.last_hits
         chunk = hits[offset : offset + PAGE_SIZE]
         if not chunk:
-            return [Message("Больше ничего нет.", keyboard=self._main_menu())]
+            # «Показать ещё» после исчерпания — не тупик и не повтор дословно (сц. 10
+            # прогона 04.10): варианты продолжения под рукой (шаги 5.5/7.2).
+            return [
+                Message(
+                    "Других позиций по этой задаче нет. Назовите товар иначе, откройте каталог или позовём менеджера.",
+                    keyboard=Keyboard().row(Button("Каталог", "catalog"), Button("Менеджер", "manager")),
+                )
+            ]
         return [self._list(chunk, "Ещё варианты", len(hits), offset=offset)]
 
     def _list(self, hits: list[SearchHit], title: str, total: int, offset: int) -> ProductList:
@@ -1648,7 +1666,9 @@ class DialogEngine:
         else:
             keyboard.row(Button("В корзину", f"add:{sku}"))
         if product.url:
-            keyboard.row(Button("Открыть на сайте", f"card:{sku}", url=product.url))
+            # Действие «noop», а не «card:»: кнопка — ссылка, повторное нажатие
+            # не должно рисовать карточку заново (ТЗ BUG-17, шаг 7.5).
+            keyboard.row(Button("Открыть на сайте", "noop", url=product.url))
         keyboard.row(Button("Моя корзина", "cart"), Button("Меню", "menu"))
 
         audience = session.profile.audience
@@ -1763,7 +1783,9 @@ class DialogEngine:
         # callback_data 64 байтами, а «ОБОРУДОВАНИЕ ДЛЯ ШКОЛЫ ПО ПРИКАЗУ № 838»
         # в кириллице занимает вдвое больше — такие кнопки молча пропадали.
         for number, root in enumerate(self.roots):
-            keyboard.row(Button(root.title(), f"root:{number}"))
+            # С большой буквы только первое слово: «Оборудование для детского сада»,
+            # а не «Оборудование Для Детского Сада» (ТЗ BUG-20, шаг 7.4).
+            keyboard.row(Button(root[:1].upper() + root[1:], f"root:{number}"))
         keyboard.row(Button("Подбор по приказу", "norms"), Button("Меню", "menu"))
         return [Message("Выберите раздел каталога:", keyboard=keyboard)]
 
@@ -1933,7 +1955,7 @@ class DialogEngine:
             self.storage.save_cart(cart)
         return self._card(session, sku, replace=True)
 
-    def _show_cart(self, session: Session, replace: bool = False) -> list[Response]:
+    def _show_cart(self, session: Session, replace: bool = False, page: int = 1) -> list[Response]:
         cart = self.storage.load_cart(session.user_id)
         if cart.is_empty:
             return [self._empty_cart(session, replace)]
@@ -1944,24 +1966,40 @@ class DialogEngine:
         # Полная комплектация — это до сотни строк: в превью помещаются первые
         # (лимит сообщения в Telegram — 4096 знаков), весь состав уходит менеджеру
         # и в файле.
-        visible = cart.items[:CART_PREVIEW_LINES]
+        # Постраничные кнопки корзины (шаг 7.3): 20 строк × 4 кнопки — 80 колбэков,
+        # Telegram такую клавиатуру обрезает. Страница — CART_PAGE_LINES строк.
+        page_size = CART_PAGE_LINES
+        total_pages = max(1, -(-len(cart.items) // page_size))
+        page = max(0, min(page - 1, total_pages - 1))
+        window = cart.items[page * page_size : (page + 1) * page_size]
         keyboard = Keyboard()
-        for number, item in enumerate(visible, 1):
+        for offset, item in enumerate(window, 1):
+            number = page * page_size + offset
             keyboard.row(
                 Button(f"{number} −", f"dec:{item.sku_1c}"),
                 Button(f"{number}: {item.quantity} шт.", "noop"),
                 Button(f"{number} +", f"inc:{item.sku_1c}"),
                 Button(f"{number} ✕", f"del:{item.sku_1c}"),
             )
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(Button("←", f"cart_page:{page}"))
+            nav.append(Button(f"Стр. {page + 1} из {total_pages}", "noop"))
+            if page < total_pages - 1:
+                nav.append(Button("→", f"cart_page:{page + 2}"))
+            keyboard.row(*nav)
         keyboard.row(Button("Оформить заказ", "checkout"), Button("Очистить", "clear"))
 
         notes = []
-        if len(cart.items) > len(visible):
-            hidden = len(cart.items) - len(visible)
+        if len(cart.items) > len(cart.items[:CART_PREVIEW_LINES]):
+            hidden = len(cart.items) - CART_PREVIEW_LINES
             notes.append(
                 f"… и ещё {hidden} {plural(hidden, 'позиция', 'позиции', 'позиций')} — "
                 "полный состав уйдёт менеджеру и в файле."
             )
+        if total_pages > 1:
+            notes.append("Кнопки количеством и удалением — постранично.")
         if any(item.price is None for item in cart.items):
             notes.append("По части позиций цена уточняется — менеджер пришлёт её при подтверждении.")
         note = " ".join(notes) or None
@@ -1975,7 +2013,8 @@ class DialogEngine:
                         sku_1c=item.sku_1c,
                         norm_citation=item.norm_citation,
                     )
-                    for item in visible
+                    # Текст превью — до CART_PREVIEW_LINES строк (ТЗ 4.7), кнопки — постранично.
+                    for item in cart.items[:CART_PREVIEW_LINES]
                 ],
                 total=cart.total,
                 note=note,

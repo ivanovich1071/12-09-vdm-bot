@@ -75,6 +75,10 @@ TURN_WORKERS = 16
 BUSY_HINT = "Ещё думаю над прошлым нажатием — секунду."
 
 # Ответ на то, чего бот разобрать не умеет: фото, голосовое, видео, стикер.
+# Долгий ход (шаг 7.1): через 10 секунд тишины клиент видит, что его не бросили
+# («и где позиции? жду» — из переписки 23.09). Финальный ответ приходит следом.
+TURN_PROGRESS = "Смотрю каталог — это займёт до минуты. Если ответ придёт раньше — уберу это сообщение."
+
 UNSUPPORTED = (
     "Такое я пока не разбираю. Напишите словами, что нужно подобрать, "
     "или пришлите список файлом — .xlsx, .docx или .pdf."
@@ -677,6 +681,19 @@ async def _reply(  # noqa: ANN001
     нужно не меньше, чем во время счёта.
     """
     typing = asyncio.create_task(_keep_typing(bot, chat_id))
+    # Долгий ход: через 10 секунд тишины — промежуточное сообщение (вопрос 45
+    # опросного листа). Финальный ответ приходит следом, черновик удаляется.
+    progress_note: TgMessage | None = None
+
+    async def _progress() -> None:
+        nonlocal progress_note
+        await asyncio.sleep(10)
+        try:
+            progress_note = await bot.send_message(chat_id, _escape(TURN_PROGRESS))
+        except TelegramAPIError:
+            progress_note = None
+
+    progress = asyncio.create_task(_progress())
     try:
         try:
             responses = await asyncio.to_thread(work)
@@ -686,8 +703,11 @@ async def _reply(  # noqa: ANN001
                 Message("Что-то пошло не так на моей стороне. Повторите, пожалуйста, вопрос.")
             ]
 
+        progress.cancel()
         if not responses:
             # Нажали надпись, а не кнопку — отвечать нечем и не нужно.
+            if progress_note is not None:
+                await _quietly(progress_note.delete())
             return
 
         try:
@@ -703,7 +723,10 @@ async def _reply(  # noqa: ANN001
             # а не только сетевые ошибки: раньше остальное уносило обработчик,
             # и человек не получал ничего.
             log.warning("Ответ не доставлен (%s)", exc)
+        if progress_note is not None:
+            await _quietly(progress_note.delete())
     finally:
+        progress.cancel()
         typing.cancel()
 
 
