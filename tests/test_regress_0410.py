@@ -204,6 +204,19 @@ class TestCoreFallback:
         assert not engine.storage.load_cart(USER).is_empty
         assert "не нашлось" not in out.lower()
 
+    def test_add_phrase_beats_manager_mention(self, engine):
+        """Прогон 05.10 (СЦ5/СЦ7): «возьму … 4 шт. и счёт от менеджера» — корзина
+        пополняется словами, а не глотается карточкой менеджера."""
+        engine.handle_text(USER, CHANNEL, "покажи волейбольный мяч")
+        out = flat(engine.handle_text(USER, CHANNEL, "возьму волейбольный 4 шт. и счёт от менеджера"))
+        assert engine.storage.load_cart(USER).count == 4
+        assert engine.settings.manager_contact not in out
+
+    def test_pure_manager_request_still_reaches_manager(self, engine):
+        """Перестановка не задела чистую просьбу: слов добавления нет — карточка менеджера."""
+        out = flat(engine.handle_text(USER, CHANNEL, "позовите, пожалуйста, живого человека"))
+        assert engine.settings.manager_contact in out
+
     def test_price_objection_answered(self, engine):
         """BUG-02/17: на «дорого» не бывает ни деградации, ни «ничего не нашлось»."""
         engine.handle_text(USER, CHANNEL, "покажи мат гимнастический")
@@ -364,6 +377,21 @@ class TestRealCatalog:
         cards = [card for r in responses if isinstance(r, ProductList) for card in r.cards]
         assert cards, "выдачи нет"
         assert all(card.product.in_stock for card in cards), "показаны позиции без наличия (заготовки)"
+
+    def test_classifier_lost_but_catalog_subject_still_searched(self, tmp_path):
+        """Прогон 05.10 (СЦ2): «тактильные дорожки 3 шт. срок 4 недели» классификатор
+        не понял — запасной путь видит предмет в словаре каталога и ищет, а не
+        отвечает «проще обычного»."""
+        engine = self.engine(tmp_path)
+        out = flat(engine.handle_text(USER, CHANNEL, "тактильные дорожки 3 шт. срок 4 недели"))
+        assert "проще обычного" not in out.lower()
+
+    def test_chatter_without_subject_still_degrades(self, tmp_path):
+        """Обратная сторона словарного гейта: болтовня без предметов каталога —
+        прежняя заглушка, а не случайная выдача."""
+        engine = self.engine(tmp_path)
+        out = flat(engine.handle_text(USER, CHANNEL, "а можно скидку посерьёзнее?"))
+        assert "недоступен" in out.lower()
 
     def test_group_room_shows_real_goods(self, tmp_path):
         """К9: «оснастить группу 3–4 лет» — настоящий товар групповой комнаты."""

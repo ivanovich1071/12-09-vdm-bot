@@ -35,6 +35,7 @@ from agent.providers import (
 from agent.routing import Orchestrator
 from catalog.models import Product
 from catalog.search import CatalogIndex
+from core import config as config_module
 from core.config import Settings
 from core.dialog import DialogEngine, Session
 from core.storage import Storage
@@ -154,6 +155,32 @@ def test_fallback_model_joins_router():
 def test_fallback_model_absent_by_default():
     router = build_router(Settings(cloudru_api_key="ключ-не-настоящий"))
     assert [c.name for c in router.clients] == ["cloudru"]
+
+
+def test_fallback_model_read_from_env(monkeypatch):
+    """CLOUDRU_FALLBACK_MODEL доходит из .env до роутера.
+
+    Прогон 05.10: поле у Settings было, build_router его читал, а from_env
+    переменную не распарсил — сервер молча жил одной моделью.
+    """
+    monkeypatch.setattr(config_module, "load_env", lambda *a, **kw: None)
+    monkeypatch.setenv("CLOUDRU_API_KEY", "ключ-не-настоящий")
+    monkeypatch.setenv("CLOUDRU_FALLBACK_MODEL", "Qwen/Qwen3.6-35B-A3B")
+    monkeypatch.setenv("LLM_PROVIDER", "auto")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    router = build_router(Settings.from_env())
+    assert [c.name for c in router.clients] == ["cloudru", "cloudru-qwen"]
+    assert router.clients[1].model == "Qwen/Qwen3.6-35B-A3B"
+
+
+def test_openrouter_without_key_is_not_built(monkeypatch):
+    """На сервере OpenRouter не зовут вовсе: ключ только в локальном .env для QA-прогонов."""
+    monkeypatch.setattr(config_module, "load_env", lambda *a, **kw: None)
+    monkeypatch.setenv("CLOUDRU_API_KEY", "ключ-не-настоящий")
+    monkeypatch.setenv("LLM_PROVIDER", "auto")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    router = build_router(Settings.from_env())
+    assert all(c.name != "openrouter" for c in router.clients)
 
 
 def test_blocked_primary_leaves_fallback_ready():

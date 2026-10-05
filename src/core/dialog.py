@@ -467,13 +467,12 @@ class DialogEngine:
         if action is not None:
             return self._handle_action(user_id, channel, action)
 
-        # Запрос менеджера — первым (шаг 4.1): ни анкета, ни подбор, ни модель
-        # его не глотают. «Позовите человека» — это просьба, а не имя контакта.
-        if intent.asks_manager(text):
-            return self._manager(session)
-
         # Корзина словами (шаги 4.2–4.3): «возьму X 4 шт.» и «по этому списку
         # по 1 шт.» — действия ядра, они работают и без модели (BUG-03/04).
+        # Они раньше карточки менеджера: прогон 05.10 (СЦ5/СЦ7) — «возьму
+        # Лесенку 4 шт. … и счёт от менеджера» глоталась карточкой, и корзина
+        # не пополнялась. Чистая просьба («позовите человека») слов добавления
+        # не содержит и ниже всё равно дойдёт до менеджера.
         has_procurement = self.procurement_service() is not None
         if has_procurement and intent.asks_add(text):
             handled = self.add_by_text(session, text)
@@ -483,6 +482,11 @@ class DialogEngine:
         if has_procurement and intent.asks_list_to_cart(text):
             self._remember(session)
             return self._collect_list(session, text)
+
+        # Запрос менеджера (шаг 4.1): ни анкета, ни подбор, ни модель его не
+        # глотают. «Позовите человека» — это просьба, а не имя контакта.
+        if intent.asks_manager(text):
+            return self._manager(session)
         # Вопросы о показанном — кодом (шаги 4.5–4.8), но только без модели:
         # с агентом возражение «дорого» ведёт модель (цена из показанного,
         # подсказка «разбить сейчас/потом»), а код — её запасной путь.
@@ -714,6 +718,13 @@ class DialogEngine:
         if kind is intent.TASK and self.procurement_service() is not None:
             return self.select_offer(session, text, "Могу предложить товары из каталога")
         if kind not in (intent.PRODUCT, intent.NORM_CODE):
+            # Классификатор класс не узнал — но это не повод для заглушки, если
+            # в реплике назван предмет из каталога: «тактильные дорожки 3 шт.
+            # срок 4 недели» (прогон 05.10, СЦ2) уводило в «проще обычного»,
+            # хотя искать было что. Решает словарь каталога.
+            service = self.procurement_service()
+            if service is not None and service.names_catalog_item(text):
+                return self.select_offer(session, text, "Могу предложить товары из каталога")
             return self._degraded(session)
 
         if self.procurement_service() is not None:

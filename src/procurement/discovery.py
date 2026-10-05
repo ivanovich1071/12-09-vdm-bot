@@ -193,13 +193,8 @@ def _negations(low: str) -> set[str]:
     return found
 
 
-def query_from_text(text: str, vocab: frozenset[str] | None = None) -> str:
-    """Слова о самом товаре — то, что остаётся после учреждения, помещения, возраста, бюджета.
-
-    «Нужны мячи для спортзала в саду, дети 3–4 лет» → «мячи». Пусто — в реплике
-    нет ничего, кроме описания задачи. `vocab` — основы слов каталога: без словаря
-    фильтр не применяется (тесты, разбор без каталога).
-    """
+def _after_task_words(text: str) -> str:
+    """Реплика без слов задачи, учреждения, помещения, возраста, бюджета и количеств."""
     rest = text
     patterns = [
         *(re.compile(pattern, re.IGNORECASE) for _, pattern in dialog_profile._INSTITUTIONS),
@@ -214,7 +209,11 @@ def query_from_text(text: str, vocab: frozenset[str] | None = None) -> str:
     ]
     for pattern in patterns:
         rest = pattern.sub(" ", rest.lower())
-    rest = _TASK_WORDS.sub(" ", rest)
+    return _TASK_WORDS.sub(" ", rest)
+
+
+def _goods_words(rest: str, vocab: frozenset[str] | None) -> tuple[list[str], list[str]]:
+    """Парой (сырые слова, слова после словаря): разбор один, потребители два."""
     raw: list[str] = []
     kept: list[str] = []
     for word in re.findall(r"[а-яёa-z0-9][а-яёa-z0-9-]+", rest):
@@ -230,6 +229,18 @@ def query_from_text(text: str, vocab: frozenset[str] | None = None) -> str:
             # «менеджера» и «примерно» отпадут сами, а новое слово-товар не потеряется.
             if vocab is None or catalog_text.stem(word) in vocab:
                 kept.append(word)
+    return raw, kept
+
+
+def query_from_text(text: str, vocab: frozenset[str] | None = None) -> str:
+    """Слова о самом товаре — то, что остаётся после учреждения, помещения, возраста, бюджета.
+
+    «Нужны мячи для спортзала в саду, дети 3–4 лет» → «мячи». Пусто — в реплике
+    нет ничего, кроме описания задачи. `vocab` — основы слов каталога: без словаря
+    фильтр не применяется (тесты, разбор без каталога).
+    """
+    rest = _after_task_words(text)
+    raw, kept = _goods_words(rest, vocab)
     subjects = [w for w in kept if not any(c.isdigit() for c in w)]
     if vocab is not None and raw and not subjects:
         # Все слова-предметы вне словаря: товара в каталоге действительно нет
@@ -237,6 +248,31 @@ def query_from_text(text: str, vocab: frozenset[str] | None = None) -> str:
         # даст честное «не нашлось», а не чужие товары из слов помещения.
         return " ".join(raw)
     return " ".join(kept)
+
+
+# Болтовня и служебные слова, чьи основы случайно живут в названиях товаров:
+# «спасибо большое» находило «больш» (грифель «Большой»…), «вы бот?» — трёхбуквенное
+# совпадение в артикулах. Для вопроса «назван ли предмет» они не аргумент.
+_CHATTER_WORDS = re.compile(
+    r"спасиб\w*|пожалуйст\w*|здравству\w*|привет\w*|больш\w*|хорош\w*|ладно|"
+    r"бот\w*|менеджер\w*|оператор\w*|спецификац\w*|сч[её]т\w*|exce[lл]\w*|"
+    r"просто\w*|примерно|подскаж\w*|подожд\w*|понимаю|минут\w*|секунд\w*|"
+    r"подум\w*|посмотр\w*|вернус\w*|узна\w*|спрош\w*|свяжус\w*|перезвон\w*|"
+    r"спасибо|дорого|дешев\w*|нужн\w*|можно|спиш\w*|оформ\w*|добав\w*",
+    re.IGNORECASE,
+)
+
+
+def subject_words(text: str, vocab: frozenset[str] | None = None) -> list[str]:
+    """Предметные слова реплики, которые вообще есть в каталоге.
+
+    В отличие от query_from_text сырой добор не делается: список отвечает на
+    вопрос «назван ли знакомый предмет», а не «что искать» (запасной путь ядра,
+    прогон 05.10: «тактильные дорожки 3 шт.» классификатор не понял, а словарь —
+    видит).
+    """
+    _, kept = _goods_words(_after_task_words(text), vocab)
+    return [w for w in kept if not _CHATTER_WORDS.fullmatch(w)]
 
 
 def is_rejection(text: str) -> bool:

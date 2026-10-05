@@ -218,6 +218,10 @@ class Settings:
             cloudru_api_key=env.get("CLOUDRU_API_KEY", ""),
             cloudru_base_url=env.get("CLOUDRU_BASE_URL", cls.cloudru_base_url),
             cloudru_model=env.get("CLOUDRU_MODEL", cls.cloudru_model),
+            # Запасная модель живёт у того же провайдера; без этой строки
+            # переменная .env молча игнорировалась и запасной не собирался
+            # (прогон 05.10: в логе был один cloudru вместо двух).
+            cloudru_fallback_model=env.get("CLOUDRU_FALLBACK_MODEL", cls.cloudru_fallback_model),
             openrouter_api_key=env.get("OPENROUTER_API_KEY", ""),
             openrouter_base_url=env.get("OPENROUTER_BASE_URL", cls.openrouter_base_url),
             openrouter_model=env.get("OPENROUTER_MODEL", cls.openrouter_model),
@@ -225,6 +229,12 @@ class Settings:
             llm_max_tokens=int(env.get("LLM_MAX_TOKENS", cls.llm_max_tokens)),
             cloudru_price_in=float(env.get("CLOUDRU_PRICE_IN", cls.cloudru_price_in)),
             cloudru_price_out=float(env.get("CLOUDRU_PRICE_OUT", cls.cloudru_price_out)),
+            cloudru_fallback_price_in=float(
+                env.get("CLOUDRU_FALLBACK_PRICE_IN", cls.cloudru_fallback_price_in)
+            ),
+            cloudru_fallback_price_out=float(
+                env.get("CLOUDRU_FALLBACK_PRICE_OUT", cls.cloudru_fallback_price_out)
+            ),
             openrouter_price_in=float(env.get("OPENROUTER_PRICE_IN", cls.openrouter_price_in)),
             openrouter_price_out=float(env.get("OPENROUTER_PRICE_OUT", cls.openrouter_price_out)),
             telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
