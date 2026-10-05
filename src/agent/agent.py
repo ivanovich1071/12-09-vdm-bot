@@ -37,9 +37,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
-from agent.client import ChatClient, LLMError
+from agent.client import ChatClient, LLMError, LLMTimeoutError, without_reasoning
 from agent.providers import LLMRouter
 from agent.routing import (
     CONSULT,
@@ -359,8 +360,11 @@ class SalesAgent:
         return self.router.available
 
     def reply(self, session, text: str) -> list[Response]:  # noqa: ANN001
-        if not self.available:
-            return self.engine.offer(session, text)
+        started = time.monotonic()
+        settings = getattr(self.engine, "settings", None)
+        budget = float(getattr(settings, "turn_budget_seconds", 45.0))
+        call_cap = float(getattr(settings, "llm_call_timeout_seconds", 30.0))
+        deadline = started + budget
 
         decision = self.routing.decide(session, text)
         show_cards, reason = may_show_cards(session.profile, decision)
@@ -387,7 +391,17 @@ class SalesAgent:
             session.prices |= {
                 price for reply in service if isinstance(reply, Message) for price in prices_in(reply.text)
             }
+            session.route["llm_skipped"] = "service_branch"
             return service
+
+        # Проверка «модель доступна» — после сервисных веток: прогон 04.10, К1 — при
+        # заблокированном провайдере ход уходил в запасной подбор, минуя ядро, и
+        # «пришлите Excel» с «оформить» переставали работать.
+        if not self.available:
+            blocked = [(c.name, round(self.router.blocked_for(c)) or 0) for c in self.router.clients if self.router.blocked_for(c) > 0]
+            session.route["llm_skipped"] = "provider_blocked"
+            session.route["provider_blocked_for"] = dict(blocked)
+            return self.engine.offer(session, text)
 
         tools = ToolBox(self.engine, session)
         messages = [
@@ -395,8 +409,15 @@ class SalesAgent:
             *self._history(session),
         ]
 
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Бюджет хода исчерпан ещё до модели (долгая маршрутизация): отвечаем
+            # тем, что умеет ядро, вместо очередных 60 секунд тишины.
+            session.route["budget_exhausted"] = "before_model"
+            return self._finish(prefix, self.engine.offer(session, text), session, text, "")
+
         try:
-            answer = self._ask(messages, tools, tools_for(decision.branch))
+            answer = self._ask(messages, tools, tools_for(decision.branch), deadline, call_cap)
         except LLMError:
             # Провайдеры уже помечены нерабочими и записаны в лог — здесь остаётся
             # только доиграть ход предложением из каталога. Файл и срок из составной
@@ -611,7 +632,14 @@ class SalesAgent:
 
     # --- Цикл вызова инструментов -------------------------------------------
 
-    def _ask(self, messages: list[dict], tools: ToolBox, schemas: list[dict] | None) -> str:
+    def _ask(
+        self,
+        messages: list[dict],
+        tools: ToolBox,
+        schemas: list[dict] | None,
+        deadline: float | None = None,
+        call_cap: float = 30.0,
+    ) -> str:
         """Ход разговора: пробуем провайдеров по очереди, пока кто-то не ответит.
 
         Каждому даём свою копию сообщений. Цикл вызова инструментов дописывает
@@ -620,8 +648,11 @@ class SalesAgent:
         """
         last: LLMError | None = None
         for client in self.router.ready():
+            # Поле reasoning_content DeepSeek требует, остальные модели могут не
+            # принять — историю готовим под конкретного провайдера.
+            client_messages = messages if client.reasoning_in_history else without_reasoning(messages)
             try:
-                answer = self._run(client, list(messages), tools, schemas)
+                answer = self._run(client, list(client_messages), tools, schemas, deadline, call_cap)
             except LLMError as exc:
                 self.router.mark_down(client, exc)
                 last = exc
@@ -630,12 +661,23 @@ class SalesAgent:
             return answer
         raise last or LLMError("нет настроенных провайдеров модели")
 
+    def _call_timeout(self, deadline: float | None, call_cap: float) -> float:
+        """Таймаут одного вызова: остаток бюджета хода, но не больше потолка."""
+        if deadline is None:
+            return call_cap
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LLMTimeoutError("бюджет хода исчерпан")
+        return min(remaining, call_cap)
+
     def _run(
         self,
         client: ChatClient,
         messages: list[dict],
         tools: ToolBox,
         schemas: list[dict] | None,
+        deadline: float | None = None,
+        call_cap: float = 30.0,
     ) -> str:
         candidate = ""
         for _ in range(MAX_TOOL_ROUNDS):
@@ -643,7 +685,9 @@ class SalesAgent:
                 # Лимит хода исчерпан: дальше только просьба ответить по собранному.
                 tools.session.route["call_limit"] = tools.calls
                 break
-            message = client.complete(messages, tools=schemas)
+            message = client.complete(
+                messages, tools=schemas, timeout=self._call_timeout(deadline, call_cap)
+            )
             tools.calls += 1
             account_usage(tools.session, client, message)
             calls = message.get("tool_calls") or []
@@ -658,7 +702,7 @@ class SalesAgent:
             # content и tool_calls нельзя: рассуждающие модели отдают ещё и
             # reasoning_content, а Cloud.ru требует это поле обратно — без него
             # следующий запрос падает с «Missing reasoning_content field».
-            messages.append(_assistant_message(message))
+            messages.append(_assistant_message(message, client.reasoning_in_history))
             for call in calls:
                 function = call.get("function", {})
                 arguments = _parse_arguments(function.get("arguments"))
@@ -1298,13 +1342,15 @@ def _missing(profile) -> list[str]:  # noqa: ANN001 — core.profile.DialogProfi
     ]
 
 
-def _assistant_message(message: dict) -> dict:
+def _assistant_message(message: dict, reasoning: bool = True) -> dict:
     """Ответ модели в том виде, в каком его примут обратно.
 
     Провайдеры расходятся в служебных полях, поэтому ничего не выбрасываем и
     ничего не придумываем: берём пришедшее и добавляем только то, чего нет.
     Наши собственные пометки (они начинаются с подчёркивания) провайдеру,
-    разумеется, не возвращаем — он их не поймёт.
+    разумеется, не возвращаем — он их не поймёт. Поле reasoning_content —
+    требование валидатора DeepSeek; модели, которые его не принимают,
+    отправляются без него (`reasoning=False`).
     """
     kept = {
         key: value
@@ -1313,7 +1359,10 @@ def _assistant_message(message: dict) -> dict:
     }
     kept.setdefault("role", "assistant")
     kept.setdefault("content", "")
-    kept.setdefault("reasoning_content", "")
+    if reasoning:
+        kept.setdefault("reasoning_content", "")
+    else:
+        kept.pop("reasoning_content", None)
     return kept
 
 

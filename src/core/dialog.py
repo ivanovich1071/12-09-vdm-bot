@@ -196,6 +196,9 @@ class Session:
     # ведут два процесса с общим хранилищем — бот и сервер Mini App, — и по отметке
     # процесс замечает, что разговор продолжился у соседа.
     state_stamp: tuple | None = None
+    # Подряд идущие заглушки «консультант недоступен». Второй раз подряд заглушки
+    # не будет: клиенту нужны менеджер и телефон, а не повтор про «временно».
+    degradation_streak: int = 0
 
     def remember(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": self.masker.mask(content)})
@@ -219,6 +222,13 @@ POINTS_TO_CART = 40
 REVIEW_TO_SHOW = 5
 # Строк корзины в превью: сообщения Telegram длиннее 4096 знаков не уходят.
 CART_PREVIEW_LINES = 20
+
+
+# Вопрос «кто ты такой» не доходит до модели, если её нет, — отвечаем сами (ТЗ BUG-07).
+_IDENTITY_QUESTION = re.compile(
+    r"(?:вы|ты)\s+(?:бот|робот)\b|(?:вы|ты)\s+кто|это\s+(?:бот|робот)|робот\s*\?|человек\s*\?",
+    re.IGNORECASE,
+)
 
 
 class DialogEngine:
@@ -604,39 +614,28 @@ class DialogEngine:
         # случайных товаров: вопрос попал в товарную ветку, и справка, которая
         # лежала рядом, не пригодилась.
         if kind is intent.NORM_QUESTION:
+            session.degradation_streak = 0
             doc_id = norm_reference.question_about_document(text)
             if doc_id is None:
                 return self._norm_help()
             return self._explain_norm(session, doc_id)
 
-        if kind in (intent.GREETING, intent.SMALL_TALK):
-            return [
-                Message(
-                    "Здравствуйте! Я консультант ЭЛТИ-КУДИЦ. Подбираете для "
-                    "детского сада или для школы?",
-                    keyboard=self._main_menu(),
-                )
-            ]
+        if kind in (intent.GREETING, intent.SMALL_TALK) or _IDENTITY_QUESTION.search(text):
+            session.degradation_streak = 0
+            return [self._small_talk(text)]
 
         # Описание задачи без товара — тоже повод для подбора: консультанта нет, а ядро либо
         # подберёт по учреждению и помещению, либо спросит одно недостающее.
         if kind is intent.TASK and self.procurement_service() is not None:
             return self.select_offer(session, text, "Могу предложить товары из каталога")
         if kind not in (intent.PRODUCT, intent.NORM_CODE):
-            return [
-                Message(
-                    "Сейчас я отвечаю проще обычного — консультант временно "
-                    "недоступен. Могу показать каталог или найти позиции по "
-                    "пункту перечня, например «1.5.1».\n"
-                    f"По остальным вопросам — менеджер: {self.settings.manager_contact}.",
-                    keyboard=self._offer_menu(),
-                )
-            ]
+            return self._degraded(session)
 
         if self.procurement_service() is not None:
             return self.select_offer(session, text, "Могу предложить товары из каталога")
 
         # Без Procurement Core движок живёт только в тестах диалога: там — поиск по индексу.
+        session.degradation_streak = 0
         hits = self.index.search(
             SearchQuery(text=text, limit=SEARCH_CAP, audience=session.profile.audience)
         )
@@ -661,6 +660,53 @@ class DialogEngine:
             self._list(hits[:PAGE_SIZE], "Первые три — подробнее", len(hits), offset=0),
         ]
 
+    def _small_talk(self, text: str) -> Message:
+        """Приветствие, благодарность и «вы бот?» — разные ответы, а не одна фраза
+        на всё (проверка ТЗ BUG-07: «спасибо» → «Здравствуйте!» читалось как баг)."""
+        low = (text or "").lower()
+        if re.search(r"\bспасибо|благодар", low):
+            return Message(
+                "Пожалуйста! Если понадобятся ещё позиции — я здесь. "
+                f"По счётам и срокам поможет менеджер: {self.settings.manager_contact}.",
+                keyboard=self._main_menu(),
+            )
+        if re.search(r"вы\s+(?:бот|робот)|ты\s+(?:бот|робот)|вы\s+кто|ты\s+кто|человек\s*\?", low):
+            return Message(
+                "Я Элтик, помощник ЭЛТИ-КУДИЦ: подбираю оборудование из каталога "
+                "и комплектации по приказам 1057 и 838. Счёт, скидки и сроки "
+                f"называет менеджер: {self.settings.manager_contact}.",
+                keyboard=self._main_menu(),
+            )
+        return Message(
+            "Здравствуйте! Я консультант ЭЛТИ-КУДИЦ. Подбираете для "
+            "детского сада или для школы?",
+            keyboard=self._main_menu(),
+        )
+
+    def _degraded(self, session: Session) -> list[Message]:
+        """Заглушка без модели — но не дважды подряд (прогон 04.10, BUG-02: клиент
+        получал её и на содержательные реплики, из деградации не было выхода)."""
+        session.degradation_streak += 1
+        if session.degradation_streak >= 2:
+            return [
+                Message(
+                    "Свяжу вас с менеджером: "
+                    f"{self.settings.manager_contact}. Оставьте телефон — и менеджер "
+                    "перезвонит; пока могу показать каталог или найти позиции по "
+                    "пункту перечня, например «1.5.1».",
+                    keyboard=self._offer_menu(),
+                )
+            ]
+        return [
+            Message(
+                "Сейчас я отвечаю проще обычного — консультант временно "
+                "недоступен. Могу показать каталог или найти позиции по "
+                "пункту перечня, например «1.5.1».\n"
+                f"По остальным вопросам — менеджер: {self.settings.manager_contact}.",
+                keyboard=self._offer_menu(),
+            )
+        ]
+
     def select_offer(self, session: Session, text: str, header: str = "Подобрал в каталоге") -> list[Response]:
         """Подбор по реплике через Procurement Core.
 
@@ -670,6 +716,8 @@ class DialogEngine:
         """
         about = selection.about_task(text)
         code = intent.norm_code(text) if intent.classify(text) is intent.NORM_CODE else None
+        # Содержательный ответ ядра выводит разговор из деградации.
+        session.degradation_streak = 0
         result = selection.select(
             self,
             session,

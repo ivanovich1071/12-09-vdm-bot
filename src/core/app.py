@@ -54,6 +54,9 @@ def build_engine(
     router = build_router(settings)
     if warm_llm and router.configured:
         warm_up(router)
+        # Проверка заблокированных провайдеров в фоне: блок снимаем сами, раз в
+        # 20 секунд, а не чьим-то следующим ходом.
+        router.start_pinger()
     agent = None
     if router.configured:
         # Движок агенту нужен, но сам он создаётся ниже — проставим после.

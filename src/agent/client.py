@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -53,6 +54,15 @@ class LLMRateLimitError(LLMError):
         self.retry_after = retry_after
 
 
+class LLMTimeoutError(LLMError):
+    """Провайдер не уложился в отведённое время.
+
+    Прогон 04.10: один медленный ответ выключал модель всем на пять минут
+    (общий cooldown для всех сбоев). Таймаут — не поломка провайдера, а
+    случайная пауза: короткая пауза на 30 секунд, и модель снова в строю.
+    """
+
+
 # Пауза быстрого повтора после 429: ждём Retry-After, но не дольше пяти секунд —
 # дальше ход становится долгим ожиданием для человека.
 QUICK_RETRY_AFTER = 5.0
@@ -76,6 +86,10 @@ class ChatClient:
     # ощущению «эта пободрее» дорого, а по цифрам — нет.
     price_in: float = 0.0
     price_out: float = 0.0
+    # DeepSeek на Cloud.ru требует поле reasoning_content в истории у каждого
+    # ответа ассистента; другие модели оно может не принять. Выключено — поле
+    # не отправляется этому клиенту ни в истории, ни в цикле инструментов.
+    reasoning_in_history: bool = True
 
     @property
     def host(self) -> str:
@@ -89,7 +103,10 @@ class ChatClient:
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.3,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
+        """Один вызов модели. `timeout` на вызов сильнее поля клиента: так ход
+        укладывается в общий бюджет (остаток бюджета вместо полных 60 секунд)."""
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -114,9 +131,10 @@ class ChatClient:
             method="POST",
         )
         body: dict[str, Any] | None = None
+        wait = timeout if timeout and timeout > 0 else self.timeout
         for attempt in (1, 2):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=wait) as response:
                     body = json.loads(response.read().decode("utf-8"))
                 break
             except urllib.error.HTTPError as exc:
@@ -139,6 +157,8 @@ class ChatClient:
                     raise LLMAuthError(message) from exc
                 raise LLMError(message) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if _is_timeout(exc):
+                    raise LLMTimeoutError(f"{self.name} не ответил за {wait:.0f} с") from exc
                 raise LLMError(f"{self.name} недоступен: {exc}") from exc
         if body is None:
             raise LLMError(f"{self.name}: ответа нет")
@@ -174,6 +194,15 @@ def _retry_after(headers: Any) -> float:
         return 2.0
 
 
+def _is_timeout(exc: Exception) -> bool:
+    """Пауза это или сеть лежит: socket.timeout приходит и сам по себе, и внутри URLError."""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(exc, urllib.error.URLError) and isinstance(
+        getattr(exc, "reason", None), (TimeoutError, socket.timeout)
+    )
+
+
 def _usage(body: dict[str, Any], model: str) -> dict[str, Any]:
     raw = body.get("usage") or {}
     return {
@@ -181,3 +210,17 @@ def _usage(body: dict[str, Any], model: str) -> dict[str, Any]:
         "tokens_in": int(raw.get("prompt_tokens") or 0),
         "tokens_out": int(raw.get("completion_tokens") or 0),
     }
+
+
+def without_reasoning(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """История для моделей, которые поле reasoning_content не принимают.
+
+    Поле нужно только валидатору DeepSeek на Cloud.ru; остальные провайдеры
+    могут отвергнуть сообщение с незнакомым ключом.
+    """
+    return [
+        {key: value for key, value in item.items() if key != "reasoning_content"}
+        if item.get("role") == "assistant"
+        else item
+        for item in messages
+    ]

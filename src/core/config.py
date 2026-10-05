@@ -73,11 +73,25 @@ class Settings:
     cloudru_api_key: str = ""
     cloudru_base_url: str = "https://foundation-models.api.cloud.ru/v1"
     cloudru_model: str = "deepseek-ai/DeepSeek-V4-Flash"
+    # Запасная модель у того же провайдера (тот же ключ и адрес): пауза у основной
+    # не оставляет ход без модели — подхватывает вторая (прогон 04.10, К1).
+    # Пусто — работает как раньше, одной моделью. Имя сверяется по каталогу
+    # Cloud.ru Foundation Models перед выкатом (`run.py llm`).
+    cloudru_fallback_model: str = ""
+    cloudru_fallback_price_in: float = 0.0
+    cloudru_fallback_price_out: float = 0.0
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "deepseek/deepseek-chat-v3-0324"
     llm_timeout_seconds: float = 60.0
     llm_max_tokens: int = 2000
+    # Общий срок хода с моделью: исчерпан — отвечаем тем, что уже собрано
+    # (подбор ядра, комплектация), а не ждём ещё минуту (прогон 04.10: ответы
+    # до 147 с). Таймаут одного вызова не больше остатка бюджета; короткому
+    # вызову маршрутизатора хватает 8 секунд.
+    turn_budget_seconds: float = 45.0
+    llm_call_timeout_seconds: float = 30.0
+    llm_router_timeout_seconds: float = 8.0
     # Рубли за миллион токенов — по прайсу провайдера на 01.09.2026. Нужны,
     # чтобы в журнале стояла стоимость хода: выбирать модель по цифрам дешевле,
     # чем по впечатлению. Цены меняются, поэтому это настройка, а не константа.

@@ -36,7 +36,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent.client import LLMError
+from agent.client import LLMError, without_reasoning
 from core import intent
 
 log = logging.getLogger(__name__)
@@ -149,6 +149,9 @@ INTENT_TITLES = {
 # показывайте» — согласие на что?), но не весь разговор: это её цена.
 HISTORY_LIMIT = 6
 MAX_TOKENS = 250
+# Короткому вызову маршрутизатора хватает 8 секунд: он решает лишь ветку и роль.
+# Ждать от него полные 60 секунд — удваивать время хода на ровном месте (К1).
+ROUTER_TIMEOUT_SECONDS = 8.0
 
 # Попытка сменить роль или вытащить инструкцию. Ловится правилом, а не моделью:
 # просить модель решить, атакуют ли её, — сомнительная затея.
@@ -521,10 +524,18 @@ class Orchestrator:
         messages = [{"role": "system", "content": system}, *_history(session, text)]
         for client in self.llm.ready():
             try:
-                message = client.complete(messages, temperature=0.0, max_tokens=MAX_TOKENS)
+                message = client.complete(
+                    messages if client.reasoning_in_history else without_reasoning(messages),
+                    temperature=0.0,
+                    max_tokens=MAX_TOKENS,
+                    timeout=ROUTER_TIMEOUT_SECONDS,
+                )
             except LLMError as exc:
-                self.llm.mark_down(client, exc)
-                continue
+                # Сбой короткого вызова маршрутизатора не блокирует провайдера:
+                # решает правила и запасной агент (прогон 04.10, К1 — из-за этой
+                # блокировки ход уходил в подбор без модели).
+                log.warning("Маршрутизатор не ответил (%s) — решают правила.", exc)
+                return None
             _account(session, client, message)
             parsed = parse(message.get("content") or "", _last_agent(session.profile))
             if parsed is not None:

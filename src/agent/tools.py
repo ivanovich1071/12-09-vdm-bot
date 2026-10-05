@@ -28,9 +28,10 @@ from procurement.models import SelectionResult, SelectionStatus
 _NORM_TOOLS = frozenset({"find_by_norm_code", "find_norm_item", "explain_norm"})
 # Инструменты подбора: вызов любого из них — это подбор, а не обещание подбора.
 SELECTION_TOOLS = frozenset({"search_products", "find_by_norm_code"})
-# Сколько пунктов раздела отдаёт find_norm_item: в «1.5 Спортивный зал» приказа 1057 их 99, и
-# консультант составляет по ним полную предварительную комплектацию — обрезать раздел нельзя.
-MAX_POSITIONS = 100
+# Сколько пунктов раздела отдаёт find_norm_item модели: раздел логопеда 1.13.3 — 85 позиций,
+# и целиком они раздували каждый следующий вызов хода до 11,8 тыс. знаков (прогон 04.10, К1).
+# Модели — первые 30 и счётчик «ещё N»; полная комплектация остаётся в `kit` для файла.
+FIND_NORM_LIMIT = 30
 
 # Просьба добавить в корзину: «добавь», «клади», «в корзину», «возьмём», «оформи».
 _ADD_REQUEST = re.compile(
@@ -449,7 +450,15 @@ class ToolBox:
             positions = index.children(item.doc_id, item.code)
             if positions:
                 brief["positions_total"] = len(positions)
-                brief["positions"] = [self._position(child) for child in positions[:MAX_POSITIONS]]
+                # Модели отдаём не больше FIND_NORM_LIMIT пунктов раздела: логопедский
+                # 1.13.3 — 85 позиций, 11,8 тыс. знаков в каждом следующем вызове хода
+                # (прогон 04.10, К1). Полная комплектация остаётся в `kit` для файла,
+                # а «ещё N» модель называет клиенту сама.
+                brief["positions"] = [self._position(child) for child in positions[:FIND_NORM_LIMIT]]
+                if len(positions) > FIND_NORM_LIMIT:
+                    brief["positions_note"] = (
+                        f"показаны первые {FIND_NORM_LIMIT} из {len(positions)} — полный раздел в файле комплектации"
+                    )
                 # Комплектация для файла — весь раздел без обрезки: в файле место есть. Какой из
                 # разобранных разделов уйдёт в файл, решает текст ответа (`kit_for`).
                 self.kit = self.kits[f"{item.doc_id}:{item.code}"] = {
