@@ -102,8 +102,61 @@ def _key(candidate: Candidate) -> tuple:
         not any(m.status is MappingStatus.APPROVED for m in candidate.mappings),
         product.availability is not Availability.AVAILABLE,
         product.price is None,
-        candidate.position,
+        _point_order(candidate),
     )
+
+
+def _point_order(candidate: Candidate) -> tuple[int, ...]:
+    """Естественный порядок пункта вместо алфавита названий (К9.5).
+
+    Прогон 04.10: последняя ступень — порядок по названию — выдавал заготовки
+    строковым порядком номеров (1.13.3.3.1, 1.13.3.3.10, 1.13.3.3.13…) и товары
+    по префиксам поставщиков («БОС», «ВАЛ», «МЕД»).
+    """
+    numbers = [
+        tuple(int(part) for part in code.split(".")[:6])
+        for code in candidate.product.norm_codes
+        if code.replace(".", "").isdigit()
+    ]
+    return min(numbers) if numbers else (99,)
+
+
+# Заготовка «Оснащения новостроек»: витринная копия с номером пункта в начале
+# названия («1.13.3.2.2 Доска магнитно-маркерная»), без привязки и без наличия.
+_STUB_NAME = re.compile(r"^\s*(\d{1,2}(?:\.\d{1,3}){1,5})и?\s+\S")
+
+
+def _stub_point(product: Product) -> str | None:
+    if product.norm_codes or product.available:
+        return None
+    match = _STUB_NAME.match(product.name)
+    return match.group(1) if match else None
+
+
+def _demote_stubs(candidates: list[Candidate], state: CatalogRuntimeState) -> list[Candidate]:
+    """Заготовки не вытесняют настоящие товары со склада (К9.3).
+
+    У пункта есть настоящий товар — заготовка не показывается вовсе; нет —
+    остаётся (с наличием ноль она и так уходит в конец списка). Вопрос о самих
+    заготовках («что это и можно ли их продавать») открыт у заказчика.
+    """
+    stubs = {point for c in candidates if (point := _stub_point(c.product))}
+    if not stubs:
+        return candidates
+    real: set[str] = set()
+    for product in state.index.products:
+        if product.available:
+            real.update(product.norm_codes)
+    kept = []
+    for candidate in candidates:
+        point = _stub_point(candidate.product)
+        if point and any(
+            point == other or other.startswith(f"{point}.") or point.startswith(f"{other}.")
+            for other in real
+        ):
+            continue
+        kept.append(candidate)
+    return kept
 
 
 class GuardedRanker:
@@ -228,6 +281,7 @@ class ProcurementSelector:
                         warnings.append(
                             Notice("SUBJECT_NOT_FOUND", f"По запросу «{subject}» в каталоге товаров нет.")
                         )
+        candidates = _demote_stubs(candidates, state)
         ranked = self.ranker.rank(requirement, candidates)
         picked, rest = ranked[:limit], ranked[limit:]
         items = tuple(self._item(task, requirement, candidate, rest) for candidate in picked)
@@ -271,7 +325,6 @@ class ProcurementSelector:
             query=text,
             institution_type=requirement.audience,
             institution_name=user.institution_name,
-            room=requirement.catalog_room,
             zone=user.zone,
             age_group=user.age_group,
             category=user.category,
@@ -279,6 +332,10 @@ class ProcurementSelector:
             # Названный пункт фильтрует и без документа: «раздел 1.12» без приказа —
             # не повод показывать весь каталог (К2.5, прогон 04.10).
             norm_point=norm.point if (norm.filters or norm.point) else None,
+            # К9.4: названный пункт сильнее помещения — пункт сам задаёт раздел,
+            # помещение остаётся подписью. 1.13.3.3.43 при «кабинете логопеда» в
+            # профиле был пуст, хотя пирамидки в каталоге есть.
+            room=None if norm.point else requirement.catalog_room,
             price_max=user.budget,
             available_only=user.available_only,
             limit=max(catalog_size, 1),
@@ -495,17 +552,20 @@ def _named(candidates: list[Candidate], text: str) -> bool:
     stems = _stems(text)
     if not stems:
         return bool(candidates)
-    return any(
-        any(stem in _plain(candidate.product.name) for stem in stems) for candidate in candidates
-    )
+    return any(_subject_hit(candidate, stems) for candidate in candidates)
 
 
 def _subject_hit(candidate: Candidate, stems: list[str]) -> bool:
-    """Предмет запроса стоит в названии этой позиции (не только в описании)."""
+    """Предмет запроса стоит в названии этой позиции (не только в описании).
+
+    Название стеммится тем же стеммером, что и запрос: «станок» и «станка»
+    сходятся в «станк», и подстрочный поиск не ломается на беглой гласной.
+    """
     if not stems:
         return True
     name = _plain(candidate.product.name)
-    return any(stem in name for stem in stems)
+    name_stems = set(catalog_text.stems(name))
+    return any(stem in name_stems or stem in name for stem in stems)
 
 
 def _subjects(text: str) -> list[str]:

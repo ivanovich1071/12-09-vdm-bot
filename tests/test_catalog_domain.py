@@ -287,10 +287,11 @@ def test_institution_filter(service):
     assert skus(service.search(CatalogQuery(query="кукла", institution_type="school"))) == set()
 
     preschool = service.search(CatalogQuery(institution_type="preschool", limit=100))
-    assert skus(preschool) == {"KG1", "BALL1", "KG2", "GRP1"}
-    # Лото лежит в смешанной «Коррекционной среде» и в школьной ветке: для сада оно чужое.
+    # К9.1: лото из смешанной «Коррекционной среды» больше не стирается фильтром
+    # учреждения — нейтральное размещение подходит и саду, и школе.
+    assert skus(preschool) == {"KG1", "BALL1", "KG2", "GRP1", "LOG1"}
     report = preschool.filter("institution_type")
-    assert (report.excluded, report.unknown) == (5, 0)
+    assert (report.excluded, report.unknown) == (4, 0)
 
     unknown = service.search(CatalogQuery(query="мяч", institution_type="колледж"))
     assert unknown.hits == []
@@ -361,9 +362,10 @@ def test_service_depends_only_on_repository_contract(products):
 
 
 def test_room_and_institution_checked_on_same_placement(service):
-    # Логопедия у лото только в смешанной ветке, школьное размещение — начальные классы.
+    # К9.1: логопедия у лото в смешанной ветке — она теперь не выпадает при
+    # фильтре учреждения, поэтому «кабинет логопеда в школе» лото находит.
     assert "LOG1" in skus(service.search(CatalogQuery(room="кабинет логопеда")))
-    assert "LOG1" not in skus(
+    assert "LOG1" in skus(
         service.search(CatalogQuery(room="кабинет логопеда", institution_type="школа"))
     )
 
@@ -445,14 +447,14 @@ def test_age_parsing(text, expected):
 def test_age_filter_is_soft_and_reported(service):
     result = service.search(CatalogQuery(institution_type="preschool", age_group="5–6 лет", limit=100))
 
-    # Кукла из группы 3–4 лет исключена, пирамидка без возраста осталась.
-    assert skus(result) == {"KG1", "BALL1", "KG2"}
+    # Кукла из группы 3–4 лет исключена, лото и пирамидка без возраста остались (К9.1).
+    assert skus(result) == {"KG1", "BALL1", "KG2", "LOG1"}
     report = result.filter("age_group")
-    assert (report.status, report.excluded, report.unknown) == (FilterStatus.PARTIAL, 1, 1)
+    assert (report.status, report.excluded, report.unknown) == (FilterStatus.PARTIAL, 1, 2)
     assert "оставлены" in report.note
 
     unparsed = service.search(CatalogQuery(institution_type="preschool", age_group="младшая группа", limit=100))
-    assert skus(unparsed) == {"KG1", "BALL1", "KG2", "GRP1"}
+    assert skus(unparsed) == {"KG1", "BALL1", "KG2", "GRP1", "LOG1"}
     assert unparsed.filter("age_group").status is FilterStatus.NOT_APPLIED
 
 

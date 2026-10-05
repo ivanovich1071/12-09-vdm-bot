@@ -41,6 +41,79 @@ class SourceRef:
     as_of: str = ""
 
 
+_ORDER_INSTITUTION = {"order_1057": "preschool", "order_838": "school"}
+
+
+def _institution_from_norms(norms: tuple[NormRef, ...]) -> str | None:
+    """Документ привязки, по которому берём учреждение, — когда на сайте оно не названо."""
+    docs = {ref.doc_id for ref in norms if ref.item_code} & _ORDER_INSTITUTION.keys()
+    return docs.pop() if len(docs) == 1 else None
+
+
+# Помещение по разделу приказа 1057, когда на сайте товар лежит вне именного раздела
+# (план 05-10, шаг 2.10). Проверено на справочнике: заголовки дают эти помещения.
+_NORM_ROOMS = (
+    ("1.13.3", "кабинет логопеда"),
+    ("1.13.2", "кабинет психолога"),
+    ("1.13.1", "кабинет дефектолога"),
+    ("1.13.4", "кабинет дополнительного образования"),
+    ("1.5", "спортивный зал"),
+    ("1.6", "бассейн"),
+    ("1.2", "музыкальный зал"),
+)
+# Возраст групповых помещений: 1.14.2 — до года, дальше по году (1.14.4 — 2–3, 1.14.5 — 3–4).
+_GROUP_AGES = {
+    "1.14.2": (0, 1),
+    "1.14.3": (1, 2),
+    "1.14.4": (2, 3),
+    "1.14.5": (3, 4),
+    "1.14.6": (4, 5),
+    "1.14.7": (5, 6),
+    "1.14.8": (6, 7),
+}
+
+
+def _norm_room_age(doc_id: str, code: str) -> tuple[str | None, AgeRange | None]:
+    """Помещение и возраст по коду пункта приказа."""
+    if doc_id != "order_1057":
+        return None, None
+    for prefix, room in _NORM_ROOMS:
+        if code == prefix or code.startswith(f"{prefix}."):
+            return room, None
+    if code == "1.14" or code.startswith("1.14."):
+        for prefix, years in _GROUP_AGES.items():
+            if code == prefix or code.startswith(f"{prefix}."):
+                return "групповая комната", AgeRange(*years)
+        return "групповая комната", None
+    return None, None
+
+
+def _norm_placements(norms: tuple[NormRef, ...]) -> list[Placement]:
+    """Размещения «по приказу» из привязок реестра: учреждение, помещение, возраст."""
+    doc = _institution_from_norms(norms)
+    if doc is None:
+        return []
+    institution = _ORDER_INSTITUTION[doc]
+    result: list[Placement] = []
+    seen: set[tuple[str | None, AgeRange | None]] = set()
+    for ref in norms:
+        if not ref.item_code or ref.doc_id != doc:
+            continue
+        room, age = _norm_room_age(ref.doc_id, ref.item_code)
+        if (room, age) in seen:
+            continue
+        seen.add((room, age))
+        result.append(
+            Placement(
+                path=(f"ПРИКАЗ {_ORDER_INSTITUTION[doc]}", f"пункт {ref.item_code}"),
+                institution=institution,
+                room=room,
+                age=age,
+            )
+        )
+    return result
+
+
 @dataclass(frozen=True)
 class NormRef:
     """Нормативное основание: документ и, если известен, пункт перечня."""
@@ -244,7 +317,19 @@ class Product:
 
     @cached_property
     def placements(self) -> list[Placement]:
-        return [placement_of(path) for path in self.category_paths if path]
+        found = [placement_of(path) for path in self.category_paths if path]
+        # К9.2/К9.3: дерево сайта не даёт учреждение или помещение, а реестр
+        # привязал товар к пункту приказа — размещение строится по пункту (1057 —
+        # сад, 838 — школа). 61 позиция «Коррекционной среды» без этого выпадала
+        # при любом запросе, 57 товаров с пунктом 1.13.3.x не доходили до кабинета
+        # логопеда, а у групповых помещений настоящие товары вытеснялись заготовками.
+        if not any(p.institution for p in found) or not any(p.room for p in found):
+            extra = _norm_placements(self.norms)
+            if not any(p.institution for p in found):
+                found += [p for p in extra if p.institution]
+            if not any(p.room for p in found):
+                found += [p for p in extra if p.room or p.age]
+        return found
 
     @property
     def institution_types(self) -> set[str]:

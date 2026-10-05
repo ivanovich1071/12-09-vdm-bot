@@ -15,6 +15,7 @@ import json
 import re
 from typing import Any
 
+from catalog.placement import institution_code
 from core import selection
 from core.ui import price_text, stock_text
 from norms import documents as norm_docs
@@ -22,6 +23,9 @@ from norms import extract as norm_extract
 from norms import reference
 from norms.extract import document_ids_in_text
 from procurement.models import SelectionResult, SelectionStatus
+
+# Перечень по учреждению: сад — 1057, школа — 838 (как в ядре, DOCUMENT_FROM_INSTITUTION).
+_AUDIENCE_DOCUMENT = {"preschool": "order_1057", "school": "order_838"}
 
 # Инструменты, чьи вызовы попадают в журнал хода: по ним разбирают сбои
 # «нашёл, но не то».
@@ -505,11 +509,18 @@ class ToolBox:
         return answer
 
     def _document_for(self, document: str | None) -> str | None:
-        """Приказ, по которому подбираем: названный моделью или взятый из разговора."""
+        """Приказ, по которому подбираем: названный моделью, из разговора или по учреждению.
+
+        Одно правило с ядром (`NormReason.DOCUMENT_FROM_INSTITUTION`): прогон 04.10,
+        К9.6 — без «1057» на «кабинет логопеда» консультант получал школьный 838.
+        """
         if document:
             return _document_id(document)
         named = self.session.profile.norm_doc_ids
-        return named[0] if len(named) == 1 else None
+        if len(named) == 1:
+            return named[0]
+        audience = institution_code(self.session.profile.institution)
+        return _AUDIENCE_DOCUMENT.get(audience)
 
     def _explain_norm(self, document: str) -> dict[str, Any]:
         doc_id = _document_id(document)

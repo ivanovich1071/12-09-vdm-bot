@@ -232,7 +232,7 @@ def _steps(query: CatalogQuery) -> list[_Step]:
             _Step(
                 "institution_type",
                 query.institution_type,
-                _narrow(lambda placement: placement.institution, code),
+                _by_institution(code),
                 note="" if code else "тип учреждения не распознан — подходящих товаров нет",
             )
         )
@@ -318,6 +318,36 @@ def _report(step: _Step, excluded: int, unknown: int) -> FilterReport:
         unknown=unknown,
         note="; ".join(notes),
     )
+
+
+def _by_institution(wanted: str | None) -> Callable[[_Candidate], _Verdict]:
+    """Учреждение не стирает «нейтральные» разделы (К9.1).
+
+    Размещение без учреждения («Коррекционная среда», «Инновационные решения»)
+    подходит и саду, и школе. Прежний общий фильтр оставлял товару только
+    размещения с учреждением, поэтому 61 позиция нейтральных корней выпадала
+    при любом запросе, а подбор по кабинету логопеда находил одни заготовки
+    «Оснащения новостроек». Исключается только товар, у которого все размещения
+    с учреждением чужие и ни одного нейтрального нет.
+    """
+
+    def check(candidate: _Candidate) -> _Verdict:
+        if wanted is None:
+            return _Verdict.MISMATCH
+        known = [p for p in candidate.placements if p.institution]
+        neutral = [p for p in candidate.placements if not p.institution]
+        if not known and not neutral:
+            return _Verdict.UNKNOWN
+        matching = [p for p in known if p.institution == wanted]
+        if matching:
+            candidate.placements = matching + neutral
+            return _Verdict.MATCH
+        if neutral:
+            candidate.placements = neutral
+            return _Verdict.MATCH
+        return _Verdict.MISMATCH
+
+    return check
 
 
 def _narrow(

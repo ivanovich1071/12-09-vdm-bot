@@ -177,7 +177,9 @@ def test_hard_filters_keep_foreign_sections_out(service):
 def test_budget_filters_expensive_items(service):
     task = task_from(service, "Детский сад, спортивный зал, бюджет до 10 тысяч")
     result = service.select(task.id, OWNER)
-    assert ids(result) == ["B2"]
+    # К9.10: пункт 1.5.1.x — это спортинвентарь зала по 1057, поэтому «Мяч для игр»
+    # (908 ₽) тоже законно входит в подбор зала; дорогой B3 отсечён бюджетом.
+    assert ids(result) == ["B2", "B1"]
     budget = next(f for f in result.filters if f["name"] == "price")
     assert budget["excluded"] == 2
 
@@ -185,7 +187,7 @@ def test_budget_filters_expensive_items(service):
 def test_budget_warning_when_page_exceeds_budget(service):
     task = task_from(service, "Детский сад, спортивный зал", budget=13000)
     result = service.select(task.id, OWNER)
-    assert set(ids(result)) == {"B2", "B3"}
+    assert set(ids(result)) == {"B2", "B1", "B3"}
     assert any(notice.code == "BUDGET_EXCEEDED" for notice in result.warnings)
 
 
