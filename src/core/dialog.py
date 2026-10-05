@@ -44,6 +44,7 @@ from norms import reference as norm_reference
 from orders.service import OrderService
 from privacy.consent import CONSENT_TEXT, CONSENT_VERSION
 from privacy.masking import Masker
+from procurement import discovery
 from procurement.models import SelectionResult, SelectionStatus
 
 log = logging.getLogger(__name__)
@@ -718,14 +719,57 @@ class DialogEngine:
         code = intent.norm_code(text) if intent.classify(text) is intent.NORM_CODE else None
         # Содержательный ответ ядра выводит разговор из деградации.
         session.degradation_streak = 0
+        profile = session.profile
+        if code is None and discovery.is_rejection(text):
+            # Два «не то» подряд — стоп (прогон 04.10, сц. 5 и 9: логопед 11 раз
+            # получил следующую тройку мусора). Дальше — менеджер, а не листание.
+            profile.rejection_streak += 1
+            if profile.rejection_streak >= 2:
+                return [
+                    Message(
+                        "Похоже, подходящего в каталоге нет. Поможет менеджер: "
+                        f"{self.settings.manager_contact}."
+                    )
+                ]
+        else:
+            profile.rejection_streak = 0
         result = selection.select(
             self,
             session,
             text=text if about else None,
-            # Названный пункт перечня — отдельный подбор: прежние слова запроса его не сужают.
-            query="" if code else None,
+            # Названный код и слова товара работают вместе: «ростомер по разделу 1.12»
+            # ищет и по словам, и по разделу — слова больше не стираются (К2.4).
+            query=None,
+            norm_item=code,
         )
-        return self._selection_reply(session, result, header)
+        reply = self._selection_reply(session, result, header)
+        # Позиций нет и назван пункт — объясняем про пункт, а не молчаливое «не нашлось»:
+        # REVIEW_REQUIRED («пункта нет в документе») сюда тоже попадает.
+        if code and result is not None and not result.items:
+            if note := self._section_note(result.norm, selection.query_of(text)):
+                reply = [*reply, Message(note)]
+        return reply
+
+    def _section_note(self, norm, request: str = "") -> str | None:  # noqa: ANN001 — norms.selector NormRequirement
+        """Честный ответ о разделе вместо молчаливого «не нашлось» (сц. 9, 12)."""
+        code = norm.point
+        if not code:
+            return None
+        asked = f" по запросу «{request}»" if request else ""
+        if norm.document:
+            item = self.norm_texts.get(norm.document, code)
+            if item is not None:
+                return (
+                    f"В разделе {code} «{item.title}»{asked} товаров нет. "
+                    "Назовите другой раздел или товар — или позовём менеджера."
+                )
+        homes = self.norm_texts.documents_with(code)
+        if homes:
+            item = self.norm_texts.get(homes[0], code)
+            title = f" — «{item.title}»" if item is not None else ""
+            name = norm_docs.get(homes[0]).short_name if homes[0] in norm_docs.DOCUMENTS else homes[0]
+            return f"Пункта {code} в названном перечне нет; в {name} это{title}."
+        return f"Пункта {code} нет ни в одном из разобранных перечней."
 
     def _selection_reply(
         self, session: Session, result: SelectionResult | None, header: str

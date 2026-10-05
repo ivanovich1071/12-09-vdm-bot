@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from core import intent
 from core.errors import DomainError
+from procurement import discovery
 from procurement.models import SelectionItem, SelectionResult
 from procurement.service import MAX_TEXT
 
@@ -32,7 +33,7 @@ QUESTIONS = {
 # Предупреждения ядра, которые стоит сказать человеку. Остальные — служебный отчёт о фильтрах.
 # NORM_REVIEW_REQUIRED не для клиента: его расшифровка («Документ назван пользователем…»)
 # — служебный отчёт, который 19-20.09 показывался людям как часть ответа.
-SPOKEN_WARNINGS = frozenset({"BUDGET_EXCEEDED"})
+SPOKEN_WARNINGS = frozenset({"BUDGET_EXCEEDED", "SUBJECT_NOT_FOUND"})
 MAX_QUERY = 200
 
 
@@ -100,6 +101,11 @@ def more(engine: DialogEngine, session: Session) -> SelectionResult | None:
 def about_task(text: str) -> bool:
     """Говорит ли реплика о закупке. «Хорошо, что дальше?» — нет: её слова не запрос."""
     return intent.classify(text) in (intent.PRODUCT, intent.NORM_CODE, intent.TASK)
+
+
+def query_of(text: str) -> str:
+    """Слова товара из реплики — для честного ответа о пустом разделе (сц. 12)."""
+    return discovery.query_from_text(text)
 
 
 def citation(item: SelectionItem) -> str | None:

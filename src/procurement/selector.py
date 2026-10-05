@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+from catalog import text as catalog_text
 from catalog.models import Availability, Product
 from catalog.placement import parse_age
 from catalog.query import CatalogQuery
@@ -180,10 +181,12 @@ class ProcurementSelector:
             if report.note and report.status.value != "applied"
         ]
 
+        excluded = set(task.preferences.get("exclude_terms") or [])
         candidates = [
             self._candidate(requirement, hit.product, position, hit.reason in _RELEVANCE)
             for position, hit in enumerate(found.hits)
             if hit.product.id not in requirement.exclude
+            and not (excluded and excluded & set(catalog_text.stems(hit.product.name)))
         ]
         if requirement.user.text:
             # Названы слова запроса — показываем то, что им отвечает. Раздел помещения
@@ -207,7 +210,24 @@ class ProcurementSelector:
                     filters = tuple(_report(report) for report in found.filters)
                     matched = widened
                     warnings.append(notice)
-            candidates = matched
+            # Совпадение только в описании — мусор: «ростомер» нашёлся в описании
+            # пробирок (прогон 04.10, К2.5). Предмет запроса обязан быть в названии.
+            subjects = _subjects(requirement.user.text)
+            stems = _stems(requirement.user.text)
+            strict = [c for c in matched if _subject_hit(c, stems)]
+            if matched and not strict:
+                candidates = []
+            else:
+                candidates = strict
+            # Многосоставный запрос («ростомер, весы и кушетка») отвечает по каждому
+            # предмету: чего нет — сказано прямо, а не одной фразой «не нашлось».
+            if len(subjects) > 1:
+                for subject in subjects:
+                    subject_stems = _stems(subject)
+                    if subject_stems and not any(_subject_hit(c, subject_stems) for c in candidates):
+                        warnings.append(
+                            Notice("SUBJECT_NOT_FOUND", f"По запросу «{subject}» в каталоге товаров нет.")
+                        )
         ranked = self.ranker.rank(requirement, candidates)
         picked, rest = ranked[:limit], ranked[limit:]
         items = tuple(self._item(task, requirement, candidate, rest) for candidate in picked)
@@ -256,7 +276,9 @@ class ProcurementSelector:
             age_group=user.age_group,
             category=user.category,
             norm_document=norm.document if norm.filters else None,
-            norm_point=norm.point if norm.filters else None,
+            # Названный пункт фильтрует и без документа: «раздел 1.12» без приказа —
+            # не повод показывать весь каталог (К2.5, прогон 04.10).
+            norm_point=norm.point if (norm.filters or norm.point) else None,
             price_max=user.budget,
             available_only=user.available_only,
             limit=max(catalog_size, 1),
@@ -350,7 +372,7 @@ def _questions(requirement: ProcurementRequirement) -> tuple[str, ...]:
     товаре, раздела, возраста или пункта перечня.
     """
     user, norm = requirement.user, requirement.norm
-    if user.room or user.text or user.category or user.age_group or (norm.filters and norm.point):
+    if user.room or user.text or user.category or user.age_group or norm.point:
         return ()
     if not user.institution_type:
         return ("institution_type", "room")
@@ -478,14 +500,37 @@ def _named(candidates: list[Candidate], text: str) -> bool:
     )
 
 
+def _subject_hit(candidate: Candidate, stems: list[str]) -> bool:
+    """Предмет запроса стоит в названии этой позиции (не только в описании)."""
+    if not stems:
+        return True
+    name = _plain(candidate.product.name)
+    return any(stem in name for stem in stems)
+
+
+def _subjects(text: str) -> list[str]:
+    """Предметы многосоставного запроса: «ростомер, весы и кушетка» → три предмета."""
+    parts = re.split(r"\s*(?:,|а также|\bи\b)\s*", _plain(text))
+    return [part.strip() for part in parts if part.strip()]
+
+
 def _stems(text: str) -> list[str]:
-    """Основы слов запроса: «мольберты» → «мольбер», чтобы совпасть с «Мольберт настенный»."""
-    stems = []
-    for word in re.findall(r"[а-яa-z0-9]{4,}", _plain(text)):
-        stem = word[: max(4, len(word) - 2)]
-        if not any(stem.startswith(skip) or skip.startswith(stem) for skip in _NOT_GOODS):
-            stems.append(stem)
-    return stems
+    """Основы слов запроса: «мольберты» → «мольбер», «мячи» → «мяч».
+
+    Стеммер общий с каталогом (`catalog.text.stem`) — иначе «мячи» из запроса и
+    «Мяч баскетбольный» из названия расходились, и честный матч по названию
+    отбрасывал верные позиции.
+    """
+    result: list[str] = []
+    for token in catalog_text.tokenize(_plain(text)):
+        if len(token) < 3:
+            continue
+        stem = catalog_text.stem(token)
+        if any(stem.startswith(skip) or skip.startswith(stem) for skip in _NOT_GOODS):
+            continue
+        if stem not in result:
+            result.append(stem)
+    return result
 
 
 def _plain(text: str) -> str:

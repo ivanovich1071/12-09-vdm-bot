@@ -69,6 +69,28 @@ class ProcurementService:
         self.selector = ProcurementSelector(self.mapping, self.quantities, ranker)
         self.builder = SpecificationBuilder(self.mapping, self.quantities)
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._vocab: frozenset[str] | None = None
+
+    @property
+    def vocab(self) -> frozenset[str]:
+        """Основы слов каталога — названия товаров и разделы.
+
+        Второй фильтр запроса (К2.1): слово остаётся в поиске, только если оно вообще
+        встречается в каталоге. «Менеджера», «времени», «примерно» отпадают сами, а
+        новое слово-товар не теряется. Строится один раз на версию каталога.
+        """
+        if self._vocab is None:
+            from catalog import text as catalog_text
+
+            state = self.runtime.state
+            words: set[str] = set()
+            for product in state.index.products:
+                words.update(catalog_text.stems(product.name))
+                for placement in product.placements:
+                    for section in placement.sections:
+                        words.update(catalog_text.stems(section))
+            self._vocab = frozenset(words)
+        return self._vocab
 
     # --- Задача ---------------------------------------------------------------
 
@@ -335,7 +357,7 @@ class ProcurementService:
         if text is not None:
             if len(text) > MAX_TEXT:
                 raise InvalidRequest(f"Текст длиннее {MAX_TEXT} символов.", code="TEXT_TOO_LONG")
-            discovery.apply_text(task, text)
+            discovery.apply_text(task, text, vocab=self.vocab)
         for name, value in (fields or {}).items():
             if name in TASK_FIELDS:
                 setattr(task, name, _checked(name, value, TASK_FIELDS[name]))
