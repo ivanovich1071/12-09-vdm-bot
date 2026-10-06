@@ -45,8 +45,8 @@ from core.ui import (
     ProductCard,
     ProductList,
     Response,
+    card_price_line,
     price_text,
-    stock_text,
 )
 from core_api.composition import build_core_api
 from observability import redact
@@ -237,7 +237,7 @@ def render_card(card: ProductCard) -> str:
     product = card.product
     lines = [
         f"<b>{_escape(product.name)}</b>",
-        f"{price_text(product.price)} · {stock_text(product)}",
+        card_price_line(product),
         f"Код 1С: {_escape(product.sku_1c)}",
     ]
     # Оснований у товара бывает несколько, и в спецификации важно видеть все:
@@ -289,7 +289,7 @@ def render_list_item(card: ProductCard) -> str:
     product = card.product
     lines = [
         f"<b>{_escape(product.name)}</b>",
-        f"{price_text(product.price)} · {stock_text(product)}",
+        card_price_line(product),
     ]
     if card.citation:
         lines.append(code_numbers(_escape(card.citation)))

@@ -142,3 +142,49 @@ def test_lead_letter_names_the_request_instead_of_zero_items(lead):
     body = letter.get_body(preferencelist=("plain",)).get_content()
     assert "Иванов" in body and "330-02-79" in body
     assert "нужен счёт" in body
+
+
+# --- Тестовые владельцы (QA_USER_IDS): наружные приёмники не вызываются --------
+
+
+class _FakeStorage:
+    def __init__(self):
+        self.saved = []
+
+    def save_order(self, order):
+        self.saved.append(order)
+
+
+def _service(tmp_path, qa_user_ids):
+    from orders.service import OrderService
+
+    external = JsonlSink(path=tmp_path / "external.jsonl")  # стоит вместо почты/Sheets
+    local = CompositeSink(
+        [JsonlSink(path=tmp_path / "local.jsonl"), XlsxSink(directory=tmp_path / "xlsx")]
+    )
+    return (
+        OrderService(_FakeStorage(), external, local_sink=local, qa_user_ids=qa_user_ids),
+        tmp_path / "external.jsonl",
+        tmp_path / "local.jsonl",
+    )
+
+
+def test_qa_owner_order_never_reaches_external_sinks(order, tmp_path):
+    """Клиенту обещали «ТЕСТ: заявка не отправлена» — и письмо вправду не уходит."""
+    service, external_file, local_file = _service(tmp_path, frozenset({"u1"}))
+
+    assert service._deliver(order)
+
+    assert local_file.exists()
+    assert not external_file.exists()
+    assert order.status == "sent"
+
+
+def test_regular_owner_order_goes_out_as_before(order, tmp_path):
+    """Обычному владельцу — внешний приёмник; локальный гейт его не касается."""
+    service, external_file, local_file = _service(tmp_path, frozenset({"someone-else"}))
+
+    assert service._deliver(order)
+
+    assert external_file.exists()
+    assert not local_file.exists()

@@ -23,6 +23,17 @@ log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 5
 
 
+def build_local_sink(settings: Settings) -> CompositeSink:
+    """Локальные файлы (jsonl + Excel): дубль внешних приёмников и единственный
+    приёмник для тестовых владельцев (QA_USER_IDS) — наружу их заявки не ходят."""
+    return CompositeSink(
+        [
+            JsonlSink(path=Path(settings.orders_jsonl_path)),
+            XlsxSink(directory=Path(settings.orders_xlsx_dir)),
+        ]
+    )
+
+
 def build_sink(settings: Settings) -> OrderSink:
     """Приёмник по конфигурации. Локальный файл всегда включён как дубль.
 
@@ -32,12 +43,7 @@ def build_sink(settings: Settings) -> OrderSink:
     """
     # Спецификация в Excel идёт всегда: пока интеграции с 1С нет, это тот вид, в
     # котором заказ можно передать менеджеру и завести руками.
-    fallback = CompositeSink(
-        [
-            JsonlSink(path=Path(settings.orders_jsonl_path)),
-            XlsxSink(directory=Path(settings.orders_xlsx_dir)),
-        ]
-    )
+    fallback = build_local_sink(settings)
     if settings.order_sink == "google_sheets":
         if not settings.google_sheets_id:
             log.warning("ORDER_SINK=google_sheets, но GOOGLE_SHEETS_ID пуст — пишем в файл")
@@ -77,9 +83,27 @@ def build_sink(settings: Settings) -> OrderSink:
 
 
 class OrderService:
-    def __init__(self, storage: Storage, sink: OrderSink) -> None:
+    def __init__(
+        self,
+        storage: Storage,
+        sink: OrderSink,
+        *,
+        local_sink: OrderSink | None = None,
+        qa_user_ids: frozenset[str] = frozenset(),
+    ) -> None:
         self.storage = storage
         self.sink = sink
+        # Тестовым владельцам клиент обещает «ТЕСТ: заявка сохранена, менеджеру не
+        # отправлена» — теперь это правда, а не только текст: наружные приёмники
+        # (почта, Sheets) для них не вызываются вовсе (раньше при ORDER_SINK=smtp
+        # письмо уходило на настоящий адрес).
+        self.local_sink = local_sink or sink
+        self.qa_user_ids = qa_user_ids
+
+    def _sink_for(self, order: Order) -> OrderSink:
+        if order.user_id in self.qa_user_ids:
+            return self.local_sink
+        return self.sink
 
     def submit(self, cart: Cart, customer: Customer, channel: str, extras: list[tuple[str, bytes]] | None = None) -> Order:
         """Создаёт заказ и пытается отправить.
@@ -134,8 +158,10 @@ class OrderService:
 
     def _deliver(self, order: Order, extras: list[tuple[str, bytes]] = ()) -> bool:
         order.delivery_attempts += 1
+        test_owner = order.user_id in self.qa_user_ids
+        sink = self.local_sink if test_owner else self.sink
         try:
-            self.sink.push(order, extras)
+            sink.push(order, extras)
         except Exception as exc:
             order.status = "failed"
             order.last_error = str(exc)
@@ -145,5 +171,8 @@ class OrderService:
         order.status = "sent"
         order.last_error = None
         self.storage.save_order(order)
-        log.info("Заказ %s отправлен в %s", order.id, getattr(self.sink, "name", "sink"))
+        if test_owner:
+            log.info("Тестовая заявка %s (QA) сохранена в файлы, менеджерам не отправлялась", order.id)
+        else:
+            log.info("Заказ %s отправлен в %s", order.id, getattr(sink, "name", "sink"))
         return True

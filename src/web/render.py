@@ -17,9 +17,9 @@ from core.ui import (
     ProductCard,
     ProductList,
     Response,
+    card_price_line,
     plain_text,
     price_text,
-    stock_text,
 )
 
 
@@ -38,7 +38,7 @@ def _one(response: Response) -> dict[str, Any]:
         return {
             "type": "item",
             "text": product.name,
-            "meta": f"{price_text(product.price)} · {stock_text(product)}",
+            "meta": card_price_line(product),
             "norm": response.citation,
             "url": product.url,
             "sku": product.sku_1c,
@@ -62,7 +62,7 @@ def _one(response: Response) -> dict[str, Any]:
                 {
                     "sku": card.product.sku_1c,
                     "text": card.product.name,
-                    "meta": f"{price_text(card.product.price)} · {stock_text(card.product)}",
+                    "meta": card_price_line(card.product),
                     "norm": card.citation,
                     "url": card.product.url,
                     "actions": _keyboard(card.keyboard),

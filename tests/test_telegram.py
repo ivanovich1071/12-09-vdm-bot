@@ -110,8 +110,12 @@ def test_card_shows_price_stock_and_citation():
     assert "позиция 1.7.11" in rendered
 
 
-def test_card_without_price_says_on_request():
-    assert "цена по запросу" in render_card(ProductCard(product=product(price=None)))
+def test_card_without_price_points_to_the_manager():
+    """Вопрос 4 опросного листа: пустая цена — приглашение к заявке, не «по запросу»."""
+    rendered = render_card(ProductCard(product=product(price=None)))
+    assert "Цену подскажет менеджер" in rendered
+    assert "цена по запросу" not in rendered
+    assert "Цену подскажет менеджер" in render_list_item(ProductCard(product=product(price=None)))
 
 
 def test_list_item_is_compact():

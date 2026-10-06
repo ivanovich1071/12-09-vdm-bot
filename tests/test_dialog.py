@@ -359,6 +359,29 @@ def test_card_never_touches_the_site(engine, tmp_path):
     assert media.prefetch.pending == 1, "товар без снимка должен уйти фоновому сборщику"
 
 
+def test_card_without_price_offers_the_manager(tmp_path):
+    """Вопрос 4 опросного листа: у товара без цены — действие, а не только слова."""
+    from core.ui import ProductCard
+
+    index = CatalogIndex(
+        [product("S1", "Фрезерный станок с ЧПУ", 253000), product("NP", "Принтер 3D учебный", None)]
+    )
+    storage = Storage(tmp_path / "t.sqlite3")
+    settings = Settings(orders_jsonl_path=str(tmp_path / "orders.jsonl"))
+    orders = OrderService(storage, JsonlSink(path=tmp_path / "orders.jsonl"))
+    engine = DialogEngine(index, storage, orders, settings)
+
+    responses = engine.handle_action(USER, CHANNEL, "card:NP")
+    card = [r for r in responses if isinstance(r, ProductCard)][0]
+    actions = [button.action for row in card.keyboard.rows for button in row]
+    assert "manager" in actions
+
+    priced = engine.handle_action(USER, CHANNEL, "card:S1")
+    priced_card = [r for r in priced if isinstance(r, ProductCard)][0]
+    priced_actions = [button.action for row in priced_card.keyboard.rows for button in row]
+    assert "manager" not in priced_actions
+
+
 # --- Оформление без сюрпризов: анкета, счётчики файла -------------------------
 
 

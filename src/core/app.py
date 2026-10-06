@@ -20,7 +20,7 @@ from media.files import PhotoStore
 from media.prefetch import MediaPrefetcher
 from media.service import MediaService
 from observability.dialog_log import DialogLogger
-from orders.service import OrderService, build_sink
+from orders.service import OrderService, build_local_sink, build_sink
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +49,12 @@ def build_engine(
     expired = storage.purge_expired_dialogs()
     if expired:
         log.info("Удалено разговоров по сроку хранения: %s", expired)
-    orders = OrderService(storage, build_sink(settings))
+    orders = OrderService(
+        storage,
+        build_sink(settings),
+        local_sink=build_local_sink(settings),
+        qa_user_ids=settings.qa_user_ids,
+    )
 
     router = build_router(settings)
     if warm_llm and router.configured:

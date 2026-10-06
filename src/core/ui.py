@@ -142,6 +142,18 @@ def price_text(value: int | None) -> str:
     return f"{value:,}".replace(",", " ") + " ₽"
 
 
+def card_price_line(product: Product) -> str:
+    """Строка цены в карточке и выдаче.
+
+    Пустая цена — не безликое «по запросу»: по опросному листу (вопрос 4, оба
+    отдела) бот говорит, что цену подскажет менеджер, а карточка такого товара
+    получает кнопку «Уточнить цену» (её ставит диалог).
+    """
+    if product.price is None:
+        return f"Цену подскажет менеджер · {stock_text(product)}"
+    return f"{price_text(product.price)} · {stock_text(product)}"
+
+
 def stock_text(product: Product) -> str:
     return f"в наличии {product.in_stock} шт." if product.available else "под заказ"
 
