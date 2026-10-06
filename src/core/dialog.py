@@ -697,7 +697,13 @@ class DialogEngine:
             ]
 
         return [
-            self._list(hits[:limit], title or self._result_title(hits, text), len(hits), offset=0)
+            self._list(
+                hits[:limit],
+                title or self._result_title(hits, text),
+                len(hits),
+                offset=0,
+                show_norms=self._show_norms(session),
+            )
         ]
 
     def offer(self, session: Session, text: str) -> list[Response]:
@@ -774,7 +780,13 @@ class DialogEngine:
             header += f" — вот {len(shown)} из {self._found(hits)}"
         return [
             Message(f"{header}:\n\n{names}", keyboard=self._offer_menu()),
-            self._list(hits[:PAGE_SIZE], "Первые три — подробнее", len(hits), offset=0),
+            self._list(
+                hits[:PAGE_SIZE],
+                "Первые три — подробнее",
+                len(hits),
+                offset=0,
+                show_norms=self._show_norms(session),
+            ),
         ]
 
     def _point_explain(self, session: Session, text: str, code: str) -> list[Response]:
@@ -1690,16 +1702,35 @@ class DialogEngine:
                     keyboard=Keyboard().row(Button("Каталог", "catalog"), Button("Менеджер", "manager")),
                 )
             ]
-        return [self._list(chunk, "Ещё варианты", len(hits), offset=offset)]
+        return [
+            self._list(
+                chunk,
+                "Ещё варианты",
+                len(hits),
+                offset=offset,
+                show_norms=self._show_norms(session),
+            )
+        ]
 
-    def _list(self, hits: list[SearchHit], title: str, total: int, offset: int) -> ProductList:
+    def _show_norms(self, session: Session) -> bool:
+        """Показывать ли нормативные основания этому клиенту.
+
+        Вопрос 10 опросного листа (текст совпадает у обоих отделов): частному
+        лицу — только польза товара, без приказов и пунктов. Тот, кто сам
+        спросил про документ, отвечает по делу — гейт его вопросов не глотает.
+        """
+        return session.profile.client_kind != "person"
+
+    def _list(
+        self, hits: list[SearchHit], title: str, total: int, offset: int, show_norms: bool = True
+    ) -> ProductList:
         cards = [
             ProductCard(
                 product=hit.product,
                 # Пустая строка основания читается как «мы не проверяли». В
                 # подробной карточке об этом сказано давно, а в выдаче позиция
                 # без привязки молчала — и стояла вперемешку с обоснованными.
-                citation=hit.citation() or _not_listed(hit.audience),
+                citation=(hit.citation() or _not_listed(hit.audience)) if show_norms else None,
                 keyboard=Keyboard().row(
                     Button("В корзину", f"add:{hit.product.sku_1c}"),
                     Button("Подробнее", f"card:{hit.product.sku_1c}"),
@@ -1750,7 +1781,10 @@ class DialogEngine:
         keyboard.row(Button("Моя корзина", "cart"), Button("Меню", "menu"))
 
         audience = session.profile.audience
-        norm = product.norm_for(audience, session.profile.room or "")
+        # Частнику (вопрос 10 опросного листа) оснований не показываем: только
+        # польза товара. Явный вопрос о документе гейт обходит — он выше.
+        person = not self._show_norms(session)
+        norm = None if person else product.norm_for(audience, session.profile.room or "")
         # Предложение Бабковой (вопрос 5): не все читают кнопки — словами говорим,
         # что оформить можно самому, а менеджер рядом для смет и документов. Один
         # раз за разговор: повторное «Подробнее» не приносит подсказку снова.
@@ -1770,7 +1804,7 @@ class DialogEngine:
                 keyboard=keyboard,
                 image=self._image(product),
                 image_path=self.photo_path(product),
-                norms=self.norm_lines(product, audience),
+                norms=[] if person else self.norm_lines(product, audience),
                 replace=replace,
             ),
             *([hint] if hint else []),
@@ -1802,7 +1836,15 @@ class DialogEngine:
                 )
             ]
         session.last_hits = hits
-        return [self._list(hits, f"Похожее: {product.name}", len(hits), offset=0)]
+        return [
+            self._list(
+                hits,
+                f"Похожее: {product.name}",
+                len(hits),
+                offset=0,
+                show_norms=self._show_norms(session),
+            )
+        ]
 
     def norm_lines(self, product: Product, audience: str | None) -> list[str]:
         """Все основания товара с формулировками пунктов приказа.

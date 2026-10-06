@@ -268,6 +268,7 @@ class DialogProfile:
                 self.offered,
                 self.kit,
                 self.order,
+                self.client_kind != "unknown",
             )
         )
 
@@ -294,6 +295,14 @@ class DialogProfile:
             self.institution = _first_match(low, _INSTITUTIONS)
             if self.institution:
                 changed.append("institution")
+
+        # Сегмент (вопросы 10–12 опросного листа): физлицам приказы не упоминаем.
+        kind = client_kind_of(low)
+        if self.institution and kind == "unknown":
+            kind = "org"
+        if kind != "unknown" and kind != self.client_kind:
+            self.client_kind = kind
+            changed.append("client_kind")
 
         room = _first_match(low, _ROOMS)
         if room and room != self.room:
@@ -418,6 +427,18 @@ class DialogProfile:
                 f"- Составлена комплектация: {names[0] + ', ' if names else ''}раздел {self.kit.get('code')} "
                 f"«{self.kit.get('title')}», позиций {count}; полный список человек скачивает файлом"
             )
+        if self.client_kind == "person":
+            lines.append(
+                "- Клиент — частное лицо (себе, ребёнку, в подарок): приказы, пункты и перечни "
+                "не упоминай, говори о пользе товара простым языком"
+            )
+        elif self.client_kind == "org":
+            lines.append("- Клиент — учреждение или закупка: нормативные основания уместны")
+        elif not self.institution:
+            lines.append(
+                "- Сегмент не ясен: в конце ответа мягко уточни — «для дома или для детского "
+                "сада/центра?» (один раз, вместо вопроса «вы физлицо или организация?»)"
+            )
         if self.order:
             positions = self.order.get("positions") or []
             found = sum(1 for position in positions if position.get("sku"))
@@ -471,6 +492,36 @@ class DialogProfile:
         """
         known = set(cls().to_dict())
         return cls(**{key: value for key, value in (raw or {}).items() if key in known})
+
+
+# Сегмент клиента по словам реплики (вопрос 12 опросного листа, вариант Бабковой):
+# прямой вопрос «вы для себя или для организации?» не задаём — определяем тихо.
+_ORG_SIGNALS = re.compile(
+    r"школ|лице|гимнази|детск\w*\s*сад|садик|\bсад[ауеы]|\bдоу\b|центр|колледж|учрежде|"
+    r"тендер|закупк|фгос|44-фз|223-фз|приказ|\b838\b|\b1057\b|муниципа|администрац|"
+    r"для групп|кабинет",
+    re.IGNORECASE,
+)
+_PERSON_SIGNALS = re.compile(
+    r"ребен|ребён|\bсын\w*|\bдоч\w*|внук|внучк|подар|для себя|малыш|племянник|домой|дома\b|домашн",
+    re.IGNORECASE,
+)
+
+
+def client_kind_of(text: str) -> str:
+    """«person» — частник, «org» — учреждение или закупка, «unknown» — не ясно.
+
+    Организационные сигналы сильнее: «игрушки в детский сад ребёнку» — всё равно
+    закупка в учреждение. «unknown» — не навсегда: следующая реплика уточнит.
+    """
+    low = (text or "").lower()
+    if not low:
+        return "unknown"
+    if _ORG_SIGNALS.search(low):
+        return "org"
+    if _PERSON_SIGNALS.search(low):
+        return "person"
+    return "unknown"
 
 
 def whole_object(text: str) -> bool:

@@ -75,7 +75,16 @@ from agent.verify import (
 )
 from core import exports, intent, selection
 from core.profile import whole_object
-from core.ui import Button, Keyboard, Message, ProductCard, Response, price_text, stock_text
+from core.ui import (
+    Button,
+    Keyboard,
+    Message,
+    ProductCard,
+    Response,
+    price_text,
+    split_prose,
+    stock_text,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1009,12 +1018,19 @@ class SalesAgent:
         if answer:
             # Коды 1С нужны нам для сведения текста с карточками, но человеку в
             # ответе они ни к чему — это внутренний артикул, а не характеристика.
-            responses.append(
-                Message(
-                    _without_codes(answer),
-                    keyboard=self._keyboard(session, tools, decision, answer),
+            # Длинный ответ идёт 2–3 сообщениями (вопрос 18 опросного листа);
+            # кнопки — в последней части, под ними и действие.
+            parts = split_prose(_without_codes(answer))
+            last = len(parts) - 1
+            for number, part in enumerate(parts):
+                responses.append(
+                    Message(
+                        part,
+                        keyboard=self._keyboard(session, tools, decision, answer)
+                        if number == last
+                        else None,
+                    )
                 )
-            )
 
         for sku in mentioned[:CARDS_SHOWN]:
             product = self.engine.index.get(sku)
@@ -1295,6 +1311,11 @@ class SalesAgent:
         profile = session.profile.as_prompt()
         if profile:
             parts.append(profile)
+        name = (session.customer.name or "").strip()
+        if name and name != "Клиент":
+            # Вопрос 20 опросного листа: обращайся по имени, но без навязчивости —
+            # не в каждой фразе. Имя берём из сессии, в профиль (на диск) оно не идёт.
+            parts.append(f"## Как обращаться\n\nКлиента зовут {name}. Обращайся по имени уместно, но не в каждой фразе.")
         return "\n\n".join(parts)
 
     def _history(self, session) -> list[dict]:  # noqa: ANN001

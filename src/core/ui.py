@@ -219,3 +219,41 @@ def plural(count: int, one: str, few: str, many: str) -> str:
     if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
         return few
     return many
+
+
+# Длинный ответ присылаем частями: «полотно» в один экран читают неохотно
+# (вопрос 18 опросного листа — оба отдела: «как живой человек»).
+PROSE_SPLIT_AT = 600
+MAX_PROSE_PARTS = 3
+_PROSE_BOUNDARY = re.compile(r"[.!?…](?=\s)|\n")
+
+
+def split_prose(text: str, limit: int = PROSE_SPLIT_AT, max_parts: int = MAX_PROSE_PARTS) -> list[str]:
+    """Длинный текст — до `max_parts` сообщений по границам предложений.
+
+    Предложение не рвётся: режем только после точки/восклицания/вопроса или на
+    переводе строки. Короткий текст возвращается одной частью; границ нет —
+    тоже одной (лучше длинное сообщение, чем обрыв на полуслове).
+    """
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return [cleaned] if cleaned else []
+    part_target = max(limit, len(cleaned) // max_parts)
+    parts: list[str] = []
+    start = 0
+    while start < len(cleaned) and len(parts) < max_parts - 1:
+        if len(cleaned) - start <= part_target:
+            break
+        cut = next(
+            (
+                match.end()
+                for match in _PROSE_BOUNDARY.finditer(cleaned, start + int(part_target * 0.6))
+            ),
+            None,
+        )
+        if cut is None:
+            break
+        parts.append(cleaned[start:cut].strip())
+        start = cut
+    parts.append(cleaned[start:].strip())
+    return [part for part in parts if part]

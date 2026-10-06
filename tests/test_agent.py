@@ -248,7 +248,44 @@ def test_tool_result_reaches_the_model(engine):
 
     tool_messages = [m for m in second["messages"] if m["role"] == "tool"]
     assert tool_messages, "результат инструмента не отправлен модели"
-    assert "Фрезерный станок с ЧПУ" in tool_messages[0]["content"]
+
+
+def test_client_name_reaches_the_prompt(engine):
+    """Вопрос 20 опросного листа: клиента зовут по имени, без навязчивости."""
+    engine.session(USER, CHANNEL).customer.name = "Мария"
+    script = [answer("Здравствуйте! Чем помогу?")]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        engine.handle_text(USER, CHANNEL, "привет")
+        first = cloud.requests[0]
+
+    assert "Клиента зовут Мария" in json.dumps(first, ensure_ascii=False)
+    assert "не в каждой фразе" in json.dumps(first, ensure_ascii=False)
+
+
+def test_long_answer_arrives_in_short_messages(engine):
+    """Вопрос 18 опросного листа: «полотно» — 2–3 сообщениями, как живой человек."""
+    long_text = (
+        "Фрезерный станок с ЧПУ подойдёт для кабинета технологии. "
+        "Оборудование компактно и умещается на стандартном рабочем месте ученика. "
+        "Для начала работы хватает обычной розетки, вытяжка не обязательна. "
+        "Управление простое, интерфейс понятен школьникам средних классов. "
+        "В комплект поставки входят ключи для обслуживания и запасные фрезы. "
+        "Массивная станина гасит вибрацию, поэтому работа получается точной. "
+        "Гравировка по дереву и пластику выполняется тем же инструментом. "
+        "Обучение работе занимает один урок. "
+        "При необходимости поможем с пусконаладкой и обучением учителя. "
+        "Гарантия и сервисное обслуживание описаны в паспорте изделия."
+    )
+    assert len(long_text) > 600
+    script = [answer(long_text)]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
+
+    messages = [r for r in responses if isinstance(r, Message)]
+    assert 2 <= len(messages) <= 3
+    assert "станок" in " ".join(m.text for m in messages).lower()
 
 
 def test_personal_data_never_leaves_for_the_model(engine):
