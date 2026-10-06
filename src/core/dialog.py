@@ -34,6 +34,7 @@ from core.ui import (
     ProductList,
     Response,
     delivery_note,
+    lead_accepted,
     order_accepted,
     plural,
     price_text,
@@ -46,7 +47,7 @@ from norms.check import check_point, nearest_section
 from norms.extract import document_ids_in_text
 from orders.service import OrderService
 from privacy.consent import CONSENT_TEXT, CONSENT_VERSION
-from privacy.masking import Masker
+from privacy.masking import PHONE, Masker
 from procurement import discovery
 from procurement.models import SelectionResult, SelectionStatus
 
@@ -173,6 +174,10 @@ class Session:
     checkout_step: int | None = None
     customer: Customer = field(default_factory=Customer)
     pending_checkout: bool = False
+    # Лид без корзины (шаг 4.4): человек просил счёт/КП/реквизиты/звонок, и мы
+    # ждём его контакты, прежде чем передать заявку менеджеру.
+    pending_lead: bool = False
+    lead_essence: str = ""
     history: list[dict[str, str]] = field(default_factory=list)
     profile: DialogProfile = field(default_factory=DialogProfile)
     # Один маскер на весь разговор: метки должны совпадать между сообщениями,
@@ -287,7 +292,10 @@ class DialogEngine:
         # быть — тогда бот называет номер пункта без текста, как и раньше.
         # Справочник приказов — по настройке (`norm_items_path`), а не по
         # относительному пути: виджет и бот в одном процессе видят один файл (шаг 3.5).
-        self.norm_texts = norm_items.ItemIndex(norm_items.load(Path(self.settings.norm_items_path)))
+        items_path = Path(self.settings.norm_items_path)
+        self.norm_texts = norm_items.ItemIndex(
+            norm_items.load(items_path), norm_items.load_meta(items_path)
+        )
 
     @property
     def index(self) -> CatalogIndex:
@@ -482,6 +490,14 @@ class DialogEngine:
         if has_procurement and intent.asks_list_to_cart(text):
             self._remember(session)
             return self._collect_list(session, text)
+
+        # Лид без корзины (шаг 4.4): «нужен счёт / КП / реквизиты / перезвоните» —
+        # заявка менеджеру и без позиций. Корзина словами важнее: «возьму X и
+        # счёт» — это корзина, оформление само доведёт до менеджера.
+        lead = self._lead_flow(session, text)
+        if lead is not None:
+            self._remember(session)
+            return lead
 
         # Запрос менеджера (шаг 4.1): ни анкета, ни подбор, ни модель его не
         # глотают. «Позовите человека» — это просьба, а не имя контакта.
@@ -2147,10 +2163,15 @@ class DialogEngine:
         self.storage.record_consent(
             session.user_id, session.channel, CONSENT_VERSION, "granted"
         )
-        if not session.pending_checkout:
-            return [Message("Согласие записано.", keyboard=self._main_menu())]
-        session.pending_checkout = False
-        return self._ask_contact(session, step=0)
+        if session.pending_checkout:
+            session.pending_checkout = False
+            return self._ask_contact(session, step=0)
+        if session.pending_lead:
+            # Лид ждал согласия: контакты уже в сессии — заявка уходит сейчас.
+            if session.customer.phone:
+                return self._submit_lead(session, "", session.customer.phone)
+            return self._ask_lead_contact(session, session.lead_essence)
+        return [Message("Согласие записано.", keyboard=self._main_menu())]
 
     def _ask_contact(self, session: Session, step: int) -> list[Response]:
         session.checkout_step = step
@@ -2343,6 +2364,8 @@ class DialogEngine:
         self.storage.save_cart(cart)
         session.checkout_step = None
         session.pending_checkout = False
+        session.pending_lead = False
+        session.lead_essence = ""
         session.customer = Customer()
         session.last_hits = []
         session.forget()
@@ -2381,6 +2404,143 @@ class DialogEngine:
                 keyboard=keyboard,
             )
         ]
+
+    # --- Лид без корзины (шаг 4.4) ----------------------------------------------
+
+    def _lead_flow(self, session: Session, text: str) -> list[Response] | None:
+        """«Нужен счёт» без единого товара — заявка менеджеру, а не потерянный клиент.
+
+        Возвращает `None`, когда реплика лида не касается: есть корзина (работает
+        чекаут), человек передумал и заговорил о товарах, либо лида в реплике нет.
+        """
+        if not self.storage.load_cart(session.user_id).is_empty:
+            session.pending_lead = False
+            return None
+        phone = PHONE.search(text or "")
+        if session.pending_lead:
+            if phone:
+                return self._submit_lead(session, text, phone.group(0))
+            if intent.asks_lead(text):
+                return self._ask_lead_contact(session, text)
+            # Человек заговорил о другом: подбираем товары, просьба о контактах
+            # снимается — иначе бот молчал бы вопросом про телефон вместо ответов.
+            if intent.classify(text) not in (intent.OTHER,):
+                session.pending_lead = False
+            return None
+        if intent.asks_lead(text):
+            if phone:
+                return self._submit_lead(session, text, phone.group(0))
+            if self._has_export_context(session):
+                # «Пришлите счёт в Excel» по показанной комплектации — это файл и
+                # счёт-нота из обычного потока, а не лид: контакты человек давать
+                # не обязан (прогон 0923, сц. «Excel + счёт + срок»).
+                session.pending_lead = False
+                return None
+            return self._ask_lead_contact(session, text)
+        return None
+
+    def _has_export_context(self, session: Session) -> bool:
+        """Из разговора есть что выслать: комплектация, файл заказа или показанный выбор."""
+        profile = session.profile
+        return bool(profile.kit or profile.order or profile.offered)
+
+    def _ask_lead_contact(self, session: Session, essence: str) -> list[Response]:
+        session.pending_lead = True
+        session.lead_essence = (essence or session.lead_essence)[:300]
+        if session.customer.phone:
+            # Контакты уже известны из прошлого хода: переспрашивать нечестно.
+            return self._submit_lead(session, essence, session.customer.phone)
+        return [
+            Message(
+                "Передам менеджеру — счёт, КП и реквизиты у него. "
+                "Оставьте имя и телефон одним сообщением, например: "
+                "«Иван Петров, +7 916 123-45-67».",
+                keyboard=self._main_menu(),
+            )
+        ]
+
+    def start_lead(self, user_id: str, channel: str, customer: Customer | None = None, essence: str = "") -> list[Response]:
+        """Контакт без корзины из канала (кнопка «Отправить контакт», шлюз) — тот же лид.
+
+        Канал отдаёт имя и телефон готовыми: остаётся согласие (если его ещё нет)
+        и сама заявка. Согласие спрашиваем, а не ставим молча — это персональные
+        данные; ответ на «Согласен» доводит заявку до менеджера.
+        """
+        session = self.session(user_id, channel)
+        if customer is not None:
+            session.customer = Customer(
+                name=customer.name or session.customer.name, phone=customer.phone or session.customer.phone
+            )
+        if essence:
+            session.lead_essence = essence[:300]
+        if self.storage.active_consent(session.user_id) is None:
+            session.pending_lead = True
+            return [
+                Message(
+                    CONSENT_TEXT,
+                    keyboard=Keyboard().row(
+                        Button("Согласен", "consent_yes"),
+                        Button("Отказаться", "consent_no"),
+                    ),
+                )
+            ]
+        if session.customer.phone:
+            return self._submit_lead(session, session.lead_essence, session.customer.phone)
+        session.pending_lead = True
+        return self._ask_lead_contact(session, session.lead_essence)
+
+    def _submit_lead(self, session: Session, essence: str, phone: str) -> list[Response]:
+        if not session.customer.name:
+            # Имя — та же реплика без телефона; не назвал — «Клиент», менеджер уточнит.
+            parsed = " ".join(PHONE.sub(" ", essence or "").replace(",", " ").split()).strip(" .;—-")
+            session.customer.name = (parsed or "Клиент")[:200]
+        session.customer.phone = phone[:50]
+        if essence and not session.lead_essence:
+            session.lead_essence = essence[:300]
+        try:
+            order = self.orders.submit_lead(
+                session.user_id, session.channel, self._lead_customer(session)
+            )
+        except PermissionError:
+            # Согласия нет: контакты сохранены в сессии, «Согласен» доведёт заявку.
+            session.pending_lead = True
+            return [
+                Message(
+                    CONSENT_TEXT,
+                    keyboard=Keyboard().row(
+                        Button("Согласен", "consent_yes"),
+                        Button("Отказаться", "consent_no"),
+                    ),
+                )
+            ]
+        except ValueError as exc:
+            return [Message(str(exc), keyboard=self._main_menu())]
+        session.customer = Customer()
+        session.pending_lead = False
+        session.lead_essence = ""
+        test = session.user_id in self.settings.qa_user_ids
+        lines = [
+            lead_accepted(order.id, delivered=order.status == "sent" and not test, test=test),
+            f"Связаться напрямую: {self.settings.manager_contact}",
+        ]
+        return [Message("\n".join(lines), keyboard=self._main_menu())]
+
+    def _lead_customer(self, session: Session) -> Customer:
+        """Контакты лида + суть запроса в комментарии — то, что менеджер увидит в таблице."""
+        essence = session.lead_essence or "Запрос без состава"
+        kit = session.profile.kit
+        if kit:
+            title = kit.get("title") or ""
+            essence += f"; интересовала комплектация {kit.get('code')} «{title}»"
+        comment = f"Запрос без состава: {essence}"
+        return Customer(
+            name=session.customer.name,
+            phone=session.customer.phone,
+            email=session.customer.email,
+            organization=session.customer.organization,
+            region=session.customer.region,
+            comment=comment[:500],
+        )
 
 
 def _quantity(value: object) -> int | None:

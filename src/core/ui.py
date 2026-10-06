@@ -169,6 +169,21 @@ def order_accepted(order_id: str, total: int | None, *, delivered: bool = True, 
     return f"Ваш заказ {order_id} принят на {price_text(total)}. {tail}\n{WORKING_HOURS}"
 
 
+def lead_accepted(order_id: str, *, delivered: bool = True, test: bool = False) -> str:
+    """Что клиент видит, оставив контакты без корзины, — одинаково во всех каналах.
+
+    Лид (шаг 4.4): человек просил счёт, КП, реквизиты или звонок — состава нет,
+    и сумма здесь не называется, чтобы не звучало как «заказ на 0 рублей».
+    """
+    if test:
+        tail = "ТЕСТ: заявка сохранена, менеджеру не отправлена."
+    elif delivered:
+        tail = "Менеджер свяжется с вами в ближайшее время."
+    else:
+        tail = "Заявка сохранена, менеджер получит её чуть позже — мы повторим отправку."
+    return f"Заявка {order_id} передана менеджеру. {tail}\n{WORKING_HOURS}"
+
+
 def delivery_note(total: int | None, min_rub: int, url: str) -> str | None:
     """Оговорка про доставку, когда сумма не дотягивает до порога.
 

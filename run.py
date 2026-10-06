@@ -432,7 +432,13 @@ def _parse_acts(args) -> None:  # noqa: ANN001 — argparse.Namespace
         print(f"    … ещё {len(missing_codes) - 20}")
 
     conflicts = norm_items.section_conflicts(known)
-    naked = [code for code, item in known.get("order_838", {}).items() if not item.section]
+    # Позиции второго уровня (2.1–2.17, 3.1–3.6) без раздела — это общие позиции
+    # приказа 838, у них подпись чужого подраздела и была дефектом (шаг 3.4).
+    naked = [
+        code
+        for code, item in known.get("order_838", {}).items()
+        if not item.section and code.count(".") >= 3
+    ]
     if conflicts or naked:
         print("\nструктура справочника подозрительна — разделы «переехали» между подразделами:")
         for line in conflicts[:10]:

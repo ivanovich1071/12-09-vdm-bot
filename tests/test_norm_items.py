@@ -65,8 +65,94 @@ def test_838_section_follows_code_not_line_order():
     items = {item.code: item for item in parse_838(TEXT_838_SCRAMBLED)}
     assert items["2.14.47"].section == "Кабинет физики"
     assert items["2.15.36"].section == "Кабинет химии"
-    assert items["2.15"].section == "Кабинет химии"
-    assert items["2.1"].section == "Кабинет начальных классов"
+    assert items["2.1"].section is None
+
+
+def test_838_position_twin_does_not_steal_subsection_name():
+    """Шаг 3.4: «2.15. Конторка» — общая позиция, а не «Кабинет химии».
+
+    У приказа 838 совпадают номера позиции и подраздела: пункт 2.15.36 — это
+    кабинет химии, а позиция 2.15 «Конторка» покупается в несколько кабинетов.
+    Прежний разбор подписывал позицию чужим подразделом по цифрам.
+    """
+    items = {item.code: item for item in parse_838(TEXT_838_SCRAMBLED)}
+    assert items["2.15"].section is None
+    assert items["2.15"].title == "Конторка"
+
+
+# Общие позиции: фраза «является общей…» + перечень кабинетов строками
+# «Подраздел N. Название», как в самом приказе.
+TEXT_838_COMMON = """
+Раздел 2. Комплекс оснащения предметных кабинетов
+Позиции 2.1-2.3 являются общими для следующих подразделов (предметных кабинетов) и приобретаются в каждый из них:
+Подраздел 15. Кабинет химии
+Подраздел 4. Кабинет учителя-логопеда (учителя-дефектолога)
+2.1. Доска магнитно-маркерная
+Раздел 3. Комплекс лабораторий и студий для внеурочной деятельности
+Позиции 3.1-3.2 являются общими для следующих подразделов (предметных кабинетов):
+Подраздел 1. Студия искусства и дизайна
+3.1. Стол с ящиками для хранения/тумбой
+2.15. Конторка
+"""
+
+
+def test_838_common_positions_list_their_cabinets():
+    items = {item.code: item for item in parse_838(TEXT_838_COMMON)}
+    assert items["2.1"].section is None
+    assert items["2.1"].cabinets == (
+        "2.15 Кабинет химии",
+        "2.4 Кабинет учителя-логопеда (учителя-дефектолога)",
+    )
+    # Глава у перечня кабинетов — из самой позиции: «3.1» — это студия
+    # из раздела 3, а не тёзка из раздела 2.
+    assert items["3.1"].cabinets == ("3.1 Студия искусства и дизайна",)
+
+
+def test_expand_codes_ranges_and_pairs():
+    from norms.items import _expand_codes
+
+    assert _expand_codes("2.1-2.3") == ["2.1", "2.2", "2.3"]
+    assert _expand_codes("2.16, 2.17") == ["2.16", "2.17"]
+    assert _expand_codes("2.13") == ["2.13"]
+
+
+def test_item_index_subsection_and_common_children(tmp_path):
+    """Шаг 3.4: подраздел по коду и общие позиции в комплектации кабинета."""
+    import json
+
+    from norms.items import ItemIndex, load, load_meta
+
+    target = tmp_path / "norm_items.json"
+    target.write_text(
+        json.dumps(
+            {
+                "order_838": [
+                    {"code": "2.15.36", "title": "Эвдиометр", "section": "Кабинет химии"},
+                    {"code": "2.15", "title": "Конторка", "cabinets": ["2.15 Кабинет химии"]},
+                    {"code": "2.1", "title": "Доска", "cabinets": ["2.15 Кабинет химии"]},
+                ],
+                "subsections": {"order_838": {"2.15": "Кабинет химии"}},
+                "common_positions": {
+                    "order_838": {
+                        "2.15": ["2.15 Кабинет химии"],
+                        "2.1": ["2.15 Кабинет химии"],
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    index = ItemIndex(load(target), load_meta(target))
+    assert index.subsection("order_838", "2.15.36") == "Кабинет химии"
+    assert index.subsection("order_838", "2.15") == "Кабинет химии"
+    assert index.subsection("order_838", "1.1.1") is None
+    # Комплектация кабинета = его пункты + общие позиции этого кабинета.
+    assert [item.code for item in index.children("order_838", "2.15")] == [
+        "2.1",
+        "2.15",
+        "2.15.36",
+    ]
 
 
 def test_section_conflicts_spots_sticky_sections():

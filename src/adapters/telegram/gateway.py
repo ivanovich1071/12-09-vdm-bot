@@ -382,12 +382,10 @@ class TelegramGateway:
             assert isinstance(history, dto.HistoryOut)
             waiting = [p for p in history.preorders if p["status"] == "READY_FOR_MANAGER"]
             if not waiting:
-                return [
-                    Message(
-                        "Контакт получен, но предзаказ не выбран. "
-                        "Соберите его заново: /order или файлом заказа."
-                    )
-                ]
+                # Лид без корзины (шаг 4.4): контакт живого человека не теряется —
+                # ядро спросит согласие и передаст менеджеру заявку без состава.
+                # Прежний ответ «предзаказ не выбран» терял и имя, и телефон.
+                return list(self.core.start_lead(self.session(user_id), dto.CustomerIn(name=name[:200], phone=phone[:50])))
             preorder_id = waiting[0]["id"]
         customer = dto.CustomerIn(name=name[:200], phone=phone[:50])
         sent = self.core.send_preorder(self.session(user_id), preorder_id, customer).data

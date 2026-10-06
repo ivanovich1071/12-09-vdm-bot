@@ -422,6 +422,20 @@ class CoreApi:
         """Текстовая реплика-оформление («оформить заказ») — для каналов без своих правил."""
         return intent.asks_checkout(text)
 
+    def start_lead(
+        self, session: CoreSession, customer: dto.CustomerIn | None = None, essence: str = ""
+    ) -> list[Response]:
+        """Лид без корзины (шаг 4.4): контакты без состава — заявка менеджеру.
+
+        Канал отдаёт контакты, ядро само спросит согласие, если его ещё нет, и
+        вернёт примитивы ответа: заявку без состава получают те же приёмники,
+        что и полный заказ.
+        """
+        core_customer = Customer(**customer.model_dump()) if customer is not None else None
+        return self.services.engine.start_lead(
+            session.user_ref, session.channel, core_customer, essence
+        )
+
     def checkout(self, session: CoreSession, fingerprint: str | None = None) -> tuple[Result, Result]:
         """«Оформить»: корзина → спецификация → предзаказ. Одна цепочка для любого канала.
 

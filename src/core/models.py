@@ -132,3 +132,22 @@ class Order:
             created_at=datetime.now(UTC).isoformat(timespec="seconds"),
             consent_id=consent_id,
         )
+
+    @classmethod
+    def create_lead(
+        cls, user_id: str, channel: str, customer: Customer, consent_id: str | None
+    ) -> Order:
+        """Заявка без состава (шаг 4.4): «счёт / КП / реквизиты / перезвоните» + контакты.
+
+        Позиций нет — менеджеру уходит сам запрос: суть проситель оставил в
+        комментарии к контактам, там же ссылка на интересованную комплектацию.
+        """
+        return cls(
+            id=f"VDM-{datetime.now(UTC):%Y%m%d}-{uuid.uuid4().hex[:6].upper()}",
+            user_id=user_id,
+            channel=channel,
+            items=[],
+            customer=customer,
+            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            consent_id=consent_id,
+        )

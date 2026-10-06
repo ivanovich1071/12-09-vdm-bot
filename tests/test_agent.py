@@ -614,6 +614,24 @@ def test_invented_norm_reference_is_sent_back_for_a_rewrite(engine):
     assert "2.20.63" in correction
 
 
+def test_position_twin_named_by_subsection_is_not_renamed(engine):
+    """Шаг 3.6: «2.15 Кабинет химии» — верное название, а не переименование «Конторки».
+
+    У приказа 838 совпадают номера позиции и подраздела. Раньше проверка
+    сверяла название только с формулировкой позиции: правильный текст считался
+    выдумкой, ответ уезжал на переписывание, строки вырезались.
+    """
+    from agent.verify import title_matches
+
+    attach(engine, client("http://127.0.0.1:9"))  # агент без модели: проверка реестра живая
+    problems, bad = engine.agent._registry_problems(
+        "Позиция 2.15 «Кабинет химии» — специализированная мебель и системы хранения.", None
+    )
+    assert problems == [] and not bad
+    # Без карты подразделов та же проверка считала название подменой.
+    assert not title_matches("Кабинет химии", ["Конторка"])
+
+
 def test_rejected_product_does_not_come_as_a_card(engine):
     """01.09: модель написала, что позиция не подходит, а карточка всё равно пришла."""
     script = [

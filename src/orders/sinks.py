@@ -54,7 +54,9 @@ def order_rows(order: Order) -> list[list[str]]:
     """Заказ разворачивается в строки — по одной на позицию.
 
     Так менеджеру удобнее: можно фильтровать и сводить по товарам, не разбирая
-    вложенные структуры.
+    вложенные структуры. Заявка без состава (лид, шаг 4.4) — одной строкой
+    контактов: без неё приёмники (jsonl, Excel, таблица) молча пропустили бы
+    запрос, у которого просто нет позиций.
     """
     customer = order.customer
     head = [
@@ -67,6 +69,8 @@ def order_rows(order: Order) -> list[list[str]]:
         customer.email,
         customer.region,
     ]
+    if not order.items:
+        return [[*head, *("" for _ in range(8)), customer.comment]]
     return [
         [
             *head,
@@ -263,10 +267,14 @@ class SmtpSink:
 
         count = len(order.items)
         message = EmailMessage()
-        message["Subject"] = (
-            f"Заявка {order.id} · {count} {plural(count, 'позиция', 'позиции', 'позиций')} "
-            f"· {price_text(order.total)}"
-        )
+        if count:
+            message["Subject"] = (
+                f"Заявка {order.id} · {count} {plural(count, 'позиция', 'позиции', 'позиций')} "
+                f"· {price_text(order.total)}"
+            )
+        else:
+            # Лид без состава: «0 позиций · 0 ₽» читается как сбой, а это живой запрос.
+            message["Subject"] = f"Запрос без состава {order.id} · {order.customer.name or 'клиент'}"
         message["From"] = self.sender or self.user
         message["To"] = self.to
         body = self._body(order)
@@ -311,10 +319,15 @@ class SmtpSink:
             )
             if value
         )
+        goods = (
+            f"Состав ({len(order.items)} поз., {price_text(order.total)}):\n{items}"
+            if order.items
+            else "Позиций в запросе нет — суть запроса в комментарии."
+        )
         return (
             f"Заявка {order.id} из бота, канал {order.channel}, {order.created_at}.\n\n"
             f"{contacts}\n\n"
-            f"Состав ({len(order.items)} поз., {price_text(order.total)}):\n{items}\n\n"
+            f"{goods}\n\n"
             "Полная спецификация — во вложении.\n"
         )
 

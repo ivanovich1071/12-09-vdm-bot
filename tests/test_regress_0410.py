@@ -217,6 +217,43 @@ class TestCoreFallback:
         out = flat(engine.handle_text(USER, CHANNEL, "позовите, пожалуйста, живого человека"))
         assert engine.settings.manager_contact in out
 
+    def test_lead_request_asks_for_contacts(self, engine):
+        """Шаг 4.4: «нужен счёт» без корзины — просьба контактов, не заглушка и не менеджер-карточка."""
+        out = flat(engine.handle_text(USER, CHANNEL, "нужен счёт на организацию, оплатим по безналу"))
+        assert "имя и телефон" in out.lower()
+        assert "недоступен" not in out.lower()
+
+    def test_lead_in_one_message_with_consent(self, engine):
+        """«Перезвоните по номеру…» — заявка без состава уходит сразу."""
+        engine.handle_action(USER, CHANNEL, "consent_yes")
+        out = flat(engine.handle_text(USER, CHANNEL, "перезвоните по номеру +7 916 222-33-44, Мария"))
+        assert "Заявка" in out and "менеджеру" in out
+        [lead] = engine.storage.orders_of(USER)
+        assert lead.items == []
+        assert lead.customer.phone == "+7 916 222-33-44"
+        assert "Мария" in lead.customer.name
+        assert "перезвоните" in lead.customer.comment.lower()
+
+    def test_lead_without_consent_asks_first(self, engine):
+        """Согласие раньше передачи контактов: «Согласен» доводит заявку до менеджера."""
+        first = flat(engine.handle_text(USER, CHANNEL, "нужен счёт, вот телефон +7 916 123-45-67"))
+        assert "огласие" in first.lower()
+        out = flat(engine.handle_action(USER, CHANNEL, "consent_yes"))
+        assert "Заявка" in out and "менеджеру" in out
+        [lead] = engine.storage.orders_of(USER)
+        assert lead.customer.phone == "+7 916 123-45-67"
+
+    def test_lead_released_when_user_moves_on(self, engine):
+        """Человек передумал и спросил товар — бот отвечает, а не виснет на просьбе телефона."""
+        engine.handle_text(USER, CHANNEL, "нужен счёт")
+        out = flat(engine.handle_text(USER, CHANNEL, "покажи волейбольный мяч"))
+        assert "имя и телефон" not in out.lower()
+
+    def test_pure_manager_card_unchanged_by_lead_flow(self, engine):
+        """«Хочу менеджера» — карточка с телефоном, как и было (лид её не перехватил)."""
+        out = flat(engine.handle_text(USER, CHANNEL, "хочу менеджера"))
+        assert engine.settings.manager_contact in out
+
     def test_price_objection_answered(self, engine):
         """BUG-02/17: на «дорого» не бывает ни деградации, ни «ничего не нашлось»."""
         engine.handle_text(USER, CHANNEL, "покажи мат гимнастический")

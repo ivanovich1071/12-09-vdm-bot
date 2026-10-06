@@ -964,6 +964,10 @@ class SalesAgent:
                     bad.add(code)
                 continue
             titles = [index.get(doc, code).title for doc in docs]
+            # «2.15 Кабинет химии» — не переименование: у приказа 838 позиция и
+            # подраздел носят один номер, и имя подраздела хранится отдельно
+            # (шаг 3.6). Проверяем формулировку и по нему тоже.
+            titles += [name for doc in docs if (name := index.subsection(doc, code))]
             if claimed and not title_matches(claimed, titles):
                 renamed.append(f"{code} — в приказе «{titles[0]}»")
                 bad.add(code)

@@ -465,10 +465,12 @@ class ToolBox:
                     )
                 # Комплектация для файла — весь раздел без обрезки: в файле место есть. Какой из
                 # разобранных разделов уйдёт в файл, решает текст ответа (`kit_for`).
+                # Заголовок — имя подраздела приказа: «2.15» — это кабинет химии,
+                # а «Конторка» — общая позиция с тем же номером (шаг 3.4).
                 self.kit = self.kits[f"{item.doc_id}:{item.code}"] = {
                     "document": item.doc_id,
                     "code": item.code,
-                    "title": _kit_title(item),
+                    "title": index.subsection(item.doc_id, item.code) or _kit_title(item),
                     "positions": [
                         {
                             "code": child.code,

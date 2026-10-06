@@ -76,6 +76,32 @@ def test_contact_button_path(env):
     assert "Менеджер свяжется" in done.text
 
 
+def test_contact_without_preorder_becomes_lead(env):
+    """Шаг 4.4: контакт без предзаказа — заявка менеджеру без состава.
+
+    Прежний ответ «предзаказ не выбран» терял и имя, и телефон живого клиента.
+    """
+    api, gateway = env
+    api.storage.record_consent(USER, "telegram", "test", "granted")
+    [done] = gateway.contact(USER, "Иван", "+79001112233")
+    assert "Заявка" in done.text and "менеджеру" in done.text
+    [lead] = api.storage.orders_of(USER)
+    assert lead.items == []
+    assert lead.customer.phone == "+79001112233" and lead.customer.name == "Иван"
+
+
+def test_contact_without_preorder_asks_consent_first(env):
+    """Нет согласия — сначала кнопка «Согласен», заявка уходит после неё."""
+    api, gateway = env
+    replies = gateway.contact(USER, "Иван", "+79001112233")
+    assert any("огласие" in getattr(reply, "text", "").lower() for reply in replies)
+    assert not api.storage.orders_of(USER)
+    [done] = gateway.action(USER, "consent_yes")
+    assert "Заявка" in done.text
+    [lead] = api.storage.orders_of(USER)
+    assert lead.customer.phone == "+79001112233"
+
+
 def test_spec_command_sends_excel_and_word(env):
     _, gateway = env
     gateway.action(USER, "add:I1")

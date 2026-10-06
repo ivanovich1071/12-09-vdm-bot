@@ -5,7 +5,7 @@ import zipfile
 import pytest
 
 from core.models import Cart, CartItem, Customer, Order
-from orders.sinks import CompositeSink, JsonlSink, SmtpSink, XlsxSink, order_xlsx
+from orders.sinks import CompositeSink, JsonlSink, SmtpSink, XlsxSink, order_rows, order_xlsx
 
 
 @pytest.fixture
@@ -112,3 +112,33 @@ def test_specification_shows_stock_as_the_client_saw_it(order):
         sheet = book.read("xl/worksheets/sheet1.xml").decode("utf-8")
     assert "Наличие" in sheet
     assert "в наличии 4 шт." in sheet and "под заказ" in sheet
+
+
+# --- Лид без состава (шаг 4.4) ------------------------------------------------------------
+
+
+@pytest.fixture
+def lead():
+    return Order.create_lead(
+        "u1",
+        "web",
+        Customer(name="Иванов", phone="+7 916 330-02-79", comment="Запрос без состава: нужен счёт"),
+        "c1",
+    )
+
+
+def test_lead_keeps_contacts_in_the_table(lead):
+    """Заявка без состава — одна строка контактов: без неё приёмники молчали бы."""
+    [row] = order_rows(lead)
+    assert "Иванов" in row and "+7 916 330-02-79" in row
+    assert "нужен счёт" in row[-1]
+
+
+def test_lead_letter_names_the_request_instead_of_zero_items(lead):
+    """Тема «0 позиций · 0 ₽» читалась менеджером как сбой; это живой запрос."""
+    letter = SmtpSink(host="smtp.test", to="mgr@test").message(lead)
+    assert "Запрос без состава" in letter["Subject"]
+    assert "0 позиций" not in letter["Subject"]
+    body = letter.get_body(preferencelist=("plain",)).get_content()
+    assert "Иванов" in body and "330-02-79" in body
+    assert "нужен счёт" in body

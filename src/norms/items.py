@@ -50,6 +50,12 @@ _SPLIT_CODE = re.compile(r"(\d(?:\.\d+){2,})\s(\d)(?=\s+[А-ЯЁA-Z«\"(])")
 # Номер, склеенный с названием: «1.13.4.3.1.2Игровой».
 _GLUED_CODE = re.compile(r"(\d(?:\.\d+){2,})(?=[А-ЯЁA-Z«\"(])")
 
+# Общая позиция: «Позиция 2.13 является общей для следующих подразделов
+# (предметных кабинетов) и приобретаются в каждый из них:», «Позиции 2.1-2.12
+# являются общими…» (диапазон через тире), «Позиции 2.16, 2.17 являются общими…».
+# Кабинеты перечислены строками «Подраздел N. Название» после фразы.
+_COMMON_PHRASE = re.compile(r"^Позици[ия] (?P<codes>[0-9.\-,– —]+?) явля[ею]тся общ[еи]\w*")
+
 
 @dataclass(frozen=True)
 class NormItem:
@@ -63,12 +69,80 @@ class NormItem:
     section: str | None = None
     unit: str | None = None
     quantity: str | None = None
+    # Кабинеты, в которые приказ велит покупать общую позицию («2.15. Конторка» —
+    # в кабинет химии наравне с его пунктами 2.15.1–2.15.127). У обычного пункта
+    # список пуст.
+    cabinets: tuple[str, ...] = ()
 
     @property
     def full_title(self) -> str:
         if self.section:
             return f"{self.title} ({self.section})"
         return self.title
+
+
+def parse_838_meta(text: str) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Карта подразделов и карта общих позиций из фраз приказа (шаг 3.4).
+
+    «Позиция 2.15 является общей для следующих подразделов…» перечисляет кабинеты
+    строками «Подраздел N. Название» — это те же настоящие заголовки подразделов,
+    поэтому одна карта обслуживает оба вопроса: чей пункт (подраздел по цифрам)
+    и кому позиция общая (кабинеты из перечня). Перечень кабинетов тянется до
+    ближайшего пункта перечня: колонтитулы страниц и шум вёрстки ему не помеха.
+    """
+    subsections: dict[str, str] = {}
+    common: dict[str, list[str]] = {}
+    pending: list[str] = []
+    chapter: str | None = None
+
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        if not line:
+            continue
+        phrase = _COMMON_PHRASE.match(line)
+        if phrase:
+            pending = _expand_codes(phrase.group("codes"))
+            # Кабинеты перечня принадлежат главе самой позиции: «Позиции 3.1-3.6…
+            # Подраздел 1. Студия» — это 3.1, а не тёзка из главы 2.
+            if pending:
+                chapter = pending[0].split(".")[0]
+            continue
+        heading = _HEADING.match(line)
+        if heading:
+            kind, number, title = heading.groups()
+            title = title.strip(" .*")
+            if kind == "Раздел":
+                chapter = number
+                pending = []
+            elif chapter is not None:
+                subsections.setdefault(f"{chapter}.{number}", title)
+                if pending:
+                    for code in pending:
+                        common.setdefault(code, []).append(f"{chapter}.{number} {title}")
+            continue
+        if _ITEM_838.match(line):
+            pending = []
+    return subsections, common
+
+
+def _expand_codes(codes: str) -> list[str]:
+    """«2.1-2.12», «2.16, 2.17» → список кодов одной глубины с общим префиксом."""
+    found: list[str] = []
+    for part in re.split(r"[,;]", codes):
+        part = part.strip().replace("–", "-").replace("—", "-")
+        if not part:
+            continue
+        if "-" not in part:
+            found.append(part)
+            continue
+        left, right = part.split("-", 1)
+        lp, rp = left.split("."), right.split(".")
+        if len(lp) == len(rp) and lp[:-1] == rp[:-1] and lp[-1].isdigit() and rp[-1].isdigit():
+            prefix = ".".join(lp[:-1])
+            found.extend(f"{prefix}.{n}" for n in range(int(lp[-1]), int(rp[-1]) + 1))
+        else:
+            found.append(part)
+    return found
 
 
 def parse_838(text: str) -> list[NormItem]:
@@ -81,24 +155,23 @@ def parse_838(text: str) -> list[NormItem]:
     логопеда». Поэтому заголовки собираются в карту «номер → название», и пункт
     2.15.36 получает «Кабинет химии» по своим цифрам — в каком порядке строки ни
     приезжай из выгрузки.
+
+    Позиции второго уровня (2.1–2.17, 3.1–3.6) подразделами не подписываются
+    вовсе: у приказа совпадают номера позиции и подраздела, и «2.15. Конторка»
+    получала подпись «Кабинет химии» по чужим цифрам. Общая позиция остаётся без
+    раздела, а список её кабинетов берётся из фраз «является общей…».
     """
     sections: dict[str, str] = {}
-    subsections: dict[tuple[str, str], str] = {}
-    chapter: str | None = None
 
     for raw in text.splitlines():
         line = " ".join(raw.split())
         heading = _HEADING.match(line)
-        if not heading:
-            continue
-        kind, number, title = heading.groups()
-        title = title.strip(" .*")
-        if kind == "Раздел":
-            chapter = number
-            sections.setdefault(number, title)
-        elif chapter is not None:
-            subsections.setdefault((chapter, number), title)
+        if heading:
+            kind, number, title = heading.groups()
+            if kind == "Раздел":
+                sections.setdefault(number, title.strip(" .*"))
 
+    subsections, common = parse_838_meta(text)
     items: list[NormItem] = []
     for raw in text.splitlines():
         line = " ".join(raw.split())
@@ -109,13 +182,23 @@ def parse_838(text: str) -> list[NormItem]:
             continue
         code, title = match.groups()
         parts = code.split(".")
-        subsection = subsections.get((parts[0], parts[1]))
+        if len(parts) == 2:
+            items.append(
+                NormItem(
+                    doc_id="order_838",
+                    code=code,
+                    title=title.strip(" .*"),
+                    section=None,
+                    cabinets=tuple(common.get(code, [])),
+                )
+            )
+            continue
         items.append(
             NormItem(
                 doc_id="order_838",
                 code=code,
                 title=title.strip(" .*"),
-                section=subsection or sections.get(parts[0]),
+                section=subsections.get(f"{parts[0]}.{parts[1]}") or sections.get(parts[0]),
             )
         )
     return items
@@ -224,19 +307,38 @@ def build(sources: dict[str, Path], out: Path = DEFAULT_ITEMS) -> dict[str, int]
     """Собирает справочник пунктов из PDF приказов.
 
     Приказы в git не хранятся (как и любые PDF заказчика), поэтому команда
-    запускается вручную у того, у кого файлы лежат рядом с проектом.
+    запускается вручную у того, у кого файлы лежат рядом с проектом. Рядом с
+    пунктами пишутся карты подразделов и общих позиций — в 838 без них
+    комплектация кабинета подписана позицией-тёзкой (шаг 3.4).
     """
     parsers = {"order_838": parse_838, "order_1057": parse_1057}
+    meta_parsers = {"order_838": parse_838_meta}
     collected: dict[str, list[dict]] = {}
+    subsections: dict[str, dict[str, str]] = {}
+    common: dict[str, dict[str, list[str]]] = {}
 
     for doc_id, path in sources.items():
         if doc_id not in parsers or not path.exists():
             continue
-        items = parsers[doc_id](read_pdf(path))
+        text = read_pdf(path)
+        items = parsers[doc_id](text)
         collected[doc_id] = [asdict(item) for item in items]
+        if doc_id in meta_parsers:
+            doc_subsections, doc_common = meta_parsers[doc_id](text)
+            if doc_subsections:
+                subsections[doc_id] = doc_subsections
+            if doc_common:
+                common[doc_id] = doc_common
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(collected, ensure_ascii=False, indent=1), encoding="utf-8")
+    out.write_text(
+        json.dumps(
+            {**collected, "subsections": subsections, "common_positions": common},
+            ensure_ascii=False,
+            indent=1,
+        ),
+        encoding="utf-8",
+    )
     return {doc_id: len(items) for doc_id, items in collected.items()}
 
 
@@ -254,12 +356,24 @@ class ItemIndex:
     коротких. Это не полнотекстовый движок, это замена выдумыванию.
     """
 
-    def __init__(self, items: dict[str, dict[str, NormItem]]) -> None:
+    def __init__(
+        self,
+        items: dict[str, dict[str, NormItem]],
+        meta: dict[str, dict[str, dict]] | None = None,
+    ) -> None:
         self.items = items
+        meta = meta or {}
+        self.subsections: dict[str, dict[str, str]] = {
+            doc_id: dict(m.get("subsections", {})) for doc_id, m in meta.items()
+        }
+        self.common: dict[str, dict[str, list[str]]] = {
+            doc_id: dict(m.get("common", {})) for doc_id, m in meta.items()
+        }
         self._tokens: dict[tuple[str, str], set[str]] = {}
         for doc_id, by_code in items.items():
             for code, item in by_code.items():
-                self._tokens[(doc_id, code)] = _stems(f"{item.title} {item.section or ''}")
+                extra = " ".join(item.cabinets)
+                self._tokens[(doc_id, code)] = _stems(f"{item.title} {item.section or ''} {extra}")
 
     @property
     def loaded(self) -> bool:
@@ -267,6 +381,24 @@ class ItemIndex:
 
     def get(self, doc_id: str, code: str) -> NormItem | None:
         return self.items.get(doc_id, {}).get(code)
+
+    def subsection(self, doc_id: str, code: str) -> str | None:
+        """Имя подраздела приказа по коду: «2.15.36» и «2.15» → «Кабинет химии».
+
+        Совпадение номеров позиции и подраздела — устройство приказа 838: позиция
+        2.15 «Конторка» — общая для кабинетов, а пункты 2.15.1–2.15.127 — сам
+        кабинет химии. Хранятся они раздельно (шаг 3.4), чтобы комплектация
+        кабинета подписывалась кабинетом, а не позицией-тёзкой.
+        """
+        maps = self.subsections.get(doc_id)
+        if not maps:
+            return None
+        parts = code.split(".")
+        for size in range(len(parts), 0, -1):
+            name = maps.get(".".join(parts[:size]))
+            if name:
+                return name
+        return None
 
     def documents_with(self, code: str) -> list[str]:
         """В каких приказах есть пункт с таким номером."""
@@ -287,10 +419,33 @@ class ItemIndex:
         return [item for item in found if item is not None]
 
     def children(self, doc_id: str, code: str) -> list[NormItem]:
-        """Пункты раздела в порядке номеров, со вложенными подразделами."""
+        """Пункты раздела в порядке номеров, со вложенными подразделами.
+
+        Комплектация кабинета (шаг 3.4) — не только его собственные пункты:
+        приказ относит к кабинету и общие позиции. В кабинет химии входят и
+        2.15.1–2.15.127, и общая «2.15. Конторка», и доска со столами из блока
+        2.1–2.17, которых раньше в «полном комплекте» не было.
+        """
         prefix = f"{code}."
         found = [item for key, item in self.items.get(doc_id, {}).items() if key.startswith(prefix)]
+        found += self._common_positions(doc_id, code)
         return sorted(found, key=lambda item: [int(part) for part in item.code.split(".") if part.isdigit()])
+
+    def _common_positions(self, doc_id: str, code: str) -> list[NormItem]:
+        """Общие позиции, которые приказ относит к этому подразделу.
+
+        Кабинеты в карте общих позиций хранятся строкой «2.15 Кабинет химии» —
+        матчится код кабинета, а не название: названия подразделов могут
+        повторяться или сокращаться.
+        """
+        if code not in (self.subsections.get(doc_id) or {}):
+            return []
+        return [
+            item
+            for pos_code, cabinets in self.common.get(doc_id, {}).items()
+            if any(cabinet.split(" ", 1)[0] == code for cabinet in cabinets)
+            and (item := self.get(doc_id, pos_code)) is not None
+        ]
 
     def search(self, text: str, doc_id: str | None = None, limit: int = 5) -> list[NormItem]:
         from catalog.text import expand
@@ -338,6 +493,10 @@ def load(path: Path = DEFAULT_ITEMS) -> dict[str, dict[str, NormItem]]:
 
     result: dict[str, dict[str, NormItem]] = {}
     for doc_id, items in raw.items():
+        # Карты подразделов и общих позиций лежат в том же файле — это словари,
+        # а не списки пунктов (шаг 3.4).
+        if not isinstance(items, list):
+            continue
         result[doc_id] = {
             item["code"]: NormItem(
                 doc_id=doc_id,
@@ -346,7 +505,30 @@ def load(path: Path = DEFAULT_ITEMS) -> dict[str, dict[str, NormItem]]:
                 section=item.get("section"),
                 unit=item.get("unit"),
                 quantity=item.get("quantity"),
+                cabinets=tuple(item.get("cabinets") or ()),
             )
             for item in items
         }
     return result
+
+
+def load_meta(path: Path = DEFAULT_ITEMS) -> dict[str, dict[str, dict]]:
+    """Карты подразделов и общих позиций из того же файла, по документу.
+
+    {"order_838": {"subsections": {"2.15": "Кабинет химии", …},
+                   "common": {"2.15": ["2.1 Кабинет начальных классов", …]}}}
+    Файла может не быть — тогда подразделов нет и бот подписывает пункты,
+    как раньше.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    meta: dict[str, dict[str, dict]] = {}
+    for key, field in (("subsections", "subsections"), ("common_positions", "common")):
+        for doc_id, payload in (raw.get(key) or {}).items():
+            if isinstance(payload, dict):
+                meta.setdefault(doc_id, {})[field] = payload
+    return meta

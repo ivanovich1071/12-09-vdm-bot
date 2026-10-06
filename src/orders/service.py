@@ -105,6 +105,23 @@ class OrderService:
         self.storage.save_cart(cart)
         return order
 
+    def submit_lead(self, user_id: str, channel: str, customer: Customer) -> Order:
+        """Заявка без состава (шаг 4.4): контакты и суть запроса — без корзины.
+
+        Согласие проверяется так же, как у полного заказа: имя и телефон — те же
+        персональные данные. Суть запроса живёт в комментарии к контактам.
+        """
+        consent_id = self.storage.active_consent(user_id)
+        if consent_id is None:
+            raise PermissionError(
+                "Нет действующего согласия на обработку персональных данных: "
+                "заявка не оформляется."
+            )
+        order = Order.create_lead(user_id, channel, customer, consent_id)
+        self.storage.save_order(order)
+        self._deliver(order, [])
+        return order
+
     def retry_pending(self) -> int:
         """Повторная отправка залежавшихся заказов. Вызывается планировщиком."""
         sent = 0
