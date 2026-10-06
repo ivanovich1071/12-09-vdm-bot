@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS dialog_state (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (user_id, channel)
 );
+CREATE TABLE IF NOT EXISTS lost_notifies (
+    user_id     TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    notified_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, channel)
+);
 """
 
 # Сколько живёт незавершённый разговор. Дальше он бесполезен: закупка либо
@@ -461,6 +467,33 @@ class Storage:
         self._db.commit()
         return cursor.rowcount or 0
 
+    def stale_dialogs(self, cutoff: str, channel: str | None = None) -> list[dict]:
+        """Разговоры, замолчавшие раньше `cutoff` и ещё не отнесённые к ушедшим.
+
+        Отметка о письме живёт в `lost_notifies`: одно молчание — одно письмо,
+        сколько бы раз ни запускался фон. История возвращается маскированной —
+        как лежит.
+        """
+        sql = (
+            "SELECT d.user_id, d.channel, d.history, d.profile, d.updated_at "
+            "FROM dialog_state d "
+            "LEFT JOIN lost_notifies n ON n.user_id = d.user_id AND n.channel = d.channel "
+            "WHERE d.updated_at < ? AND n.user_id IS NULL"
+        )
+        parameters: list = [cutoff]
+        if channel:
+            sql += " AND d.channel = ?"
+            parameters.append(channel)
+        return [dict(row) for row in self._db.execute(sql, tuple(parameters)).fetchall()]
+
+    def mark_lost_notified(self, user_id: str, channel: str) -> None:
+        self._db.execute(
+            "INSERT INTO lost_notifies(user_id, channel, notified_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(user_id, channel) DO NOTHING",
+            (user_id, channel, _now()),
+        )
+        self._db.commit()
+
     # --- Права субъекта ПДн --------------------------------------------------
 
     def export_user_data(self, user_id: str) -> dict[str, object]:
@@ -505,6 +538,7 @@ class Storage:
                 )
             self._db.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
             self._db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))
+            self._db.execute("DELETE FROM lost_notifies WHERE user_id = ?", (user_id,))
         for hook in self._user_data_hooks:
             hook.delete(user_id)
         self.record_consent(user_id, channel, "n/a", "revoked")

@@ -907,14 +907,38 @@ async def main() -> None:
     )
     bot.session.middleware(RetryOnNetworkError())
     # Бот получает готовый Core API и сам не собирает ни движок, ни хранилище.
-    gateway = TelegramGateway(
-        build_core_api(settings, warm_llm=True), settings.order_upload_max_mb * 1024 * 1024
-    )
+    core = build_core_api(settings, warm_llm=True)
+    gateway = TelegramGateway(core, settings.order_upload_max_mb * 1024 * 1024)
+    if settings.lost_notify_enabled and settings.smtp_host and settings.order_email_to:
+        # Ушедшие клиенты (вопросы 9/16/17 опросного листа): раз в полчаса ищем
+        # замолчавших и пишем менеджерам на почту. Клиенту ничего не отправляется.
+        asyncio.create_task(_lost_notify_loop(core))
     dispatcher = build_dispatcher(gateway)
     await _publish_commands(bot)
     await _publish_miniapp(bot, settings.telegram_miniapp_url)
     log.info("Telegram-бот запущен")
     await _poll_forever(dispatcher, bot)
+
+
+# Как часто фоновый цикл перечитывает замолчавших (ушедшие клиенты).
+LOST_SCAN_SECONDS = 1800
+
+
+async def _lost_notify_loop(core) -> None:  # noqa: ANN001
+    """Раз в полчаса: замолчавшие дольше CLIENT_LOST_DAYS — письмом менеджерам.
+
+    Проверка ходит через Core API (как весь адаптер), а SQLite и smtplib
+    блокирующие — уводим её в поток, чтобы цикл не мешал ходам диалога. Ошибка
+    прохода цикл не гасит: следующее окно попробует снова.
+    """
+    while True:
+        await asyncio.sleep(LOST_SCAN_SECONDS)
+        try:
+            sent = await asyncio.to_thread(core.notify_lost_clients)
+            if sent:
+                log.info("Ушедшие клиенты: менеджерам отправлено писем: %s", sent)
+        except Exception as exc:
+            log.error("Проверка ушедших клиентов не прошла: %s", exc)
 
 
 def _widen_thread_pool(workers: int = TURN_WORKERS) -> None:

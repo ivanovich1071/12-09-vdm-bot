@@ -173,6 +173,12 @@ class Settings:
     # с письменного согласия заказчика и под конкретную задачу.
     dialog_log_mask_pdn: bool = True
 
+    # Ушедшие клиенты (вопросы 9/16/17 опросного листа): клиент молчит столько
+    # дней — менеджерам уходит одно письмо, кто и что искал. Напоминаний клиенту
+    # бот не отправляет (решение заказчика).
+    lost_notify_enabled: bool = True
+    client_lost_days: int = 7
+
     # Виджет
     widget_allowed_origins: list[str] = field(default_factory=lambda: ["http://localhost:8000"])
     widget_host: str = "0.0.0.0"
@@ -271,6 +277,8 @@ class Settings:
             dialog_log_enabled=env.get("DIALOG_LOG_ENABLED", "1") not in {"0", "false", "no"},
             dialog_log_path=env.get("DIALOG_LOG_PATH", cls.dialog_log_path),
             dialog_log_mask_pdn=env.get("DIALOG_LOG_MASK_PDN", "1") not in {"0", "false", "no"},
+            lost_notify_enabled=env.get("LOST_NOTIFY_ENABLED", "1") not in {"0", "false", "no"},
+            client_lost_days=int(env.get("CLIENT_LOST_DAYS", cls.client_lost_days)),
             widget_allowed_origins=[o.strip() for o in origins.split(",") if o.strip()],
             widget_host=env.get("WIDGET_HOST", cls.widget_host),
             widget_port=int(env.get("WIDGET_PORT", cls.widget_port)),

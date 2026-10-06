@@ -61,6 +61,16 @@ class CoreApi:
     def storage(self):  # noqa: ANN201 — core.storage.Storage
         return self.services.engine.storage
 
+    def notify_lost_clients(self) -> int:
+        """Ушедшие клиенты: письма менеджерам по замолчавшим разговорам.
+
+        Канал ставит это в фоновый цикл; сам фасад ничего не шлёт, пока не
+        настроена почта. Возвращает число отправленных писем.
+        """
+        from orders.lost import notify_lost_clients
+
+        return notify_lost_clients(self.services.engine.settings, self.storage)
+
     # --- Служебное ----------------------------------------------------------------
 
     def health(self) -> dict[str, Any]:
