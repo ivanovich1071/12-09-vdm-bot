@@ -379,7 +379,38 @@ def test_card_without_price_offers_the_manager(tmp_path):
     priced = engine.handle_action(USER, CHANNEL, "card:S1")
     priced_card = [r for r in priced if isinstance(r, ProductCard)][0]
     priced_actions = [button.action for row in priced_card.keyboard.rows for button in row]
-    assert "manager" not in priced_actions
+    assert "manager" in priced_actions
+
+
+def test_card_offers_similar_and_manager(tmp_path):
+    """Вопрос 5 опросного листа: у карточки — «Похожее», менеджер и словесная подсказка."""
+    from core.ui import Message, ProductCard
+
+    index = CatalogIndex(
+        [
+            product("S1", "Мяч баскетбольный", 253000),
+            product("S2", "Мяч волейбольный", 908),
+            product("S3", "Стол логопеда", None),
+        ]
+    )
+    storage = Storage(tmp_path / "t.sqlite3")
+    settings = Settings(orders_jsonl_path=str(tmp_path / "orders.jsonl"))
+    orders = OrderService(storage, JsonlSink(path=tmp_path / "orders.jsonl"))
+    engine = DialogEngine(index, storage, orders, settings)
+
+    responses = engine.handle_action(USER, CHANNEL, "card:S1")
+    assert isinstance(responses[-1], Message) and "самому" in responses[-1].text
+    card = [r for r in responses if isinstance(r, ProductCard)][0]
+    actions = [button.action for row in card.keyboard.rows for button in row]
+    assert "similar:S1" in actions and "manager" in actions
+
+    out = engine.handle_action(USER, CHANNEL, "similar:S1")
+    listing = [r for r in out if isinstance(r, ProductList)][0]
+    skus = [c.product.sku_1c for c in listing.cards]
+    assert skus and "S1" not in skus
+
+    again = engine.handle_action(USER, CHANNEL, "card:S1")
+    assert not [r for r in again if isinstance(r, Message)], "подсказка — один раз за разговор"
 
 
 # --- Оформление без сюрпризов: анкета, счётчики файла -------------------------

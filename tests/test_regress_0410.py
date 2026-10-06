@@ -218,10 +218,38 @@ class TestCoreFallback:
         assert engine.settings.manager_contact in out
 
     def test_lead_request_asks_for_contacts(self, engine):
-        """Шаг 4.4: «нужен счёт» без корзины — просьба контактов, не заглушка и не менеджер-карточка."""
+        """Шаг 4.4: «нужен счёт» без корзины — вопрос об имени, не заглушка и не менеджер-карточка."""
         out = flat(engine.handle_text(USER, CHANNEL, "нужен счёт на организацию, оплатим по безналу"))
-        assert "имя и телефон" in out.lower()
+        assert "зовут" in out.lower()
         assert "недоступен" not in out.lower()
+
+    def test_lead_collected_step_by_step(self, engine):
+        """Вопросы 1/14 опросного листа: имя → город → телефон, по одному вопросу."""
+        engine.handle_action(USER, CHANNEL, "consent_yes")
+        first = flat(engine.handle_text(USER, CHANNEL, "нужен счёт на организацию"))
+        assert "зовут" in first.lower()
+        second = flat(engine.handle_text(USER, CHANNEL, "Иван"))
+        assert "город" in second.lower()
+        third = flat(engine.handle_text(USER, CHANNEL, "Москва"))
+        assert "телефон" in third.lower()
+        out = flat(engine.handle_text(USER, CHANNEL, "+7 916 123-45-67"))
+        assert "Заявка" in out and "менеджеру" in out
+        [lead] = engine.storage.orders_of(USER)
+        assert lead.customer.name == "Иван"
+        assert lead.customer.region == "Москва"
+        assert lead.customer.phone == "+7 916 123-45-67"
+
+    def test_lead_carries_dialog_digest_to_manager(self, engine):
+        """Вопрос 2 (резюме) и вопрос 14 Бабковой (переписка): заявку виден след диалога."""
+        engine.handle_action(USER, CHANNEL, "consent_yes")
+        engine.handle_text(USER, CHANNEL, "интересовала сенсорная лампа для сенсорной комнаты")
+        engine.handle_text(USER, CHANNEL, "нужен счёт")
+        engine.handle_text(USER, CHANNEL, "Иван")
+        engine.handle_text(USER, CHANNEL, "Москва")
+        engine.handle_text(USER, CHANNEL, "+7 916 123-45-67")
+        [lead] = engine.storage.orders_of(USER)
+        assert "сенсорная лампа" in lead.customer.comment
+        assert "Последнее из диалога" in lead.customer.comment
 
     def test_lead_in_one_message_with_consent(self, engine):
         """«Перезвоните по номеру…» — заявка без состава уходит сразу."""
@@ -244,10 +272,10 @@ class TestCoreFallback:
         assert lead.customer.phone == "+7 916 123-45-67"
 
     def test_lead_released_when_user_moves_on(self, engine):
-        """Человек передумал и спросил товар — бот отвечает, а не виснет на просьбе телефона."""
+        """Человек передумал и спросил товар — бот отвечает, а не виснет на вопросах."""
         engine.handle_text(USER, CHANNEL, "нужен счёт")
         out = flat(engine.handle_text(USER, CHANNEL, "покажи волейбольный мяч"))
-        assert "имя и телефон" not in out.lower()
+        assert "зовут" not in out.lower()
 
     def test_pure_manager_card_unchanged_by_lead_flow(self, engine):
         """«Хочу менеджера» — карточка с телефоном, как и было (лид её не перехватил)."""

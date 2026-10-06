@@ -198,6 +198,12 @@ class DialogProfile:
     # кладутся, ждут отдельного «Добавить подобранное». Молчаливая замена дала пересортицу
     # в предзаказе 19.09: вместо модульного пола уехал игровой лабиринт.
     review: list[str] = field(default_factory=list)
+    # Подсказку про кнопки карточки показываем один раз за разговор (вопрос 5
+    # опросного листа): повторное «Подробнее» не приносит её снова.
+    card_hint_shown: bool = False
+    # Кто перед нами: «person» — частник, «org» — учреждение или закупка, «unknown» —
+    # не определено (вопросы 10–12 опросного листа). Определяется по словам реплик.
+    client_kind: str = "unknown"
 
     @property
     def audience(self) -> str | None:
@@ -452,6 +458,8 @@ class DialogProfile:
             "export": self.export,
             "order": self.order,
             "review": self.review,
+            "card_hint_shown": self.card_hint_shown,
+            "client_kind": self.client_kind,
         }
 
     @classmethod

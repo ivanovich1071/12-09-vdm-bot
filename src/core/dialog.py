@@ -178,6 +178,9 @@ class Session:
     # ждём его контакты, прежде чем передать заявку менеджеру.
     pending_lead: bool = False
     lead_essence: str = ""
+    # Шаг пошагового сбора данных лида: «name» → «city» → «phone». Пусто, пока
+    # вопрос не задан; телефон в первой же реплике перескакивает шаги.
+    lead_stage: str = ""
     history: list[dict[str, str]] = field(default_factory=list)
     profile: DialogProfile = field(default_factory=DialogProfile)
     # Один маскер на весь разговор: метки должны совпадать между сообщениями,
@@ -551,6 +554,8 @@ class DialogEngine:
                 return self._norm_items(session, arg)
             case "card":
                 return self._card(session, arg)
+            case "similar":
+                return self._similar(session, arg)
             case "add":
                 return self._add(session, arg, 1)
             case "inc":
@@ -1730,10 +1735,14 @@ class DialogEngine:
             )
         else:
             keyboard.row(Button("В корзину", f"add:{sku}"))
+        # Вопрос 5 опросного листа (оба отдела): рядом с покупкой — «Похожее» и
+        # менеджер. У товара без цены менеджерская кнопка зовётся уточнением цены.
         if product.price is None:
-            # Товар без цены (вопрос 4 опросного листа): рядом с «цену подскажет
-            # менеджер» — сразу действие, а не только слова.
-            keyboard.row(Button("Уточнить цену у менеджера", "manager"))
+            keyboard.row(
+                Button("Похожее", f"similar:{sku}"), Button("Уточнить цену у менеджера", "manager")
+            )
+        else:
+            keyboard.row(Button("Похожее", f"similar:{sku}"), Button("Позвать менеджера", "manager"))
         if product.url:
             # Действие «noop», а не «card:»: кнопка — ссылка, повторное нажатие
             # не должно рисовать карточку заново (ТЗ BUG-17, шаг 7.5).
@@ -1742,6 +1751,17 @@ class DialogEngine:
 
         audience = session.profile.audience
         norm = product.norm_for(audience, session.profile.room or "")
+        # Предложение Бабковой (вопрос 5): не все читают кнопки — словами говорим,
+        # что оформить можно самому, а менеджер рядом для смет и документов. Один
+        # раз за разговор: повторное «Подробнее» не приносит подсказку снова.
+        hint: Message | None = None
+        if not session.profile.card_hint_shown:
+            session.profile.card_hint_shown = True
+            hint = Message(
+                "Заказ можно оформить самому — кнопками под карточкой. Если нужно рассчитать "
+                "доставку, подготовить документы или подобрать ещё что-то к кабинету — позовём менеджера."
+            )
+        # Карточка первой: она заменяет прежнюю по кнопке, подсказка — следом.
         return [
             ProductCard(
                 product=product,
@@ -1752,8 +1772,37 @@ class DialogEngine:
                 image_path=self.photo_path(product),
                 norms=self.norm_lines(product, audience),
                 replace=replace,
-            )
+            ),
+            *([hint] if hint else []),
         ]
+
+    def _similar(self, session: Session, sku: str) -> list[Response]:
+        """«Похожее» — товары того же раздела каталога (вопрос 5 опросного листа)."""
+        product = self.index.get(sku)
+        if product is None:
+            return [Message("Не нашёл такой товар.", keyboard=self._main_menu())]
+        root = product.roots[0] if product.roots else None
+        hits = self.index.search(
+            SearchQuery(
+                text=product.name,
+                root=root,
+                limit=PAGE_SIZE + 1,
+                audience=session.profile.audience,
+            )
+        )
+        hits = [hit for hit in hits if hit.product.sku_1c != sku][:PAGE_SIZE]
+        if not hits:
+            return [
+                Message(
+                    "Похожего в этом разделе не нашлось. Подбор под задачу возьмёт на себя "
+                    "менеджер.",
+                    keyboard=Keyboard().row(
+                        Button("Связаться с менеджером", "manager"), Button("Меню", "menu")
+                    ),
+                )
+            ]
+        session.last_hits = hits
+        return [self._list(hits, f"Похожее: {product.name}", len(hits), offset=0)]
 
     def norm_lines(self, product: Product, audience: str | None) -> list[str]:
         """Все основания товара с формулировками пунктов приказа.
@@ -2370,6 +2419,7 @@ class DialogEngine:
         session.pending_checkout = False
         session.pending_lead = False
         session.lead_essence = ""
+        session.lead_stage = ""
         session.customer = Customer()
         session.last_hits = []
         session.forget()
@@ -2416,24 +2466,71 @@ class DialogEngine:
 
         Возвращает `None`, когда реплика лида не касается: есть корзина (работает
         чекаут), человек передумал и заговорил о товарах, либо лида в реплике нет.
+        Данные собираем по одному вопросу — имя, город, телефон (опросный лист,
+        вопросы 1 и 14: оба отдела просили минимум, «одним сообщением» — нет).
         """
         if not self.storage.load_cart(session.user_id).is_empty:
             session.pending_lead = False
+            session.lead_stage = ""
             return None
         phone = PHONE.search(text or "")
         if session.pending_lead:
             if phone:
-                return self._submit_lead(session, text, phone.group(0))
+                # Телефон пришёл раньше своей очереди — им и закрываем заявку.
+                return self._submit_lead(session, session.lead_essence, phone.group(0))
             if intent.asks_lead(text):
                 return self._ask_lead_contact(session, text)
-            # Человек заговорил о другом: подбираем товары, просьба о контактах
-            # снимается — иначе бот молчал бы вопросом про телефон вместо ответов.
-            if intent.classify(text) not in (intent.OTHER,):
+            # Человек заговорил о другом: подбираем товары, сбор контактов
+            # снимается — иначе бот молчал бы вопросом вместо ответов.
+            moved_on = intent.classify(text) not in (intent.OTHER,)
+            if moved_on:
                 session.pending_lead = False
-            return None
+                session.lead_stage = ""
+                return None
+            if session.lead_stage == "name":
+                name = _lead_name(text)
+                if name:
+                    session.customer.name = name
+                    session.lead_stage = "city"
+                    return [
+                        Message(
+                            f"Спасибо, {name}! Из какого вы города? "
+                            "Менеджер сразу подскажет сроки доставки.",
+                            keyboard=self._main_menu(),
+                        )
+                    ]
+                return [
+                    Message(
+                        "Напишите, как к вам обращаться — достаточно имени.",
+                        keyboard=self._main_menu(),
+                    )
+                ]
+            if session.lead_stage == "city":
+                region = " ".join((text or "").split()).strip(" .;,!-")[:100]
+                if region:
+                    session.customer.region = region
+                session.lead_stage = "phone"
+                ack = f"Записал: {region}. " if region else ""
+                return [
+                    Message(
+                        f"{ack}И последний шаг — телефон, чтобы менеджер мог перезвонить. "
+                        "Например: +7 916 123-45-67.",
+                        keyboard=self._main_menu(),
+                    )
+                ]
+            if session.lead_stage == "phone":
+                return [
+                    Message(
+                        "Не нашёл номер в сообщении. Напишите телефон в любом виде, "
+                        "например: +7 916 123-45-67.",
+                        keyboard=self._main_menu(),
+                    )
+                ]
+            # Стадия потерялась (сессия пережила обновление) — спрашиваем с начала.
+            return self._ask_lead_contact(session, session.lead_essence)
         if intent.asks_lead(text):
             if phone:
-                return self._submit_lead(session, text, phone.group(0))
+                return self._submit_lead(session, text, phone.group(0), name_from_text=True)
             if self._has_export_context(session):
                 # «Пришлите счёт в Excel» по показанной комплектации — это файл и
                 # счёт-нота из обычного потока, а не лид: контакты человек давать
@@ -2454,14 +2551,18 @@ class DialogEngine:
         if session.customer.phone:
             # Контакты уже известны из прошлого хода: переспрашивать нечестно.
             return self._submit_lead(session, essence, session.customer.phone)
-        return [
-            Message(
-                "Передам менеджеру — счёт, КП и реквизиты у него. "
-                "Оставьте имя и телефон одним сообщением, например: "
-                "«Иван Петров, +7 916 123-45-67».",
-                keyboard=self._main_menu(),
-            )
-        ]
+        # По одному вопросу за ход: имя → город → телефон.
+        if session.customer.name:
+            session.lead_stage = "city" if not session.customer.region else "phone"
+        else:
+            session.lead_stage = "name"
+        questions = {
+            "name": "Передам менеджеру — счёт, КП и реквизиты у него. Как вас зовут?",
+            "city": "Из какого вы города? Менеджер сразу подскажет сроки доставки.",
+            "phone": "Остался телефон, чтобы менеджер мог перезвонить. "
+            "Например: +7 916 123-45-67.",
+        }
+        return [Message(questions[session.lead_stage], keyboard=self._main_menu())]
 
     def start_lead(self, user_id: str, channel: str, customer: Customer | None = None, essence: str = "") -> list[Response]:
         """Контакт без корзины из канала (кнопка «Отправить контакт», шлюз) — тот же лид.
@@ -2493,11 +2594,17 @@ class DialogEngine:
         session.pending_lead = True
         return self._ask_lead_contact(session, session.lead_essence)
 
-    def _submit_lead(self, session: Session, essence: str, phone: str) -> list[Response]:
+    def _submit_lead(
+        self, session: Session, essence: str, phone: str, *, name_from_text: bool = False
+    ) -> list[Response]:
         if not session.customer.name:
-            # Имя — та же реплика без телефона; не назвал — «Клиент», менеджер уточнит.
-            parsed = " ".join(PHONE.sub(" ", essence or "").replace(",", " ").split()).strip(" .;—-")
-            session.customer.name = (parsed or "Клиент")[:200]
+            if name_from_text:
+                # Реплика-триггер несёт имя: «перезвоните по номеру …, Мария».
+                parsed = " ".join(PHONE.sub(" ", essence or "").replace(",", " ").split()).strip(" .;—-")
+                session.customer.name = (parsed or "Клиент")[:200]
+            else:
+                # На шагах сбора essence — просьба «нужен счёт», ей имями не становятся.
+                session.customer.name = "Клиент"
         session.customer.phone = phone[:50]
         if essence and not session.lead_essence:
             session.lead_essence = essence[:300]
@@ -2522,6 +2629,7 @@ class DialogEngine:
         session.customer = Customer()
         session.pending_lead = False
         session.lead_essence = ""
+        session.lead_stage = ""
         test = session.user_id in self.settings.qa_user_ids
         lines = [
             lead_accepted(order.id, delivered=order.status == "sent" and not test, test=test),
@@ -2530,21 +2638,39 @@ class DialogEngine:
         return [Message("\n".join(lines), keyboard=self._main_menu())]
 
     def _lead_customer(self, session: Session) -> Customer:
-        """Контакты лида + суть запроса в комментарии — то, что менеджер увидит в таблице."""
+        """Контакты лида + суть запроса и след диалога — то, что увидит менеджер.
+
+        Резюме просил отдел ассортимента (вопрос 2: «телефон + короткое резюме»),
+        Бабкова добавила переписку (вопрос 14: «информацию о переписке»). История
+        маскируется при записи, поэтому наружу персональные данные не уходят.
+        """
         essence = session.lead_essence or "Запрос без состава"
         kit = session.profile.kit
         if kit:
             title = kit.get("title") or ""
             essence += f"; интересовала комплектация {kit.get('code')} «{title}»"
         comment = f"Запрос без состава: {essence}"
+        digest = self._dialog_digest(session)
+        if digest:
+            comment += f"\nПоследнее из диалога:\n{digest}"
         return Customer(
             name=session.customer.name,
             phone=session.customer.phone,
             email=session.customer.email,
             organization=session.customer.organization,
             region=session.customer.region,
-            comment=comment[:500],
+            comment=comment[:2000],
         )
+
+    def _dialog_digest(self, session: Session, limit: int = 10, width: int = 120) -> str:
+        """Последние реплики клиента одной колонкой — менеджеру в заявку."""
+        lines = []
+        for turn in session.history:
+            if turn.get("role") == "user":
+                chunk = " ".join(str(turn.get("content", "")).split())[:width]
+                if chunk:
+                    lines.append(f"— {chunk}")
+        return "\n".join(lines[-limit:])
 
 
 def _quantity(value: object) -> int | None:
@@ -2554,6 +2680,20 @@ def _quantity(value: object) -> int | None:
     except ValueError:
         return None
     return int(number) if number >= 1 else None
+
+
+# Ответы, после которых имени не бывает: «да»/«хорошо» — это согласие, а не имя.
+_TINY_ANSWERS = {"да", "ок", "нет", "окей", "хорошо", "ладно", "ага", "угу"}
+_LEAD_NAME_NOISE = re.compile(r"\bменя зовут\b|\bзовут\b|\bэто\b", re.IGNORECASE)
+
+
+def _lead_name(text: str) -> str:
+    """Имя из ответа на шаге сбора: чистим служебные слова, остальное — имя."""
+    cleaned = " ".join((text or "").replace(",", " ").split())
+    cleaned = _LEAD_NAME_NOISE.sub(" ", cleaned).strip(" .;!«»\"—-")
+    if cleaned.lower() in _TINY_ANSWERS:
+        return ""
+    return cleaned[:200]
 
 
 def describe(product: Product) -> str:
