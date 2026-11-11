@@ -599,10 +599,11 @@ def build_dispatcher(gateway: TelegramGateway) -> Dispatcher:
         async with turns.wait(user):
             await _reply(bot, chat, gateway, lambda: gateway.upload(user, name, content))
             # Подпись к файлу — такая же реплика, как текст: 14.09 «подбери из наличия 30 позиций и дай
-            # списком» пришло подписью к docx и потерялось.
+            # списком» пришло подписью к docx и потерялось. Но она относится к файлу:
+            # 06.10 «по этому списку…» под файлом ушла в показанные накануне карточки.
             caption = (message.caption or "").strip()
             if caption:
-                await _reply(bot, chat, gateway, lambda: gateway.text(user, caption))
+                await _reply(bot, chat, gateway, lambda: gateway.caption(user, caption))
 
     @dispatcher.message(F.contact)
     async def on_contact(message: TgMessage, bot: Bot) -> None:

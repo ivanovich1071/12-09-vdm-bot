@@ -45,6 +45,10 @@ AUTH_COOLDOWN_SECONDS = 1800.0
 # Лимит частоты (429) — не поломка, а очередь: Cloud.ru даёт 500 запросов в минуту,
 # и один сложный ход её исчерпывает (23.09, сц. 5). Достаточно минуты.
 RATE_COOLDOWN_SECONDS = 60.0
+# Таймаут по вине бюджета хода (звали с остатком в пару секунд) — провайдер не виноват:
+# 10.11 cloudru получил 6 секунд, был отключён на 30 с, и следующий ход деградировал
+# каскадом. Такой «отказ» стоит копейки.
+STARVED_COOLDOWN_SECONDS = 3.0
 # Джиттер ±20%, чтобы параллельные ходы не снимали cooldown одновременно.
 _JITTER = (0.8, 1.2)
 # Как часто фоновый пингер проверяет заблокированного провайдера: он снимает
@@ -67,6 +71,11 @@ def _pause_for(exc: Exception) -> float:
 @dataclass
 class LLMRouter:
     clients: list[ChatClient] = field(default_factory=list)
+    # Потолок вызова классификатора оркестратора: классификация — не ответ клиенту,
+    # и её медленный вызов не должен съедать бюджет хода, оставляя финальному
+    # ответу 6 секунд. Значение — давняя настройка llm_router_timeout_seconds,
+    # которая раньше существовала, но никуда не подключалась.
+    classify_timeout: float = 8.0
     _blocked_until: dict[str, float] = field(default_factory=dict, init=False)
     _last_error: dict[str, str] = field(default_factory=dict, init=False)
     _pinger: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -89,8 +98,8 @@ class LLMRouter:
         """Сколько провайдер ещё простоит в блоке — для журнала хода."""
         return max(0.0, self._blocked_until.get(client.name, 0.0) - time.monotonic())
 
-    def mark_down(self, client: ChatClient, exc: Exception) -> None:
-        pause = _pause_for(exc)
+    def mark_down(self, client: ChatClient, exc: Exception, pause: float | None = None) -> None:
+        pause = _pause_for(exc) if pause is None else pause
         self._blocked_until[client.name] = time.monotonic() + pause
         self._last_error[client.name] = str(exc)[:300]
         log.warning(
@@ -213,7 +222,7 @@ def build_router(settings) -> LLMRouter:  # noqa: ANN001 — core.config.Setting
         )
     else:
         log.info("Провайдеры модели: %s", ", ".join(f"{c.name}/{c.model}" for c in chosen))
-    return LLMRouter(clients=chosen)
+    return LLMRouter(clients=chosen, classify_timeout=settings.llm_router_timeout_seconds)
 
 
 def warm_up(router: LLMRouter) -> None:

@@ -181,6 +181,10 @@ class Session:
     # Шаг пошагового сбора данных лида: «name» → «city» → «phone». Пусто, пока
     # вопрос не задан; телефон в первой же реплике перескакивает шаги.
     lead_stage: str = ""
+    # Реплика — подпись под только что проверенным файлом заказа. Живёт один ход:
+    # «по этому списку…» под файлом должна управлять файлом, а не показанными
+    # накануне карточками (06.10: в корзину легли девять спорттоваров из прошлой темы).
+    caption_order: bool = False
     history: list[dict[str, str]] = field(default_factory=list)
     profile: DialogProfile = field(default_factory=DialogProfile)
     # Один маскер на весь разговор: метки должны совпадать между сообщениями,
@@ -434,6 +438,19 @@ class DialogEngine:
             self._log(user_id, channel, "action", action, responses, started)
             return responses
 
+    def handle_caption(self, user_id: str, channel: str, text: str) -> list[Response]:
+        """Подпись под файлом заказа: тот же текстовый ход, но с пометкой «это про файл».
+
+        Пометка живёт один ход и в базу не пишется — она нужна ровно до конца разбора
+        этой реплики (см. `Session.caption_order`).
+        """
+        session = self.session(user_id, channel)
+        session.caption_order = True
+        try:
+            return self.handle_text(user_id, channel, text)
+        finally:
+            session.caption_order = False
+
     def _log(
         self,
         user_id: str,
@@ -485,6 +502,21 @@ class DialogEngine:
         # не пополнялась. Чистая просьба («позовите человека») слов добавления
         # не содержит и ниже всё равно дойдёт до менеджера.
         has_procurement = self.procurement_service() is not None
+        # Подпись под файлом заказа (З2) важнее показанных карточек: параметры —
+        # количеству и «из наличия» — применяются к проверенному файлу.
+        if session.caption_order and session.profile.order:
+            handled = self._caption_to_order(session, text)
+            if handled is not None:
+                self._remember(session)
+                return handled
+        # «Собери заказ из первых 29 позиций по 1 шт» (З8): пункты лежат в последнем
+        # ответе бота — заказ собирается кодом, модель не нужна и не может не успеть.
+        first_n = intent.asks_first_n(text)
+        if has_procurement and first_n:
+            handled = self._collect_first_n(session, first_n, intent.each_quantity(text) or 1)
+            if handled is not None:
+                self._remember(session)
+                return handled
         if has_procurement and intent.asks_add(text):
             handled = self.add_by_text(session, text)
             if handled is not None:
@@ -581,7 +613,13 @@ class DialogEngine:
             case "add_all":
                 return self._add_all(session)
             case "order_cart":
-                return self.order_cart(session, default=int(arg) if arg.isdigit() else None)
+                # Кнопка «Найденные в корзину по 1 шт.» обещает «по 1» — значит,
+                # количество из файла не учитывается (07.10 кнопка клала «из файла»,
+                # где есть, и по 1 только где нет).
+                return self.order_cart(session, override=int(arg) if arg.isdigit() else None)
+            case "order_cart_file":
+                # «Как в файле»: количество из файла, где не указано — по 1.
+                return self.order_cart(session, default=1)
             case "order_more":
                 return self.order_list(session, "", None, more=True)
             case "export":
@@ -854,15 +892,21 @@ class DialogEngine:
                     keyboard=self._offer_menu(),
                 )
             ]
-        return [
-            Message(
-                "Сейчас я отвечаю проще обычного — консультант временно "
-                "недоступен. Могу показать каталог или найти позиции по "
-                "пункту перечня, например «1.5.1».\n"
-                f"По остальным вопросам — менеджер: {self.settings.manager_contact}.",
-                keyboard=self._offer_menu(),
+        text = (
+            "Сейчас я отвечаю проще обычного — консультант временно "
+            "недоступен. Могу показать каталог или найти позиции по "
+            "пункту перечня, например «1.5.1».\n"
+        )
+        if session.profile.order:
+            # 10.11: деградация пришла ровно на «собери заказ из первых 29 позиций
+            # по 1 шт» — человек должен знать, что заказ не собран, и что команду
+            # достаточно повторить.
+            text += (
+                "Заказ из проверенного файла не собран — напишите ещё раз, например "
+                "«все найденные позиции по 1 шт», и я положу его в корзину без консультанта.\n"
             )
-        ]
+        text += f"По остальным вопросам — менеджер: {self.settings.manager_contact}."
+        return [Message(text, keyboard=self._offer_menu())]
 
     def _cart_keyboard(self) -> Keyboard:
         return Keyboard().row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
@@ -935,6 +979,65 @@ class DialogEngine:
                 keyboard=self._cart_keyboard(),
             )
         ]
+
+    def _caption_to_order(self, session: Session, text: str) -> list[Response] | None:
+        """Подпись под файлом заказа — параметры для него же, а не для старых карточек.
+
+        06.10 «по этому списку сформируй все позиции из наличия по 1шт» под файлом
+        «Кабинет физики» сработала как «по этому списку» и положила в корзину девять
+        показанных накануне спорттоваров. Подпись всегда относится к файлу: состав —
+        из проверки файла, количество и «из наличия» — из подписи.
+        """
+        if not (intent.asks_list_to_cart(text) or intent.asks_order_checkout(text)):
+            return None
+        return self.order_cart(
+            session,
+            override=intent.each_quantity(text),
+            in_stock=intent.asks_in_stock_only(text),
+        )
+
+    def _collect_first_n(self, session: Session, n: int, each: int) -> list[Response] | None:
+        """«Собери заказ из первых N позиций по M шт» — первые пункты последнего ответа.
+
+        10.11 фраза ушла в модель, модель не успела в бюджет хода, и клиент получил
+        «консультант временно недоступен» — хотя весь состав лежал в предыдущем
+        сообщении. Собираем кодом: пункты перечня из последнего ответа бота, первые
+        N штук, количество — названное или 1.
+        """
+        points = intent.listed_points(self._last_answer(session))
+        if not points:
+            return None
+        taken = points[:n]
+        chosen, missing, review, codes = self._points_to_products(
+            session, taken, each, limit=len(taken)
+        )
+        session.profile.review = [product.sku_1c for _, product in review]
+        if not chosen and not review:
+            answer = self._nothing_to_checkout(missing)
+            session.remember("assistant", answer)
+            return [Message(answer, keyboard=self._offer_menu())]
+        lines: list[str] = []
+        keyboard = Keyboard()
+        if chosen:
+            added, cart = self._add_products(session, chosen, norm_codes=codes)
+            lines.append(
+                f"Собрал заказ из первых {len(taken)} позиций по {each} шт.: "
+                f"добавлено {added} {plural(added, 'позиция', 'позиции', 'позиций')}. "
+                f"В корзине {cart.count} шт. на {price_text(cart.total)}."
+            )
+            keyboard.row(Button("Моя корзина", "cart"), Button("Оформить", "checkout"))
+        if review:
+            lines.append(
+                f"Точной привязки в каталоге нет у {len(review)} "
+                f"{plural(len(review), 'позиции', 'позиций', 'позиций')} — их подобрал по "
+                "формулировке, в корзину не ставил."
+            )
+            keyboard.row(Button("Добавить подобранное", "order_review"))
+        if missing:
+            lines.append(_missing_points(missing))
+        answer = "\n".join(lines)
+        session.remember("assistant", answer)
+        return [Message(answer, keyboard=keyboard)]
 
     def _shown_actions(self, session: Session, text: str) -> list[Response] | None:
         """Вопросы о показанном — ответ кодом, а не новый подбор (шаги 4.5–4.8)."""
@@ -1582,13 +1685,20 @@ class DialogEngine:
             "или назовите пункт перечня — соберу список, и оформим его одним нажатием."
         )
 
-    def order_cart(self, session: Session, default: int | None = None, override: int | None = None) -> list[Response]:
+    def order_cart(
+        self,
+        session: Session,
+        default: int | None = None,
+        override: int | None = None,
+        in_stock: bool = False,
+    ) -> list[Response]:
         """Найденные позиции присланного заказа — в корзину, без модели.
 
         15.09 на «сформируй предзаказ» и «все найденные позиции по 1 шт.» модель заново искала строки
         файла по названиям — 14 из 15, потом 4 из 15, — подменила набор зондов товаром с той же ценой и
         закончила «нажмите «Оформить»» без кнопки при пустой корзине. Позиции берутся из проверки
-        заказа, количество — из файла, названное человеком (`override`) или кнопкой «по 1 шт.» (`default`).
+        заказа, количество — названное человеком (`override`), иначе из файла, иначе `default`;
+        `in_stock` — «из наличия»: кладутся только товары со складом, остальное — менеджеру.
         """
         profile = session.profile
         order = profile.order or {}
@@ -1597,6 +1707,7 @@ class DialogEngine:
         found: list[tuple[Product, int | None]] = []
         seen: set[str] = set()
         resolved = 0
+        unavailable = 0
         for position in positions:
             product = self.index.get(position.get("sku") or "")
             if product is None:
@@ -1605,6 +1716,11 @@ class DialogEngine:
             # «найдено N строк», и «положил M позиций» по уникальным товарам не должно
             # выглядеть противоречащим (19.09: «найдено 58» рядом с «положил 57»).
             resolved += 1
+            if in_stock and not product.available:
+                # «Из наличия» (07.10 логопед: легли 57 позиций, в наличии 32 — в ответе
+                # наличие не упомянуто вовсе). Отсутствующее — не в корзину, а менеджеру.
+                unavailable += 1
+                continue
             if product.id in seen:
                 continue
             seen.add(product.id)
@@ -1613,17 +1729,29 @@ class DialogEngine:
 
         keyboard = Keyboard()
         if not found:
-            text = f"По заказу «{name}» в каталоге не нашлось ни одной позиции — класть в корзину нечего."
-            keyboard.row(Button("Связаться с менеджером", "manager"), Button("Меню", "menu"))
+            if in_stock and unavailable:
+                text = (
+                    f"По заказу «{name}» в наличии нет ни одной из {resolved} найденных позиций — "
+                    "всё под заказ. Положить всё как есть или передать менеджеру?"
+                )
+                keyboard.row(Button("Положить всё", "order_cart_file"), Button("Связаться с менеджером", "manager"))
+            else:
+                text = f"По заказу «{name}» в каталоге не нашлось ни одной позиции — класть в корзину нечего."
+                keyboard.row(Button("Связаться с менеджером", "manager"), Button("Меню", "menu"))
         elif override is None and default is None:
             unknown = sum(1 for _, quantity in found if quantity is None)
             if unknown:
                 text = (
                     f"По заказу «{name}» в каталоге {resolved} из {len(positions)} строк, но у {unknown} "
-                    f"{plural(unknown, 'позиции', 'позиций', 'позиций')} не указано количество. Нажмите "
-                    "«Найденные в корзину по 1 шт.» или напишите, например, «все по 2»."
+                    f"{plural(unknown, 'позиции', 'позиций', 'позиций')} не указано количество. «Найденные "
+                    "в корзину по 1 шт.» — всё по одной; «Как в файле» — количество из файла "
+                    "(где его нет — 1)."
                 )
-                keyboard.row(Button("Найденные в корзину по 1 шт.", "order_cart:1"), Button("Меню", "menu"))
+                keyboard.row(
+                    Button("Найденные в корзину по 1 шт.", "order_cart:1"),
+                    Button("Как в файле", "order_cart_file"),
+                    Button("Меню", "menu"),
+                )
             else:
                 # Количество есть везде — предзаказ по файлу целиком: не найденные строки менеджер увидит сам.
                 text = (
@@ -1659,6 +1787,11 @@ class DialogEngine:
                 f"«{name}» ({resolved} из {len(positions)} строк найдено), {how} "
                 f"В корзине {cart.count} шт. на {price_text(cart.total)}."
             )
+            if in_stock:
+                text += (
+                    f"\nВ наличии: {len(found)}; нет в наличии: {unavailable} "
+                    f"{plural(unavailable, 'строка', 'строки', 'строк')} — их не клал, менеджер подберёт."
+                )
             if missing:
                 text += (
                     f"\nНе нашлось в каталоге: {missing} {plural(missing, 'строка', 'строки', 'строк')} — в корзину "
@@ -2364,6 +2497,12 @@ class DialogEngine:
             return [Message(str(exc), keyboard=self._main_menu())]
 
         session.customer = Customer()
+        # Заказ принят — корзина исполнена: содержимое зафиксировано в заказе и
+        # у менеджера. Не чистить значило смешивать темы: 06.10 спортзальный заказ
+        # «дожил» в корзине, и файл «Кабинет физики» лёг поверх него (146 позиций,
+        # 2,97 млн ₽ вперемешку).
+        cart.clear()
+        self.storage.save_cart(cart)
         test = session.user_id in self.settings.qa_user_ids
         lines = [
             order_accepted(

@@ -528,7 +528,7 @@ class Orchestrator:
                     messages if client.reasoning_in_history else without_reasoning(messages),
                     temperature=0.0,
                     max_tokens=MAX_TOKENS,
-                    timeout=ROUTER_TIMEOUT_SECONDS,
+                    timeout=getattr(self.llm, "classify_timeout", ROUTER_TIMEOUT_SECONDS),
                 )
             except LLMError as exc:
                 # Сбой короткого вызова маршрутизатора не блокирует провайдера:
@@ -693,6 +693,11 @@ def _state(profile) -> str:  # noqa: ANN001 — core.profile.DialogProfile
     )
 
 
+# Классификатору хватает начала реплики: перечень из 29 пунктов в истории (10.11)
+# раздувал контекст, вызов думал дольше своего 8-секундного потолка и решали правила.
+_CLASSIFY_CHAR_CAP = 500
+
+
 def _history(session, text: str) -> list[dict[str, str]]:  # noqa: ANN001
     """Переписка для модели маршрутизации — обязательно маскированная.
 
@@ -703,10 +708,10 @@ def _history(session, text: str) -> list[dict[str, str]]:  # noqa: ANN001
     телефон ушёл бы наружу. Проверено — уходил.
     """
     history = [
-        {"role": item["role"], "content": item["content"]}
+        {"role": item["role"], "content": item["content"][:_CLASSIFY_CHAR_CAP]}
         for item in session.history[-HISTORY_LIMIT:]
     ]
-    masked = session.masker.mask(text or "")
+    masked = session.masker.mask(text or "")[:_CLASSIFY_CHAR_CAP]
     if not history or history[-1]["role"] != "user" or history[-1]["content"] != masked:
         history.append({"role": "user", "content": masked})
     return history

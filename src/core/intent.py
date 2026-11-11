@@ -474,6 +474,39 @@ def each_quantity(text: str) -> int | None:
     return number or None
 
 
+_FIRST_N = re.compile(r"перв[ыо]х?\s+(\d{1,3})\s*(?:позици\w*|пункт\w*)", re.IGNORECASE)
+# «Покажите первые три позиции» — показ, а не заказ: собираем только когда рядом
+# есть слова оформления.
+_FIRST_N_ORDER = re.compile(r"собери|сформируй|заказ|корзин|подбери|в\s+корзину|добав", re.IGNORECASE)
+
+
+def asks_first_n(text: str) -> int | None:
+    """«Собери заказ из первых 29 позиций по 1 шт» — N первых строк показанного перечня.
+
+    10.11 на такую реплику заказ не собрался вовсе: явных пунктов в тексте нет,
+    фраза ушла в модель, модель не успела — а состав лежит в последнем ответе
+    бота и собирается кодом.
+    """
+    match = _FIRST_N.search(text or "")
+    if match is None or not _FIRST_N_ORDER.search(text or ""):
+        return None
+    return int(match.group(1))
+
+
+_IN_STOCK_ONLY = re.compile(
+    r"из\s+наличи\w*|только\s+в\s+наличии|которые\s+в\s+наличии|что\s+в\s+наличии",
+    re.IGNORECASE,
+)
+
+
+def asks_in_stock_only(text: str) -> bool:
+    """«Подбери из наличия», «только в наличии» — класть лишь то, что есть на складе.
+
+    «Проверьте наличие» вопрос о складе, а не фильтр: слово «из» обязательно.
+    """
+    return bool(_IN_STOCK_ONLY.search(text or ""))
+
+
 __all__ = [
     "GREETING",
     "NORM_CODE",
@@ -490,6 +523,8 @@ __all__ = [
     "classify",
     "describes_task",
     "each_quantity",
+    "asks_first_n",
+    "asks_in_stock_only",
     "is_short",
     "list_size",
     "listed_points",

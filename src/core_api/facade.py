@@ -197,6 +197,15 @@ class CoreApi:
         """
         return self.services.engine.handle_text(session.user_ref, session.channel, text)
 
+    def caption_primitives(self, session: CoreSession, text: str) -> list[Response]:
+        """Подпись под только что проверенным файлом заказа.
+
+        Текст обрабатывается как обычная реплика, но диалог знает: он относится к
+        файлу — «по этому списку…» управляет проверенным заказом, а не показанными
+        накануне карточками (06.10).
+        """
+        return self.services.engine.handle_caption(session.user_ref, session.channel, text)
+
     def action_primitives(self, session: CoreSession, action: str) -> list[Response]:
         return self.services.engine.handle_action(session.user_ref, session.channel, action)
 

@@ -40,8 +40,8 @@ import re
 import time
 from pathlib import Path
 
-from agent.client import ChatClient, LLMError, LLMTimeoutError, without_reasoning
-from agent.providers import LLMRouter
+from agent.client import ChatClient, LLMBudgetError, LLMError, LLMTimeoutError, without_reasoning
+from agent.providers import STARVED_COOLDOWN_SECONDS, LLMRouter
 from agent.routing import (
     CONSULT,
     EXPORT_REQUEST,
@@ -95,6 +95,10 @@ MAX_TOOL_ROUNDS = 4
 # и проверено: молчание превращалось в «консультант временно недоступен» на самых важных ходах.
 TURN_CALLS = 4
 HISTORY_LIMIT = 12
+# Вызов с меньшим остатком бюджета хода не начинаем: 10.11 финальному вызову
+# досталось 6 секунд — провайдер «не ответил», был отключён на 30 с, ход
+# деградировал. Меньше этого — отвечаем уже собранным.
+MIN_CALL_SECONDS = 8.0
 # Сколько карточек прикладываем к ответу модели. Заказчик отдельно попросил
 # не больше трёх: пять карточек подряд читаются как выгрузка, а не как подбор.
 CARDS_SHOWN = 3
@@ -665,6 +669,21 @@ class SalesAgent:
             client_messages = messages if client.reasoning_in_history else without_reasoning(messages)
             try:
                 answer = self._run(client, list(client_messages), tools, schemas, deadline, call_cap)
+            except LLMBudgetError as exc:
+                # Бюджет хода кончился ещё до обращения к провайдеру: он не виноват,
+                # и отключать его значило деградировать и следующий ход (10.11 —
+                # cloudru-qwen получил «отключён на 25 с» за чужой перерасход).
+                last = exc
+                break
+            except LLMTimeoutError as exc:
+                if getattr(exc, "starved", False):
+                    # Вызову досталось меньше половины потолка — таймаут на совести
+                    # бюджета хода, не провайдера: короткая пауза вместо 30 секунд.
+                    self.router.mark_down(client, exc, pause=STARVED_COOLDOWN_SECONDS)
+                else:
+                    self.router.mark_down(client, exc)
+                last = exc
+                continue
             except LLMError as exc:
                 self.router.mark_down(client, exc)
                 last = exc
@@ -679,7 +698,7 @@ class SalesAgent:
             return call_cap
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise LLMTimeoutError("бюджет хода исчерпан")
+            raise LLMBudgetError("бюджет хода исчерпан")
         return min(remaining, call_cap)
 
     def _run(
@@ -697,9 +716,19 @@ class SalesAgent:
                 # Лимит хода исчерпан: дальше только просьба ответить по собранному.
                 tools.session.route["call_limit"] = tools.calls
                 break
-            message = client.complete(
-                messages, tools=schemas, timeout=self._call_timeout(deadline, call_cap)
-            )
+            timeout_used = self._call_timeout(deadline, call_cap)
+            if timeout_used < MIN_CALL_SECONDS:
+                # 10.11: на следующий вызов оставалось 6 секунд — cloudru «не ответил»,
+                # был отключён на 30 с, и ход деградировал. Обречённый вызов не делаем:
+                # отвечаем собранным или просим итог в оставшееся время.
+                break
+            try:
+                message = client.complete(messages, tools=schemas, timeout=timeout_used)
+            except LLMTimeoutError as exc:
+                # Меньше половины потолка — вины провайдера нет, бюджет хода съеден
+                # предыдущими вызовами; _ask отличит это от честного таймаута.
+                exc.starved = timeout_used < call_cap * 0.5
+                raise
             tools.calls += 1
             account_usage(tools.session, client, message)
             calls = message.get("tool_calls") or []
@@ -730,7 +759,14 @@ class SalesAgent:
                 "content": "Ответь пользователю по уже собранным данным, без новых вызовов.",
             }
         )
-        final = client.complete(messages)
+        try:
+            # Финальный вызов живёт в том же бюджете хода: без таймаута он уходил
+            # на полный лимит клиента (60 с) поверх уже потраченного.
+            final = client.complete(messages, timeout=self._call_timeout(deadline, call_cap))
+        except LLMError:
+            # Итоговый текст не доехал — отдаём собранное, а не роняем ход: провайдер
+            # уже отвечал, и в блок его за это ставить нечестно.
+            return candidate
         tools.calls += 1
         account_usage(tools.session, client, final)
         return (final.get("content") or "").strip() or candidate

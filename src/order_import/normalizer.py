@@ -122,7 +122,8 @@ class OrderNormalizer:
         }
         # Прочерк вместо значения — пустая ячейка: так таблицы PDF держат колонки.
         raw = {name: "" if value in _DASHES else value for name, value in raw.items()}
-        name = " ".join(raw.get("name", "").split()) or None
+        own_name = " ".join(raw.get("name", "").split()) or None
+        name = own_name
         if name is None or _PLACEHOLDER.fullmatch(name.lower().replace("ё", "е")):
             # «в каталоге не найдено» — не название товара, а пометка выгрузки бота о пункте без
             # позиции. Названием такой строки служит формулировка приказа из соседней колонки.
@@ -131,6 +132,12 @@ class OrderNormalizer:
         if not name and not article:
             return None
         if _TOTAL_ROW.match(name or "") or (not name and _TOTAL_ROW.match(article or "")):
+            return None
+        # Строка-заголовок секции выгрузки: формулировка раздела есть, позиции нет —
+        # ни названия, ни артикула, ни количества с ценой. Считать её строкой заказа
+        # значило завышать сводку: 07.10 логопед — «88 строк» и «не нашлось 29»
+        # вместо 85 позиций и 26.
+        if own_name is None and not article and not raw.get("quantity") and not raw.get("price"):
             return None
 
         issues: list[str] = []

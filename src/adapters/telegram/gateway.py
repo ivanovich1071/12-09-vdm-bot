@@ -199,6 +199,20 @@ class TelegramGateway:
         )
         return [head, *self.core.action_primitives(self.session(user_id), "cart")]
 
+    def caption(self, user_id: str, text: str) -> list[TelegramReply]:
+        """Подпись под файлом заказа — тот же поток, что у текста, но с пометкой про файл.
+
+        06.10 «по этому списку сформируй все позиции из наличия по 1шт» под файлом
+        «Кабинет физики» сработала как «по этому списку» и собрала в корзину девять
+        показанных накануне спорттоваров. Подпись относится к проверенному файлу,
+        поэтому идёт в ядро с пометкой (`caption_primitives`). Телефон в подписи
+        посреди оформления остаётся контактом — файл этому не мешает.
+        """
+        stripped = (text or "").strip()
+        if user_id in self._awaiting_contact and not stripped.startswith("/") and PHONE.search(stripped):
+            return self._guard(lambda: self._contact_from_text(user_id, stripped))
+        return self._guard(lambda: self.core.caption_primitives(self.session(user_id), stripped))
+
     def action(self, user_id: str, data: str) -> list[TelegramReply]:
         verb, _, arg = data.partition(":")
         handlers: dict[str, Callable[[], list[TelegramReply]]] = {
@@ -246,10 +260,14 @@ class TelegramGateway:
                 keyboard.row(Button("Оформить предзаказ", f"po_order:{order.id}"))
             else:
                 # 15.09 свой же файл «Подобранные позиции» без количества ушёл менеджеру предзаказом на 0 ₽.
-                keyboard.row(Button("Найденные в корзину по 1 шт.", "order_cart:1"))
+                keyboard.row(
+                    Button("Найденные в корзину по 1 шт.", "order_cart:1"),
+                    Button("Как в файле", "order_cart_file"),
+                )
                 text += (
-                    "\n\nКоличество указано не у всех позиций. Нажмите «Найденные в корзину по 1 шт.» "
-                    "или напишите, например, «все по 2»."
+                    "\n\nКоличество указано не у всех позиций. «Найденные в корзину по 1 шт.» — всё "
+                    "по одной; «Как в файле» — количество из файла (где его нет — 1); или напишите, "
+                    "например, «все по 2»."
                 )
         keyboard.row(Button("Меню", "menu"))
         if not evaluation.summary.get("checked") and order.warnings:

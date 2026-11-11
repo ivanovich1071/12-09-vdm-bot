@@ -302,10 +302,13 @@ def _check_uploaded_order(core, session_id: str, filename: str, content: bytes) 
             # Как в Telegram (15.09): файл без количества ушёл менеджеру предзаказом на 0 ₽ —
             # здесь сначала количество, потом корзина.
             text += (
-                "\n\nКоличество указано не у всех позиций. Напишите, например, «все по 2», "
-                "или добавьте найденное в корзину по 1 шт."
+                "\n\nКоличество указано не у всех позиций. Напишите, например, «все по 2»; "
+                "«Найденные в корзину по 1 шт.» — всё по одной, «Как в файле» — количество из файла."
             )
-        keyboard.row(Button("Найденные в корзину по 1 шт.", "order_cart:1"))
+        keyboard.row(
+            Button("Найденные в корзину по 1 шт.", "order_cart:1"),
+            Button("Как в файле", "order_cart_file"),
+        )
         keyboard.row(Button("Скачать Excel", "export:xlsx"), Button("Скачать Word", "export:docx"))
     keyboard.row(Button("Меню", "menu"))
     if not evaluation.summary.get("checked") and order.warnings:
