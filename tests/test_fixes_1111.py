@@ -21,7 +21,7 @@ from core.dialog import DialogEngine
 from core.storage import Storage
 from core_fixtures import procurement_service, products, state
 from order_import.normalizer import OrderNormalizer
-from order_import.parsers import RawDocument, RawRow, RawTable
+from order_import.parsers import RawDocument, RawRow, RawTable, WordOrderParser
 from orders.service import OrderService
 from orders.sinks import JsonlSink
 
@@ -136,6 +136,64 @@ def test_in_stock_words_are_not_confused_with_questions(engine):
     assert intent.asks_in_stock_only("подбери из наличия все по 1 шт")
     assert intent.asks_in_stock_only("только в наличии, остальное менеджеру")
     assert not intent.asks_in_stock_only("проверьте наличие, пожалуйста")
+
+
+# --- Замечание 2: произвольный тире-список в Word ----------------------------------------------
+
+
+def _docx_with_lines(path, lines):
+    import zipfile
+
+    body = "<w:br/>".join(f'<w:t xml:space="preserve">{line}</w:t>' for line in lines)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body><w:p><w:r>{body}</w:r></w:p></w:body></w:document>"
+    )
+    with zipfile.ZipFile(path, "w") as package:
+        package.writestr("word/document.xml", xml)
+    return path
+
+
+def test_word_file_with_dash_list_gives_order_lines(tmp_path):
+    """07.10 «произвольный список.docx» отвечал «позиций 0» — тире-список теперь читается."""
+    path = _docx_with_lines(
+        tmp_path / "произвольный список.docx",
+        [
+            "-Стойки для хранения ГИА-лабораторий  -3 шт;",
+            "- Калориметр с набором калориметрических тел-2шт;",
+            "-Термометр лабораторный -",
+        ],
+    )
+    items, _ = OrderNormalizer().normalize(WordOrderParser().parse(path))
+
+    assert [item.name for item in items] == [
+        "Стойки для хранения ГИА-лабораторий",
+        "Калориметр с набором калориметрических тел",
+        "Термометр лабораторный",
+    ]
+    assert [item.quantity for item in items] == [3, 2, None]
+
+
+def test_single_dash_line_is_not_an_order(tmp_path):
+    """Один дефис в обычном письме не превращается в позицию заказа."""
+    document = WordOrderParser().parse(_docx_with_lines(tmp_path / "x.docx", ["Заметки:", "- см. приказ 838"]))
+    assert document.warnings and document.warnings[0].code == "NO_TABLES"
+
+
+def test_dash_list_does_not_mix_with_point_list(tmp_path):
+    """Есть пункты приказа — тире-строки письма не подмешиваются в заказ."""
+    path = _docx_with_lines(
+        tmp_path / "x.docx",
+        [
+            "1.5.1.7 Мат гимнастический — 2 шт.",
+            "- примечание для менеджера",
+            "- см. приложение",
+        ],
+    )
+    items, _ = OrderNormalizer().normalize(WordOrderParser().parse(path))
+
+    assert [item.norm_item for item in items] == ["1.5.1.7"]
 
 
 # --- З5: строки-заголовки секций ---------------------------------------------------------------

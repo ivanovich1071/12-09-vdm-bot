@@ -129,6 +129,11 @@ _LIST_LINE = re.compile(
     r"^\s*(?:\d{1,3}[.)]\s+)?(\d{1,2}(?:\.\d{1,3}){2,6})(?:\s*[–—-]\s*\d{1,2}(?:\.\d{1,3}){2,6})?\s+(\S.*)$"
 )
 _LINE_QUANTITY = re.compile(r"(\d{1,4})\s*(?:шт|компл|набор|ед|экз)\w*\.?", re.IGNORECASE)
+# Строка произвольного тире-списка: «-Стойки для хранения ГИА-лабораторий  -3 шт;».
+_DASH_LINE = re.compile(r"^\s*[-–—•*]\s*(\S.*?)\s*$")
+_DASH_QUANTITY = re.compile(
+    r"[-–—\s]\s*(\d{1,4})\s*(?:шт|компл|набор|ед|экз)\w*\.?\s*[;,.]?\s*$", re.IGNORECASE
+)
 
 
 def _paragraph_rows(root: ET.Element) -> list[RawRow]:
@@ -146,14 +151,33 @@ def _paragraph_rows(root: ET.Element) -> list[RawRow]:
                 current = []
         lines.append("".join(current))
     rows = [RawRow(0, ("Пункт", "Наименование", "Количество"))]
+    dash_items: list[tuple[int, str, str]] = []
     for number, line in enumerate(lines, 1):
         match = _LIST_LINE.match(line)
-        if match is None:
+        if match is not None:
+            code, rest = match.groups()
+            parts = [part.strip() for part in re.split(r"\s+[—–]\s+", rest) if part.strip()]
+            quantity = next((found.group(1) for part in parts[1:] if (found := _LINE_QUANTITY.search(part))), "")
+            rows.append(RawRow(number, (code, parts[0] if parts else rest, quantity)))
             continue
-        code, rest = match.groups()
-        parts = [part.strip() for part in re.split(r"\s+[—–]\s+", rest) if part.strip()]
-        quantity = next((found.group(1) for part in parts[1:] if (found := _LINE_QUANTITY.search(part))), "")
-        rows.append(RawRow(number, (code, parts[0] if parts else rest, quantity)))
+        dash = _DASH_LINE.match(line)
+        if dash is None:
+            continue
+        text = dash.group(1)
+        quantity = ""
+        tail = _DASH_QUANTITY.search(text)
+        if tail is not None:
+            quantity = tail.group(1)
+            text = text[: tail.start()]
+        text = text.strip().strip(" -–—;.,")
+        if len(text) >= 3:
+            dash_items.append((number, text, quantity))
+    # Тире-список — запасной формат без пунктов и кодов: 07.10 «произвольный
+    # список.docx» («-Стойки для хранения ГИА-лабораторий  -3 шт;») отвечал
+    # «позиций 0». Включаем, только если пунктов не нашлось и строк минимум две —
+    # иначе один дефис в обычном письме превращается в ложную позицию заказа.
+    if len(rows) == 1 and len(dash_items) >= 2:
+        rows.extend(RawRow(number, ("", name, quantity)) for number, name, quantity in dash_items)
     return rows if len(rows) > 1 else []
 
 
